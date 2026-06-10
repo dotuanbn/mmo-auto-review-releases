@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-electron/
+
+# Release builds (large binaries)
+release/
+release-fix/
+release-fix2/
+release-fix3/
+release-fix4/
+release-history/
+
+# Logs & debug
+logs/
+debug/
+output/
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+
+# Video captures
+Video/
+
+# Temp inspection scripts & output
+inspect_mmo_dbs_output.txt
+
+# MCP tools (external, not project source)
+mcps/
