@@ -1,0 +1,130 @@
+{
+  "name": "mmo-auto-review",
+  "version": "1.0.6",
+  "description": "MMO Auto Review Google Map - Electron App",
+  "main": "dist-electron/main/index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && electron-builder",
+    "build:exe": "vite build && electron-builder --win dir",
+    "build:installer": "vite build && electron-builder --win nsis",
+    "release:github": "vite build && electron-builder --win nsis --publish always && node scripts/archive-release.cjs",
+    "release:archive-local": "node scripts/archive-release.cjs",
+    "preview": "vite preview",
+    "electron:dev": "vite build && electron .",
+    "clean:artifacts": "node scripts/clean-artifacts.cjs",
+    "soak:8h": "powershell -ExecutionPolicy Bypass -File .\\scripts\\soak-test-8h.ps1 -DurationHours 8 -IntervalSeconds 30 -Tag npm",
+    "typecheck:renderer": "tsc --noEmit -p tsconfig.json",
+    "typecheck:main": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck": "npm run clean:artifacts && npm run typecheck:renderer && npm run typecheck:main",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "gate:quick": "npm run typecheck && npm run lint",
+    "gate:pre-release": "npm run gate:quick && npm run build:exe"
+  },
+  "dependencies": {
+    "@2captcha/captcha-solver": "^1.3.3",
+    "@huggingface/transformers": "^4.0.1",
+    "better-sqlite3": "^11.0.0",
+    "drizzle-orm": "^0.29.0",
+    "electron-squirrel-startup": "^1.0.1",
+    "electron-updater": "^6.1.0",
+    "googleapis": "^171.4.0",
+    "lucide-react": "^0.563.0",
+    "p-queue": "^8.1.1",
+    "p-retry": "^6.2.1",
+    "playwright": "^1.56.1",
+    "proxy-chain": "^2.7.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "zod": "^4.1.11",
+    "zustand": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "@typescript-eslint/eslint-plugin": "^8.57.0",
+    "@typescript-eslint/parser": "^8.57.0",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.17",
+    "drizzle-kit": "^0.20.0",
+    "electron": "^28.1.0",
+    "electron-builder": "^24.9.1",
+    "electron-rebuild": "^3.2.9",
+    "eslint": "^8.56.0",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "postcss": "^8.4.33",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.12",
+    "vite-plugin-electron": "^0.28.0",
+    "vite-plugin-electron-renderer": "^0.14.5"
+  },
+  "build": {
+    "appId": "com.mmo.auto-review",
+    "productName": "MMO Auto Review",
+    "asar": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-electron",
+      "dist",
+      "node_modules/better-sqlite3/**/*",
+      "node_modules/bindings/**/*",
+      "node_modules/file-uri-to-path/**/*",
+      "node_modules/@huggingface/transformers/**/*",
+      "node_modules/onnxruntime-node/**/*",
+      "node_modules/onnxruntime-common/**/*"
+    ],
+    "extraResources": [],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "MMO-Auto-Review-${version}-${arch}.${ext}",
+      "category": "public.app-category.business"
+    },
+    "portable": {
+      "artifactName": "MMO-Auto-Review-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "MMO-Auto-Review-Setup-${version}.exe"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "dotuanbn",
+        "repo": "mmo-auto-review-releases",
+        "releaseType": "release"
+      }
+    ],
+    "generateUpdatesFilesForAllChannels": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dotuanbn/mmo-auto-review-releases.git"
+  },
+  "author": "MMO Team",
+  "license": "MIT"
+}

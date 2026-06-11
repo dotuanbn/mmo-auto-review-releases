@@ -1,0 +1,29 @@
+{
+    "compilerOptions": {
+        "composite": true,
+        "skipLibCheck": true,
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "allowSyntheticDefaultImports": true,
+        "strict": true,
+        "outDir": "./dist-electron"
+    },
+    "include": [
+        "src/main/**/*",
+        "src/preload/**/*",
+        "src/shared/**/*",
+        "vite.config.ts",
+        "electron.vite.config.ts"
+    ],
+    "exclude": [
+        "dist",
+        "dist-electron",
+        "release",
+        "release-fix",
+        "release-fix2",
+        "release-fix3",
+        "release-fix4",
+        "output",
+        "node_modules"
+    ]
+}
