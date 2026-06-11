@@ -32,11 +32,14 @@ jobs:
 
       - name: Build app
         run: npx vite build
+        env:
+          NODE_OPTIONS: '--max_old_space_size=4096'
 
       - name: Build macOS installer
         run: npx electron-builder --mac dmg --${{ matrix.arch }} --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
+          NODE_OPTIONS: '--max_old_space_size=4096'
 
       - name: List release artifacts
         run: ls -la release/*.dmg 2>/dev/null || echo "No DMG found"; ls -la release/*.zip 2>/dev/null || echo "No ZIP found"
