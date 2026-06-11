@@ -90,6 +90,19 @@
         }
       ]
     },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "MMO-Auto-Review-${version}-${arch}.${ext}",
+      "category": "public.app-category.business"
+    },
     "portable": {
       "artifactName": "MMO-Auto-Review-${version}.exe"
     },
