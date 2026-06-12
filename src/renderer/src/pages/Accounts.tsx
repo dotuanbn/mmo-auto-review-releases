@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { useAccountStore, useProxyStore } from '../stores'
 import {
     UserPlus,
@@ -90,9 +91,10 @@ function AccountsTab() {
     const [newAccount, setNewAccount] = useState({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' as 'auto' | 'manual' })
     const [importText, setImportText] = useState('')
     const [openDropdown, setOpenDropdown] = useState<number | null>(null)
+    const [anchorRect, setAnchorRect] = useState<{ top: number; bottom: number; left: number; right: number } | null>(null)
     const [loginStates, setLoginStates] = useState<Record<number, { status: LoginStatus; message?: string }>>({})
     const [checkingAll, setCheckingAll] = useState(false)
-    const dropdownRef = useRef<HTMLDivElement | null>(null)
+    const menuRef = useRef<HTMLDivElement | null>(null)
 
     // Normalize short email (no @) -> @gmail.com before save/login. Applied for add + import.
     const normalizeEmail = (email: string): string => {
@@ -108,13 +110,34 @@ function AccountsTab() {
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
-            if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+            if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
                 setOpenDropdown(null)
+                setAnchorRect(null)
             }
         }
         document.addEventListener('mousedown', handleClickOutside)
         return () => document.removeEventListener('mousedown', handleClickOutside)
     }, [])
+
+    // Close portal menu on scroll/resize (capture to hit nested scrollers) or Esc. Position is viewport-fixed so stale rects on scroll are avoided by close.
+    useEffect(() => {
+        if (openDropdown === null) return
+        const close = () => {
+            setOpenDropdown(null)
+            setAnchorRect(null)
+        }
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') close()
+        }
+        window.addEventListener('scroll', close, true)
+        window.addEventListener('resize', close)
+        document.addEventListener('keydown', onKey)
+        return () => {
+            window.removeEventListener('scroll', close, true)
+            window.removeEventListener('resize', close)
+            document.removeEventListener('keydown', onKey)
+        }
+    }, [openDropdown])
 
     const filteredAccounts = accounts.filter(acc =>
         acc.email.toLowerCase().includes(searchQuery.toLowerCase())
@@ -228,7 +251,7 @@ function AccountsTab() {
     const handleEdit = (account: any) => {
         setEditingAccount({ ...account })
         setShowEditModal(true)
-        setOpenDropdown(null)
+        closeDropdown()
     }
 
     const handleSaveEdit = async () => {
@@ -249,11 +272,11 @@ function AccountsTab() {
     const handleDelete = async (id: number) => {
         if (!confirm(t('accounts.deleteConfirm'))) return
         await deleteAccount(id)
-        setOpenDropdown(null)
+        closeDropdown()
     }
 
     const handleTestLogin = async (id: number) => {
-        setOpenDropdown(null)
+        closeDropdown()
         setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in' } }))
         const result = await testLogin(id)
         setLoginStates(prev => ({
@@ -266,7 +289,7 @@ function AccountsTab() {
     }
 
     const handleOpenManualLogin = async (id: number) => {
-        setOpenDropdown(null)
+        closeDropdown()
         setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Dang mo browser...' } }))
         try {
             const result = await window.electronAPI.accounts.openManualLogin(id)
@@ -296,7 +319,7 @@ function AccountsTab() {
     }
 
     const handleCheck = async (id: number) => {
-        setOpenDropdown(null)
+        closeDropdown()
         setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Dang kiem tra...' } }))
         const result = await checkLiveDie(id)
         const ok = (result as any)?.alive
@@ -337,6 +360,35 @@ function AccountsTab() {
             case 'failed': return <XCircle className="h-4 w-4 text-rose-500" />
             default: return null
         }
+    }
+
+    // Portal menu position calc: right-aligned by default (right edge to button right), switch to left if near viewport right edge.
+    // Flip above (bung lên) if near bottom of viewport. Uses fixed + viewport rects to escape all overflow-hidden containers (DataTable, AppShell etc).
+    const getMenuPosition = (rect: { top: number; bottom: number; left: number; right: number }) => {
+        const MENU_W = 208
+        const MENU_H_EST = 260
+        const GAP = 4
+        const PAD = 8
+        const vw = window.innerWidth
+        const vh = window.innerHeight
+
+        let left = rect.right - MENU_W   // right-aligned
+        let top = rect.bottom + GAP
+
+        if (left + MENU_W > vw - PAD) {
+            left = Math.max(PAD, rect.left)  // left-align fallback near right edge
+        }
+        if (top + MENU_H_EST > vh - PAD) {
+            top = Math.max(PAD, rect.top - MENU_H_EST - GAP)  // open upwards near bottom
+        }
+        if (top < PAD) top = rect.bottom + GAP
+        if (left < PAD) left = PAD
+        return { top, left }
+    }
+
+    const closeDropdown = () => {
+        setOpenDropdown(null)
+        setAnchorRect(null)
     }
 
     const columns = [
@@ -394,44 +446,22 @@ function AccountsTab() {
             width: '60px',
             align: 'center' as const,
             render: (account: any) => (
-                <div className="relative" ref={openDropdown === account.id ? dropdownRef : null}>
-                    <IconButton
-                        icon={MoreVertical}
-                        label={t('accounts.accountActions')}
-                        onClick={(e) => { e.stopPropagation(); setOpenDropdown(openDropdown === account.id ? null : account.id) }}
-                    />
-                    {openDropdown === account.id && (
-                        <div className="absolute right-0 bottom-full mb-1 z-50 w-52 overflow-hidden rounded-[16px] border border-[#e9e4f2] bg-white shadow-[0_20px_48px_rgba(27,24,38,0.18)]">
-                            <button onClick={() => handleEdit(account)}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors">
-                                <Edit className="h-4 w-4" /> {t('accounts.editAccount')}
-                            </button>
-                            <button onClick={() => handleTestLogin(account.id)}
-                                disabled={loginStates[account.id]?.status === 'logging_in'}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors disabled:opacity-50">
-                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-                                {account.loginType === 'manual' ? 'Thu cong (dung manual)' : t('accounts.testLogin')}
-                            </button>
-                            <button onClick={() => handleOpenManualLogin(account.id)}
-                                disabled={loginStates[account.id]?.status === 'logging_in'}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-amber-600 hover:bg-amber-50 transition-colors disabled:opacity-50">
-                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-                                {t('accounts.manualLogin', 'Dang nhap thu cong')}
-                            </button>
-                            <button onClick={() => handleCheck(account.id)}
-                                disabled={loginStates[account.id]?.status === 'logging_in'}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 hover:bg-emerald-50 transition-colors disabled:opacity-50">
-                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
-                                {t('accounts.checkAccount', 'Kiem tra')}
-                            </button>
-                            <Divider />
-                            <button onClick={() => handleDelete(account.id)}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 hover:bg-rose-50 transition-colors">
-                                <Trash2 className="h-4 w-4" /> {t('accounts.deleteAccount')}
-                            </button>
-                        </div>
-                    )}
-                </div>
+                <IconButton
+                    icon={MoreVertical}
+                    label={t('accounts.accountActions')}
+                    onClick={(e) => {
+                        e.stopPropagation()
+                        const id = account.id
+                        if (openDropdown === id) {
+                            closeDropdown()
+                            return
+                        }
+                        const btn = e.currentTarget as HTMLElement
+                        const r = btn.getBoundingClientRect()
+                        setOpenDropdown(id)
+                        setAnchorRect({ top: r.top, bottom: r.bottom, left: r.left, right: r.right })
+                    }}
+                />
             ),
         },
     ]
@@ -612,6 +642,59 @@ function AccountsTab() {
                     />
                 </div>
             </Modal>
+
+            {/* Portal dropdown menu (fixed to body) - escapes DataTable overflow-hidden + AppShell scroll containers.
+                 Position computed from trigger rect; right-aligned + upward flip near edges. */}
+            {openDropdown !== null && anchorRect && createPortal(
+                <div
+                    ref={menuRef}
+                    style={{
+                        position: 'fixed',
+                        ...getMenuPosition(anchorRect),
+                        zIndex: 99999,
+                    } as React.CSSProperties}
+                    className="w-52 overflow-hidden rounded-[16px] border border-[#e9e4f2] bg-white shadow-[0_20px_48px_rgba(27,24,38,0.18)]"
+                    onClick={(e) => e.stopPropagation()}
+                >
+                    {(() => {
+                        const account = accounts.find((a: any) => a.id === openDropdown)
+                        if (!account) return null
+                        const isLogging = loginStates[account.id]?.status === 'logging_in'
+                        return (
+                            <>
+                                <button onClick={() => handleEdit(account)}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors">
+                                    <Edit className="h-4 w-4" /> {t('accounts.editAccount')}
+                                </button>
+                                <button onClick={() => handleTestLogin(account.id)}
+                                    disabled={isLogging}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors disabled:opacity-50">
+                                    {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+                                    {account.loginType === 'manual' ? 'Thu cong (dung manual)' : t('accounts.testLogin')}
+                                </button>
+                                <button onClick={() => handleOpenManualLogin(account.id)}
+                                    disabled={isLogging}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-amber-600 hover:bg-amber-50 transition-colors disabled:opacity-50">
+                                    {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+                                    {t('accounts.manualLogin', 'Dang nhap thu cong')}
+                                </button>
+                                <button onClick={() => handleCheck(account.id)}
+                                    disabled={isLogging}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 hover:bg-emerald-50 transition-colors disabled:opacity-50">
+                                    {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                                    {t('accounts.checkAccount', 'Kiem tra')}
+                                </button>
+                                <Divider />
+                                <button onClick={() => handleDelete(account.id)}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 hover:bg-rose-50 transition-colors">
+                                    <Trash2 className="h-4 w-4" /> {t('accounts.deleteAccount')}
+                                </button>
+                            </>
+                        )
+                    })()}
+                </div>,
+                document.body
+            )}
         </>
     )
 }
