@@ -149,11 +149,15 @@
     "deleteSelectedConfirm": "Delete {count} accounts?",
     "importSuccess": "Imported {count} accounts successfully!",
     "recoveryEmail": "Recovery Email",
+    "twoFactorSecret": "2FA / TOTP secret",
     "openingBrowser": "Opening browser...",
     "suspended": "Suspended",
     "accountActions": "Account actions",
     "checkedResult": "Checked {checked} accounts: {alive} alive, {dead} dead",
-    "checkFailed": "Failed to check accounts"
+    "checkFailed": "Failed to check accounts",
+    "manualLogin": "Manual login",
+    "checkAccount": "Check",
+    "loginType": "Login type"
   },
   "proxies": {
     "title": "Proxies",

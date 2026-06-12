@@ -8,7 +8,6 @@ import {
     MoreVertical,
     Edit,
     LogIn,
-    Eye,
     CheckCircle,
     XCircle,
     Loader2,
@@ -80,7 +79,7 @@ function AccountsTab() {
     const {
         accounts, stats, loading, error,
         fetchAccounts, fetchStats, addAccount, deleteAccount, updateAccount,
-        importAccounts, testLogin, loginVisible, checkAllPending
+        importAccounts, testLogin, checkLiveDie, checkAllPending
     } = useAccountStore()
     const [selectedIds, setSelectedIds] = useState<Set<number | string>>(new Set())
     const [showAddModal, setShowAddModal] = useState(false)
@@ -88,7 +87,7 @@ function AccountsTab() {
     const [showEditModal, setShowEditModal] = useState(false)
     const [editingAccount, setEditingAccount] = useState<any>(null)
     const [searchQuery, setSearchQuery] = useState('')
-    const [newAccount, setNewAccount] = useState({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', loginType: 'auto' as 'auto' | 'manual' })
+    const [newAccount, setNewAccount] = useState({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' as 'auto' | 'manual' })
     const [importText, setImportText] = useState('')
     const [openDropdown, setOpenDropdown] = useState<number | null>(null)
     const [loginStates, setLoginStates] = useState<Record<number, { status: LoginStatus; message?: string }>>({})
@@ -116,23 +115,39 @@ function AccountsTab() {
 
     const handleAddAccount = async () => {
         if (!newAccount.email || !newAccount.password) return
-        await addAccount(newAccount)
-        setNewAccount({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', loginType: 'auto' })
+        await addAccount(newAccount as any)
+        setNewAccount({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' })
         setShowAddModal(false)
     }
 
     const handleImport = async () => {
         if (!importText.trim()) return
         const lines = importText.split('\n').filter(l => l.trim())
-        const accountsToImport = lines.map(line => {
-            const parts = line.split(/[:|,;]/).map(p => p.trim())
-            return {
-                email: parts[0] || '',
-                password: parts[1] || '',
-                recoveryEmail: parts[2],
-                recoveryPhone: parts[3],
+        const accountsToImport: any[] = []
+        let hasHeader = false
+        const first = lines[0]?.toLowerCase() || ''
+        if (first.includes('email') && first.includes('pass')) { hasHeader = true }
+
+        for (let i = hasHeader ? 1 : 0; i < lines.length; i++) {
+            const line = lines[i]
+            // Support header-aware or delimited: , ; : | tab ; also allow "email,pass,2fa,login"
+            const parts = line.split(/[:|,;\t]/).map(p => p.trim()).filter(Boolean)
+            if (parts.length < 2) continue
+            const entry: any = {
+                email: parts[0],
+                password: parts[1],
+                recoveryEmail: parts[2] || undefined,
+                twoFactorSecret: parts[3] || undefined,
+                loginType: 'auto' as const,
             }
-        }).filter(a => a.email && a.password)
+            // Detect if 4th/5th looks like login type
+            const last = (parts[4] || parts[3] || '').toLowerCase()
+            if (last === 'manual' || last === 'auto') {
+                entry.loginType = last as 'auto' | 'manual'
+                if (parts[3] && last !== parts[3].toLowerCase()) entry.twoFactorSecret = parts[3]
+            }
+            if (entry.email && entry.password) accountsToImport.push(entry)
+        }
 
         const count = await importAccounts(accountsToImport)
         alert(t('accounts.importSuccess').replace('{count}', String(count)))
@@ -162,6 +177,7 @@ function AccountsTab() {
             password: editingAccount.password,
             recoveryEmail: editingAccount.recoveryEmail,
             recoveryPhone: editingAccount.recoveryPhone,
+            twoFactorSecret: editingAccount.twoFactorSecret,
             loginType: editingAccount.loginType,
             status: editingAccount.status,
         })
@@ -179,19 +195,6 @@ function AccountsTab() {
         setOpenDropdown(null)
         setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in' } }))
         const result = await testLogin(id)
-        setLoginStates(prev => ({
-            ...prev,
-            [id]: { status: result.success ? 'success' : 'failed', message: result.message }
-        }))
-        setTimeout(() => {
-            setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
-        }, 5000)
-    }
-
-    const handleLoginVisible = async (id: number) => {
-        setOpenDropdown(null)
-        setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: t('accounts.openingBrowser') } }))
-        const result = await loginVisible(id)
         setLoginStates(prev => ({
             ...prev,
             [id]: { status: result.success ? 'success' : 'failed', message: result.message }
@@ -229,6 +232,20 @@ function AccountsTab() {
                 setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
             }, 5000)
         }
+    }
+
+    const handleCheck = async (id: number) => {
+        setOpenDropdown(null)
+        setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Dang kiem tra...' } }))
+        const result = await checkLiveDie(id)
+        const ok = (result as any)?.alive
+        setLoginStates(prev => ({
+            ...prev,
+            [id]: { status: ok ? 'success' : 'failed', message: ok ? 'Live' : ((result as any)?.error || 'Die') }
+        }))
+        setTimeout(() => {
+            setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+        }, 4500)
     }
 
     const handleCheckAll = async () => {
@@ -298,11 +315,17 @@ function AccountsTab() {
         {
             key: 'lastUsed',
             header: t('accounts.lastUsed'),
-            render: (account: any) => (
-                <span className="text-sm text-[#908a9e]">
-                    {account.lastUsed ? new Date(account.lastUsed).toLocaleDateString() : t('accounts.never')}
-                </span>
-            ),
+            render: (account: any) => {
+                const lu = account.lastUsed
+                let txt = t('accounts.never') || 'Chua dung'
+                if (lu) {
+                    try {
+                        const d = new Date(lu)
+                        txt = d.toLocaleDateString('vi-VN') + ' ' + d.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })
+                    } catch { txt = String(lu) }
+                }
+                return <span className="text-sm text-[#908a9e]">{txt}</span>
+            },
         },
         {
             key: 'actions',
@@ -326,19 +349,19 @@ function AccountsTab() {
                                 disabled={loginStates[account.id]?.status === 'logging_in'}
                                 className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors disabled:opacity-50">
                                 {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-                                {t('accounts.testLogin')}
-                            </button>
-                            <button onClick={() => handleLoginVisible(account.id)}
-                                disabled={loginStates[account.id]?.status === 'logging_in'}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 hover:bg-emerald-50 transition-colors disabled:opacity-50">
-                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
-                                {t('accounts.loginVisible')}
+                                {account.loginType === 'manual' ? 'Thu cong (dung manual)' : t('accounts.testLogin')}
                             </button>
                             <button onClick={() => handleOpenManualLogin(account.id)}
                                 disabled={loginStates[account.id]?.status === 'logging_in'}
                                 className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-amber-600 hover:bg-amber-50 transition-colors disabled:opacity-50">
                                 {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-                                Dang nhap thu cong
+                                {t('accounts.manualLogin', 'Dang nhap thu cong')}
+                            </button>
+                            <button onClick={() => handleCheck(account.id)}
+                                disabled={loginStates[account.id]?.status === 'logging_in'}
+                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 hover:bg-emerald-50 transition-colors disabled:opacity-50">
+                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                                {t('accounts.checkAccount', 'Kiem tra')}
                             </button>
                             <Divider />
                             <button onClick={() => handleDelete(account.id)}
@@ -430,13 +453,17 @@ function AccountsTab() {
                         <TextInput value={newAccount.recoveryEmail} onChange={(v) => setNewAccount({ ...newAccount, recoveryEmail: v })} placeholder="recovery@gmail.com" />
                     </div>
                     <div>
+                        <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.twoFactorSecret', 'Mã 2FA (TOTP secret)')} ({t('common.optional')})</label>
+                        <TextInput value={newAccount.twoFactorSecret} onChange={(v) => setNewAccount({ ...newAccount, twoFactorSecret: v })} placeholder="JBSWY3DPEHPK3PXP" />
+                    </div>
+                    <div>
                         <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.loginType', 'Loai dang nhap')}</label>
                         <Select
                             value={newAccount.loginType}
                             onChange={(v) => setNewAccount({ ...newAccount, loginType: v as 'auto' | 'manual' })}
                             options={[
-                                { value: 'auto', label: 'Tu dong (AI)' },
-                                { value: 'manual', label: 'Thu cong' },
+                                { value: 'auto', label: 'Tu dong (AI - tu go + TOTP)' },
+                                { value: 'manual', label: 'Thu cong (mo browser cho user)' },
                             ]}
                         />
                     </div>
@@ -466,13 +493,17 @@ function AccountsTab() {
                             <TextInput value={editingAccount.password} onChange={(v) => setEditingAccount({ ...editingAccount, password: v })} type="password" />
                         </div>
                         <div>
+                            <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.twoFactorSecret', 'Mã 2FA (TOTP secret)')} ({t('common.optional')})</label>
+                            <TextInput value={editingAccount.twoFactorSecret || ''} onChange={(v) => setEditingAccount({ ...editingAccount, twoFactorSecret: v })} />
+                        </div>
+                        <div>
                             <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.loginType', 'Loai dang nhap')}</label>
                             <Select
                                 value={editingAccount.loginType || 'auto'}
                                 onChange={(v) => setEditingAccount({ ...editingAccount, loginType: v })}
                                 options={[
-                                    { value: 'auto', label: 'Tu dong (AI)' },
-                                    { value: 'manual', label: 'Thu cong' },
+                                    { value: 'auto', label: 'Tu dong (AI - tu go + TOTP)' },
+                                    { value: 'manual', label: 'Thu cong (mo browser cho user)' },
                                 ]}
                             />
                         </div>
@@ -509,13 +540,14 @@ function AccountsTab() {
             >
                 <div className="space-y-4">
                     <p className="text-sm text-[#908a9e]">
-                        {t('accounts.importFormat')} <code className="rounded bg-[#f4f1fa] px-1.5 py-0.5 text-xs font-medium text-[#735bd6]">{t('accounts.importFormatCode')}</code> {t('accounts.importFormatSuffix')}
+                        {t('accounts.importFormat')} <code className="rounded bg-[#f4f1fa] px-1.5 py-0.5 text-xs font-medium text-[#735bd6]">email,password,2fa_secret,login_type</code> {t('accounts.importFormatSuffix')}
+                        <br />Hỗ trợ header (email,password,2fa,login_type), dấu phân cách :,; | tab. 2fa_secret = TOTP secret (base32). login_type=auto|manual.
                     </p>
                     <textarea
                         value={importText}
                         onChange={(e) => setImportText(e.target.value)}
                         className="h-48 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 py-3 font-mono text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                        placeholder={"email1@gmail.com:password1\nemail2@gmail.com:password2"}
+                        placeholder={"email1@gmail.com:password1:2faSECRETBASE32:auto\nemail2@gmail.com,password2,,manual\nemail,password,2FASECRET"}
                     />
                 </div>
             </Modal>

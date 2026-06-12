@@ -175,7 +175,7 @@ export class AccountService {
         return result
     }
 
-    // Create new account
+    // Create new account (supports loginType, twoFactorSecret)
     async create(data: NewAccount): Promise<Account> {
         const db = getDatabase()
         const result = db.insert(schema.accounts).values({
@@ -239,6 +239,15 @@ export class AccountService {
             .run()
     }
 
+    // Update lastUsed timestamp (on login success, campaign use, check live)
+    async updateLastUsed(id: number): Promise<void> {
+        const db = getDatabase()
+        db.update(schema.accounts)
+            .set({ lastUsed: new Date() })
+            .where(eq(schema.accounts.id, id))
+            .run()
+    }
+
     // Increment review count
     async incrementReviewCount(id: number): Promise<void> {
         const db = getDatabase()
@@ -263,8 +272,8 @@ export class AccountService {
             .run()
     }
 
-    // Import multiple accounts from CSV data (basic)
-    async importFromCSV(accounts: Array<{ email: string; password: string; recoveryEmail?: string; recoveryPhone?: string }>): Promise<number> {
+    // Import multiple accounts from CSV data (supports 2FA, loginType, recovery)
+    async importFromCSV(accounts: Array<{ email: string; password: string; recoveryEmail?: string; recoveryPhone?: string; twoFactorSecret?: string; loginType?: 'auto' | 'manual' }>): Promise<number> {
         const db = getDatabase()
         let imported = 0
 
@@ -273,8 +282,10 @@ export class AccountService {
                 db.insert(schema.accounts).values({
                     email: acc.email,
                     password: acc.password,
-                    recoveryEmail: acc.recoveryEmail,
-                    recoveryPhone: acc.recoveryPhone,
+                    recoveryEmail: acc.recoveryEmail || null,
+                    recoveryPhone: acc.recoveryPhone || null,
+                    twoFactorSecret: acc.twoFactorSecret || null,
+                    loginType: (acc.loginType === 'manual' ? 'manual' : 'auto'),
                     status: 'pending',
                     totalReviews: 0,
                     createdAt: new Date(),
@@ -361,14 +372,15 @@ export class AccountService {
             // Create profile if not exists
             const profilePath = account.profilePath || await profileService.createProfile(id, account.email)
 
-            // Attempt login
+            // Attempt login (auto TOTP if secret present)
             const loginResult = await googleAuthHandler.login(
                 account.email,
                 account.password,
                 {
                     headless: true,
                     profilePath,
-                }
+                },
+                account.twoFactorSecret || undefined
             )
             contextId = loginResult.contextId >= 0 ? loginResult.contextId : null
 
@@ -381,10 +393,21 @@ export class AccountService {
 
             if (loginResult.success) {
                 await this.updateStatus(id, 'active')
+                await this.updateLastUsed(id)
 
-                // Save session if profile exists
+                // Save session (profile state) + cookies JSON to DB column for campaign reuse
                 if (contextId !== null) {
                     await googleAuthHandler.saveSession(contextId, profilePath)
+                    try {
+                        const { browserService } = await import('../automation/BrowserService')
+                        const ctx = browserService.getContext(contextId)
+                        if (ctx) {
+                            const ck = await ctx.cookies().catch(() => [])
+                            if (ck && ck.length > 0) {
+                                await this.saveCookies(id, JSON.stringify(ck))
+                            }
+                        }
+                    } catch {}
                 }
 
                 return { alive: true }

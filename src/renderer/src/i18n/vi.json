@@ -98,11 +98,15 @@
     "deleteSelectedConfirm": "Xóa {count} tài khoản?",
     "importSuccess": "Đã nhập thành công {count} tài khoản!",
     "recoveryEmail": "Email khôi phục",
+    "twoFactorSecret": "Mã 2FA (TOTP secret)",
     "openingBrowser": "Đang mở trình duyệt...",
     "suspended": "Bị tạm ngưng",
     "accountActions": "Thao tác tài khoản",
     "checkedResult": "Đã kiểm tra {checked} tài khoản: {alive} hoạt động, {dead} chết",
-    "checkFailed": "Kiểm tra tài khoản thất bại"
+    "checkFailed": "Kiểm tra tài khoản thất bại",
+    "manualLogin": "Đăng nhập thủ công",
+    "checkAccount": "Kiểm tra",
+    "loginType": "Loại đăng nhập"
   },
   "proxies": {
     "title": "Proxy",

@@ -72,13 +72,14 @@ export function registerAccountHandlers() {
         return accountService.getById(id)
     })
 
-    // Add new account
+    // Add new account (supports 2FA secret)
     ipcMain.handle('accounts:add', async (_event, data: {
         email: string
         password: string
         recoveryEmail?: string
         recoveryPhone?: string
         loginType?: 'auto' | 'manual'
+        twoFactorSecret?: string
     }) => {
         return accountService.create({
             email: data.email,
@@ -86,6 +87,7 @@ export function registerAccountHandlers() {
             recoveryEmail: data.recoveryEmail,
             recoveryPhone: data.recoveryPhone,
             loginType: normalizeLoginType(data.loginType),
+            twoFactorSecret: data.twoFactorSecret || null,
             status: 'pending',
             totalReviews: 0,
             createdAt: new Date(),
@@ -106,12 +108,14 @@ export function registerAccountHandlers() {
         return accountService.delete(id)
     })
 
-    // Import from CSV
+    // Import from CSV (rich: supports 2fa + loginType)
     ipcMain.handle('accounts:importCSV', async (_event, accounts: Array<{
         email: string
         password: string
         recoveryEmail?: string
         recoveryPhone?: string
+        twoFactorSecret?: string
+        loginType?: 'auto' | 'manual'
     }>) => {
         return accountService.importFromCSV(accounts)
     })
@@ -125,7 +129,7 @@ export function registerAccountHandlers() {
         return accountService.checkLiveDie(id)
     })
 
-    // Test account login (headless - auto check live/die)
+    // Test account login (headless - FULL AUTO: credential + TOTP if secret; uses GoogleAuthHandler for reliability)
     ipcMain.handle('accounts:testLogin', async (_event, id: number) => {
         let contextId: number | null = null
         try {
@@ -136,11 +140,9 @@ export function registerAccountHandlers() {
                 return { success: false, message: 'Tài khoản thủ công: Hãy dùng nút Đăng nhập thủ công' }
             }
 
-            // Update status
             await accountService.updateStatus(id, 'checking')
 
             const { browserService } = await import('../automation/BrowserService')
-            const { AgenticLoginHandler } = await import('../automation/AgenticLoginHandler')
             const { googleAuthHandler } = await import('../automation/GoogleAuthHandler')
             const { profileService } = await import('../services/ProfileService')
 
@@ -150,29 +152,38 @@ export function registerAccountHandlers() {
                 headless: loadSettings().headless ?? false,
                 profilePath,
             })
-            const page = browserService.getPage(contextId)
-            if (!page) {
-                await accountService.updateStatus(id, 'pending')
-                return { success: false, message: 'Failed to create browser context' }
-            }
 
-            const handler = new AgenticLoginHandler()
-            const result = await handler.executeLogin(page, account, id)
+            // Use deterministic GoogleAuth + built-in TOTP (full auto, no user action)
+            const loginResult = await googleAuthHandler.login(
+                account.email,
+                account.password,
+                { headless: loadSettings().headless ?? false, profilePath },
+                account.twoFactorSecret || undefined
+            )
+            contextId = loginResult.contextId >= 0 ? loginResult.contextId : contextId
 
-            if (result.success) {
+            if (loginResult.success) {
                 await googleAuthHandler.saveSession(contextId, profilePath)
+                // Explicitly persist cookies JSON to accounts.cookies for Traffic/Review engines
+                try {
+                    const ctx = browserService.getContext(contextId)
+                    if (ctx) {
+                        const ck = await ctx.cookies().catch(() => [])
+                        if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
+                    }
+                } catch {}
                 await accountService.updateStatus(id, 'active')
-
-                return { success: true, message: 'AI Login successful - account is active!' }
+                await accountService.updateLastUsed(id)
+                return { success: true, message: 'Auto login successful (TOTP handled if present) - account active!' }
             }
 
-            if (result.requiresManual) {
+            if (loginResult.requires2FA) {
                 await accountService.updateStatus(id, 'pending')
-                return { success: false, message: 'AI needs manual help using Login Visible', needs2FA: true }
+                return { success: false, message: '2FA required but no valid secret - use manual login', needs2FA: true }
             }
 
             await accountService.updateStatus(id, 'banned')
-            return { success: false, message: result.error || 'AI login failed' }
+            return { success: false, message: loginResult.error || 'Auto login failed' }
         } catch (error) {
             await accountService.updateStatus(id, 'pending')
             return {
@@ -191,7 +202,7 @@ export function registerAccountHandlers() {
         }
     })
 
-    // Login with visible browser (user can see and intervene for CAPTCHA/2FA)
+    // Login with visible browser (visible for user intervention/CAPTCHA; tries auto + TOTP first)
     ipcMain.handle('accounts:loginVisible', async (_event, id: number) => {
         let contextId: number | null = null
         let keepContextOpen = false
@@ -203,11 +214,9 @@ export function registerAccountHandlers() {
                 return { success: false, message: 'Tài khoản thủ công: Hãy dùng nút Đăng nhập thủ công' }
             }
 
-            // Update status
             await accountService.updateStatus(id, 'checking')
 
             const { browserService } = await import('../automation/BrowserService')
-            const { AgenticLoginHandler } = await import('../automation/AgenticLoginHandler')
             const { googleAuthHandler } = await import('../automation/GoogleAuthHandler')
             const { profileService } = await import('../services/ProfileService')
 
@@ -217,36 +226,43 @@ export function registerAccountHandlers() {
                 headless: false,
                 profilePath,
             })
-            const page = browserService.getPage(contextId)
-            if (!page) {
-                await accountService.updateStatus(id, 'pending')
-                return { success: false, message: 'Failed to create browser context' }
-            }
 
-            const handler = new AgenticLoginHandler()
-            const result = await handler.executeLogin(page, account, id)
+            // Prefer deterministic auto (with TOTP) even in visible; leaves open only on hard require
+            const loginResult = await googleAuthHandler.login(
+                account.email,
+                account.password,
+                { headless: false, profilePath },
+                account.twoFactorSecret || undefined
+            )
+            contextId = loginResult.contextId >= 0 ? loginResult.contextId : contextId
 
-            // Even if AI fails, we leave the browser open so user can do it manually,
-            // but we alert them if it's successful.
-            if (result.success) {
+            if (loginResult.success) {
                 await googleAuthHandler.saveSession(contextId, profilePath)
+                try {
+                    const ctx = browserService.getContext(contextId)
+                    if (ctx) {
+                        const ck = await ctx.cookies().catch(() => [])
+                        if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
+                    }
+                } catch {}
                 await accountService.updateStatus(id, 'active')
-                return { success: true, message: 'AI Login successful!' }
+                await accountService.updateLastUsed(id)
+                return { success: true, message: 'Visible auto-login successful!' }
             }
 
-            if (result.requiresManual) {
+            if (loginResult.requires2FA || loginResult.error?.includes('2FA')) {
                 keepContextOpen = true
                 await accountService.updateStatus(id, 'pending')
                 return {
                     success: false,
-                    message: 'AI requires manual intervention. Trình duyệt đã mở, vui lòng thao tác tiếp.',
+                    message: 'Trình duyệt đã mở (cần thao tác 2FA/CAPTCHA). Hãy hoàn tất rồi đóng hoặc dùng Kiểm tra.',
                     needs2FA: true,
                     contextId,
                 }
             }
 
             await accountService.updateStatus(id, 'banned')
-            return { success: false, message: result.error || 'AI login failed' }
+            return { success: false, message: loginResult.error || 'Visible login failed' }
         } catch (error) {
             await accountService.updateStatus(id, 'pending')
             return {
@@ -345,15 +361,47 @@ export function registerAccountHandlers() {
             // Update account profilePath in DB
             await accountService.update(id, { profilePath })
 
-            // When browser is closed by user, update status
+            // Detect login success and persist cookies + status (do not blindly trust close)
+            const trySaveLoginState = async () => {
+                try {
+                    // Simple detection: wait a bit for myaccount or account menu
+                    const isNowLogged = await page.url().includes('myaccount') || await page.$('img[aria-label*="Google Account"], a[aria-label*="Google Account"]').catch(() => null)
+                    if (isNowLogged || page.url().match(/google\.com(?!.*(signin|ServiceLogin))/)) {
+                        await accountService.updateStatus(id, 'active')
+                        await accountService.updateLastUsed(id)
+                        // Save profile state + cookies JSON
+                        try { await page.context().storageState({ path: join(profilePath, 'state.json') }).catch(()=>{}) } catch {}
+                        try {
+                            const ck = await page.context().cookies().catch(() => [])
+                            if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
+                        } catch {}
+                        console.log(`[ManualLogin] Detected login for ${account.email}, saved cookies + active`)
+                    }
+                } catch {}
+            }
+
+            // Poll briefly for login detection (non-blocking)
+            ;(async () => {
+                for (let i = 0; i < 12; i++) { // ~1min total
+                    await new Promise(r => setTimeout(r, 5000))
+                    if (!openManualBrowsers.has(id)) break
+                    await trySaveLoginState()
+                }
+            })()
+
+            // On close also attempt save (user may have logged in)
             context.on('close', async () => {
                 openManualBrowsers.delete(id)
-                // Set account as active since user presumably logged in
-                await accountService.updateStatus(id, 'active')
-                console.log(`[ManualLogin] Browser closed for ${account.email}, set status to active`)
+                await trySaveLoginState()
+                // If still pending after close, leave as pending (user can check)
+                const fresh = await accountService.getById(id)
+                if (fresh && fresh.status === 'pending') {
+                    // do not force active; user must succeed
+                }
+                console.log(`[ManualLogin] Browser closed for ${account.email}`)
             })
 
-            return { success: true, message: 'Browser đã mở! Hãy đăng nhập Google rồi đóng browser.' }
+            return { success: true, message: 'Browser đã mở! Hãy đăng nhập Google. App sẽ tự lưu phiên khi phát hiện thành công.' }
         } catch (error) {
             openManualBrowsers.delete(id)
             return {

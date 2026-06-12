@@ -6,6 +6,7 @@ interface Account {
     password: string
     recoveryEmail?: string
     recoveryPhone?: string
+    twoFactorSecret?: string
     cookies?: string
     profilePath?: string
     loginType: 'auto' | 'manual'
@@ -38,10 +39,10 @@ interface AccountStore {
     // Actions
     fetchAccounts: () => Promise<void>
     fetchStats: () => Promise<void>
-    addAccount: (data: { email: string; password: string; recoveryEmail?: string; recoveryPhone?: string; loginType?: 'auto' | 'manual' }) => Promise<void>
+    addAccount: (data: { email: string; password: string; recoveryEmail?: string; recoveryPhone?: string; loginType?: 'auto' | 'manual'; twoFactorSecret?: string }) => Promise<void>
     updateAccount: (id: number, data: Partial<Account>) => Promise<void>
     deleteAccount: (id: number) => Promise<void>
-    importAccounts: (accounts: { email: string; password: string }[]) => Promise<number>
+    importAccounts: (accounts: { email: string; password: string; twoFactorSecret?: string; loginType?: 'auto' | 'manual' }[]) => Promise<number>
     testLogin: (id: number) => Promise<any>
     loginVisible: (id: number) => Promise<any>
     checkLiveDie: (id: number) => Promise<AccountLiveCheckResult>

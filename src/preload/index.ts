@@ -9,18 +9,26 @@ type AccountAddPayload = {
     recoveryEmail?: string
     recoveryPhone?: string
     loginType?: AccountLoginType
+    twoFactorSecret?: string
 }
 
-type AccountUpdatePayload = Partial<Pick<
-    Account,
-    'email' | 'password' | 'recoveryEmail' | 'recoveryPhone' | 'loginType' | 'status'
->>
+type AccountUpdatePayload = Partial<{
+    email?: string
+    password?: string
+    recoveryEmail?: string | null
+    recoveryPhone?: string | null
+    loginType?: 'auto' | 'manual'
+    status?: string
+    twoFactorSecret?: string | null
+}>
 
 type AccountImportPayload = {
     email: string
     password: string
     recoveryEmail?: string
     recoveryPhone?: string
+    twoFactorSecret?: string
+    loginType?: AccountLoginType
 }
 
 type AccountLiveCheckResult = {

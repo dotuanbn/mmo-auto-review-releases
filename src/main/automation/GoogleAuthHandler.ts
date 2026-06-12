@@ -1,19 +1,54 @@
 import { Page } from 'playwright'
 import { browserService, BrowserConfig } from './BrowserService'
+import * as crypto from 'crypto'
 
 export interface GoogleLoginResult {
     success: boolean
     error?: string
     requires2FA?: boolean
+    contextId?: number
 }
 
 export class GoogleAuthHandler {
-    // Login to Google account
+    // Inline TOTP (same logic as AccountService for independence, no plaintext secret log)
+    private generateTOTP(secret: string): string {
+        try {
+            const base32chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+            const cleanSecret = secret.replace(/\s/g, '').toUpperCase()
+            let bits = ''
+            for (const char of cleanSecret) {
+                const val = base32chars.indexOf(char)
+                if (val === -1) continue
+                bits += val.toString(2).padStart(5, '0')
+            }
+            const bytes: number[] = []
+            for (let i = 0; i < bits.length - 7; i += 8) {
+                bytes.push(parseInt(bits.substr(i, 8), 2))
+            }
+            const key = Buffer.from(bytes)
+            const epoch = Math.floor(Date.now() / 1000)
+            const timeStep = Math.floor(epoch / 30)
+            const timeBuffer = Buffer.alloc(8)
+            timeBuffer.writeBigUInt64BE(BigInt(timeStep))
+            const hmac = crypto.createHmac('sha1', key)
+            hmac.update(timeBuffer)
+            const hash = hmac.digest()
+            const offset = hash[hash.length - 1] & 0x0f
+            const binary = ((hash[offset] & 0x7f) << 24) | ((hash[offset + 1] & 0xff) << 16) | ((hash[offset + 2] & 0xff) << 8) | (hash[offset + 3] & 0xff)
+            const otp = binary % 1000000
+            return otp.toString().padStart(6, '0')
+        } catch {
+            return ''
+        }
+    }
+
+    // Login to Google account (supports auto 2FA TOTP if secret provided)
     async login(
         email: string,
         password: string,
-        config?: BrowserConfig
-    ): Promise<{ success: boolean; contextId: number; error?: string }> {
+        config?: BrowserConfig,
+        twoFactorSecret?: string | null
+    ): Promise<{ success: boolean; contextId: number; error?: string; requires2FA?: boolean }> {
         const contextId = await browserService.createContext(config)
         const page = browserService.getPage(contextId)
 
@@ -22,34 +57,41 @@ export class GoogleAuthHandler {
         }
 
         try {
-            // Navigate to Google login
             await page.goto('https://accounts.google.com/signin', { waitUntil: 'networkidle' })
             await browserService.randomDelay(1000, 2000)
 
-            // Enter email
             await this.enterEmail(page, email)
             await browserService.randomDelay(2000, 4000)
 
-            // Check for error
             if (await this.hasError(page)) {
                 return { success: false, contextId, error: 'Email not found or invalid' }
             }
 
-            // Enter password
             await this.enterPassword(page, password)
             await browserService.randomDelay(2000, 4000)
 
-            // Check for 2FA
-            if (await this.requires2FA(page)) {
-                return { success: false, contextId, error: '2FA required - please complete manually' }
-            }
-
-            // Check for password error
             if (await this.hasPasswordError(page)) {
                 return { success: false, contextId, error: 'Incorrect password' }
             }
 
-            // Check if logged in
+            // Auto handle TOTP 2FA if secret available
+            if (await this.requires2FA(page)) {
+                if (twoFactorSecret) {
+                    const code = this.generateTOTP(twoFactorSecret)
+                    if (code) {
+                        const submitted = await this.enter2FACode(page, code)
+                        if (submitted) {
+                            await browserService.randomDelay(2000, 4000)
+                            const loggedIn = await this.isLoggedIn(page)
+                            if (loggedIn) {
+                                return { success: true, contextId }
+                            }
+                        }
+                    }
+                }
+                return { success: false, contextId, error: '2FA required - please complete manually', requires2FA: true }
+            }
+
             const isLoggedIn = await this.isLoggedIn(page)
             if (isLoggedIn) {
                 return { success: true, contextId }
@@ -115,19 +157,60 @@ export class GoogleAuthHandler {
         }
     }
 
-    // Check if 2FA is required
+    // Check if 2FA is required (TOTP code input)
     private async requires2FA(page: Page): Promise<boolean> {
         try {
             const twoFASelectors = [
-                'input[type="tel"]', // Phone verification
-                '#idvPin', // PIN input
+                'input[type="tel"]',
+                '#totpPin',
+                'input[name="totpPin"]',
+                'input[autocomplete="one-time-code"]',
                 'text="2-Step Verification"',
                 'text="Xác minh 2 bước"',
+                'text="Enter code"',
+                'text="Nhập mã"',
             ]
-
             for (const selector of twoFASelectors) {
                 const element = await page.$(selector)
                 if (element) return true
+            }
+            // Fallback: look for common 6-digit prompt text
+            const bodyText = await page.textContent('body').catch(() => '')
+            if (bodyText && /enter.*code|nhập.*mã|2-step|2 bước|verification code/i.test(bodyText)) return true
+            return false
+        } catch {
+            return false
+        }
+    }
+
+    // Enter TOTP code (auto for secret case)
+    private async enter2FACode(page: Page, code: string): Promise<boolean> {
+        try {
+            const selectors = [
+                '#totpPin',
+                'input[name="totpPin"]',
+                'input[type="tel"]',
+                'input[autocomplete="one-time-code"]',
+                'input[aria-label*="code" i]',
+            ]
+            let input = null
+            for (const sel of selectors) {
+                input = await page.$(sel)
+                if (input) break
+            }
+            if (!input) {
+                // Try any visible text/tel input on 2fa step
+                const inputs = await page.$$('input[type="text"], input[type="tel"]')
+                if (inputs.length > 0) input = inputs[0]
+            }
+            if (input) {
+                await input.fill('')
+                await input.type(code, { delay: 60 })
+                await browserService.randomDelay(400, 800)
+                // Submit
+                await page.keyboard.press('Enter')
+                await browserService.randomDelay(1500, 2500)
+                return true
             }
             return false
         } catch {
