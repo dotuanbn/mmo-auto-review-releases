@@ -220,7 +220,27 @@ export class BrowserService {
         return profilesPath
     }
 
+    private cleanChromeLockFiles(profilePath: string): void {
+        if (!existsSync(profilePath)) return
+        // Stale singleton/lock files from crashed Chrome or prior launch cause "context closed" immediately on next launchPersistentContext
+        const lockNames = ['SingletonLock', 'SingletonCookie', 'LOCK', 'LOCK~', 'LOCK.bak']
+        for (const name of lockNames) {
+            const p = join(profilePath, name)
+            try {
+                if (existsSync(p)) {
+                    rmSync(p, { force: true })
+                    logProxy(`[BrowserService] Removed stale Chrome lock: ${name}`)
+                }
+            } catch {
+                // Locked by live Chrome or permission — ignore, launch will surface real conflict if any
+            }
+        }
+    }
+
     private prepareProfileDirectory(profilePath: string, cleanProfileOnStart: boolean): string {
+        // Always attempt stale lock recovery first (critical for account profile reuse after crash/other Chrome)
+        this.cleanChromeLockFiles(profilePath)
+
         if (cleanProfileOnStart && existsSync(profilePath)) {
             rmSync(profilePath, { recursive: true, force: true })
         }

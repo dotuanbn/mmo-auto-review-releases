@@ -435,9 +435,13 @@ export class AccountService {
             }
         } catch (error) {
             await this.updateStatus(id, 'pending')
+            const raw = error instanceof Error ? error.message : 'Unknown error'
+            const friendly = /target page, context or browser has been closed|launchPersistentContext/i.test(raw)
+                ? 'Không mở được trình duyệt (profile bị khóa hoặc xung đột Chrome). Đóng Chrome khác, thử lại hoặc reset profile.'
+                : raw
             return {
                 alive: false,
-                error: error instanceof Error ? error.message : 'Unknown error'
+                error: friendly
             }
         } finally {
             if (contextId !== null) {

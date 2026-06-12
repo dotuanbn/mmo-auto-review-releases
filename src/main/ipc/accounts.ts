@@ -1,6 +1,5 @@
 import { ipcMain } from 'electron'
 import { accountService } from '../services/AccountService'
-import { chromium } from 'playwright'
 import { profileService } from '../services/ProfileService'
 import { existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
@@ -55,6 +54,18 @@ function sanitizeAccountUpdatePayload(data: unknown): Partial<Account> {
     }
 
     return update
+}
+
+function toFriendlyAccountError(err: unknown): string {
+    const raw = err instanceof Error ? err.message : String(err ?? 'Unknown error')
+    // Never leak secrets/args; map launch/profile closed (common lock or conflict) to actionable UI text
+    if (/target page, context or browser has been closed|launchPersistentContext|browser has been closed/i.test(raw)) {
+        return 'Không mở được trình duyệt (profile có thể bị khóa bởi Chrome khác hoặc lỗi khởi động). Đóng Chrome đang dùng, thử lại hoặc xóa profile rồi đăng nhập.'
+    }
+    if (/executablePath|channel|user-data-dir/i.test(raw)) {
+        return 'Lỗi cấu hình trình duyệt. Vui lòng thử lại hoặc kiểm tra Chrome đã cài.'
+    }
+    return raw.length > 200 ? raw.slice(0, 200) + '...' : raw
 }
 
 export function registerAccountHandlers() {
@@ -142,31 +153,26 @@ export function registerAccountHandlers() {
 
             await accountService.updateStatus(id, 'checking')
 
-            const { browserService } = await import('../automation/BrowserService')
             const { googleAuthHandler } = await import('../automation/GoogleAuthHandler')
             const { profileService } = await import('../services/ProfileService')
 
             const profilePath = account.profilePath || await profileService.createProfile(id, account.email)
 
-            contextId = await browserService.createContext({
-                headless: loadSettings().headless ?? false,
-                profilePath,
-            })
-
-            // Use deterministic GoogleAuth + built-in TOTP (full auto, no user action)
+            // Single create via handler (reuses BrowserService with channel/args/stealth/lock-clean). No outer create to avoid same-profile lock conflict.
             const loginResult = await googleAuthHandler.login(
                 account.email,
                 account.password,
                 { headless: loadSettings().headless ?? false, profilePath },
                 account.twoFactorSecret || undefined
             )
-            contextId = loginResult.contextId >= 0 ? loginResult.contextId : contextId
+            contextId = loginResult.contextId >= 0 ? loginResult.contextId : null
 
             if (loginResult.success) {
-                await googleAuthHandler.saveSession(contextId, profilePath)
+                await googleAuthHandler.saveSession(contextId!, profilePath)
                 // Explicitly persist cookies JSON to accounts.cookies for Traffic/Review engines
                 try {
-                    const ctx = browserService.getContext(contextId)
+                    const { browserService } = await import('../automation/BrowserService')
+                    const ctx = browserService.getContext(contextId!)
                     if (ctx) {
                         const ck = await ctx.cookies().catch(() => [])
                         if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
@@ -188,7 +194,7 @@ export function registerAccountHandlers() {
             await accountService.updateStatus(id, 'pending')
             return {
                 success: false,
-                message: error instanceof Error ? error.message : 'Unknown error',
+                message: toFriendlyAccountError(error),
             }
         } finally {
             if (contextId !== null) {
@@ -216,30 +222,25 @@ export function registerAccountHandlers() {
 
             await accountService.updateStatus(id, 'checking')
 
-            const { browserService } = await import('../automation/BrowserService')
             const { googleAuthHandler } = await import('../automation/GoogleAuthHandler')
             const { profileService } = await import('../services/ProfileService')
 
             const profilePath = account.profilePath || await profileService.createProfile(id, account.email)
 
-            contextId = await browserService.createContext({
-                headless: false,
-                profilePath,
-            })
-
-            // Prefer deterministic auto (with TOTP) even in visible; leaves open only on hard require
+            // Single create via handler (BrowserService channel/args/stealth + lock clean). No duplicate create on same profile.
             const loginResult = await googleAuthHandler.login(
                 account.email,
                 account.password,
                 { headless: false, profilePath },
                 account.twoFactorSecret || undefined
             )
-            contextId = loginResult.contextId >= 0 ? loginResult.contextId : contextId
+            contextId = loginResult.contextId >= 0 ? loginResult.contextId : null
 
             if (loginResult.success) {
-                await googleAuthHandler.saveSession(contextId, profilePath)
+                await googleAuthHandler.saveSession(contextId!, profilePath)
                 try {
-                    const ctx = browserService.getContext(contextId)
+                    const { browserService } = await import('../automation/BrowserService')
+                    const ctx = browserService.getContext(contextId!)
                     if (ctx) {
                         const ck = await ctx.cookies().catch(() => [])
                         if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
@@ -267,7 +268,7 @@ export function registerAccountHandlers() {
             await accountService.updateStatus(id, 'pending')
             return {
                 success: false,
-                message: error instanceof Error ? error.message : 'Unknown error',
+                message: toFriendlyAccountError(error),
             }
         } finally {
             if (contextId !== null && !keepContextOpen) {
@@ -295,7 +296,7 @@ export function registerAccountHandlers() {
         }
     })
 
-    // Open browser for manual login - user logs in themselves
+    // Open browser for manual login - user logs in themselves (now reuses BrowserService for consistent channel/args/stealth/lock-clean; keeps context alive until user closes or login detected)
     ipcMain.handle('accounts:openManualLogin', async (_event, id: number) => {
         try {
             // Check if browser already open for this account
@@ -308,22 +309,18 @@ export function registerAccountHandlers() {
                 return { success: false, message: 'Không tìm thấy tài khoản' }
             }
 
-            // Determine profile path
+            // Determine profile path (prefer service, heal legacy traffic_profiles if needed)
             let profilePath = account.profilePath
             if (!profilePath || !existsSync(profilePath)) {
-                // Try legacy naming
                 const basePath = profileService.getProfilesPath()
                 const emailClean = account.email.replace(/[@.]/g, '_')
                 const legacyPath = join(basePath, `profile_${account.id}_${emailClean}`)
                 if (existsSync(legacyPath)) {
                     profilePath = legacyPath
                 } else {
-                    // Create new profile
                     profilePath = await profileService.createProfile(account.id, account.email)
                 }
             }
-
-            // Also check traffic_profiles folder
             if (!profilePath || !existsSync(profilePath)) {
                 const { app } = await import('electron')
                 const trafficPath = join(app.getPath('userData'), 'traffic_profiles', `account_${account.id}_${account.email.replace(/[@.]/g, '_')}`)
@@ -331,8 +328,6 @@ export function registerAccountHandlers() {
                     profilePath = trafficPath
                 }
             }
-
-            // If still no profile path, create one
             if (!profilePath) {
                 const { app } = await import('electron')
                 profilePath = join(app.getPath('userData'), 'traffic_profiles', `account_${account.id}_${account.email.replace(/[@.]/g, '_')}`)
@@ -341,38 +336,43 @@ export function registerAccountHandlers() {
 
             console.log(`[ManualLogin] Opening browser for ${account.email}, profile: ${profilePath}`)
 
-            // Launch persistent context (headless: false so user can see)
-            const context = await chromium.launchPersistentContext(profilePath, {
+            const { browserService } = await import('../automation/BrowserService')
+
+            // Use BrowserService (channel:'chrome' + full stable args + StealthPatcher + fingerprint + lock recovery) — fixes instant close
+            const contextId = await browserService.createContext({
                 headless: false,
-                viewport: { width: 1366, height: 768 },
-                args: [
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-infobars',
-                    '--no-first-run',
-                ],
+                profilePath,
             })
+            openManualBrowsers.set(id, contextId)
 
-            openManualBrowsers.set(id, context)
+            // Navigate to Google signin (reuse service page if present)
+            const rawContext = browserService.getContext(contextId)
+            let page = browserService.getPage(contextId)
+            if (!page && rawContext) {
+                page = rawContext.pages().find(p => !p.isClosed()) || await rawContext.newPage()
+            }
+            if (page) {
+                await page.goto('https://accounts.google.com/signin', { waitUntil: 'domcontentloaded' }).catch(() => {})
+            }
 
-            // Navigate to Google login
-            const page = context.pages()[0] || await context.newPage()
-            await page.goto('https://accounts.google.com/signin', { waitUntil: 'domcontentloaded' })
-
-            // Update account profilePath in DB
+            // Persist profilePath
             await accountService.update(id, { profilePath })
 
-            // Detect login success and persist cookies + status (do not blindly trust close)
+            // Detect + save cookies/state to accounts.cookies (compat with engines); idempotent
             const trySaveLoginState = async () => {
                 try {
-                    // Simple detection: wait a bit for myaccount or account menu
-                    const isNowLogged = await page.url().includes('myaccount') || await page.$('img[aria-label*="Google Account"], a[aria-label*="Google Account"]').catch(() => null)
-                    if (isNowLogged || page.url().match(/google\.com(?!.*(signin|ServiceLogin))/)) {
+                    const ctx = browserService.getContext(contextId) || rawContext
+                    if (!ctx) return
+                    const currentPage = browserService.getPage(contextId) || (ctx.pages ? ctx.pages().find((p: any) => !p.isClosed()) : null)
+                    const url = currentPage ? currentPage.url() : ''
+                    const hasAvatar = currentPage ? await currentPage.$('img[aria-label*="Google Account"], a[aria-label*="Google Account"]').catch(() => null) : null
+                    const loggedByUrl = url.includes('myaccount') || (url.includes('google.com') && !/signin|ServiceLogin|accounts\.google\.com\/ServiceLogin/i.test(url))
+                    if (loggedByUrl || hasAvatar) {
                         await accountService.updateStatus(id, 'active')
                         await accountService.updateLastUsed(id)
-                        // Save profile state + cookies JSON
-                        try { await page.context().storageState({ path: join(profilePath, 'state.json') }).catch(()=>{}) } catch {}
+                        try { await ctx.storageState({ path: join(profilePath, 'state.json') }).catch(() => {}) } catch {}
                         try {
-                            const ck = await page.context().cookies().catch(() => [])
+                            const ck = await ctx.cookies().catch(() => [])
                             if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
                         } catch {}
                         console.log(`[ManualLogin] Detected login for ${account.email}, saved cookies + active`)
@@ -380,33 +380,32 @@ export function registerAccountHandlers() {
                 } catch {}
             }
 
-            // Poll briefly for login detection (non-blocking)
+            // Poll for detection (non-blocking, ~60s; stops if map entry removed)
             ;(async () => {
-                for (let i = 0; i < 12; i++) { // ~1min total
+                for (let i = 0; i < 12; i++) {
                     await new Promise(r => setTimeout(r, 5000))
                     if (!openManualBrowsers.has(id)) break
                     await trySaveLoginState()
                 }
             })()
 
-            // On close also attempt save (user may have logged in)
-            context.on('close', async () => {
-                openManualBrowsers.delete(id)
-                await trySaveLoginState()
-                // If still pending after close, leave as pending (user can check)
-                const fresh = await accountService.getById(id)
-                if (fresh && fresh.status === 'pending') {
-                    // do not force active; user must succeed
-                }
-                console.log(`[ManualLogin] Browser closed for ${account.email}`)
-            })
+            // On user close (or external), save state/cookies then cleanup service map (no force-kill of active)
+            if (rawContext) {
+                rawContext.on('close', async () => {
+                    openManualBrowsers.delete(id)
+                    await trySaveLoginState()
+                    try { await browserService.closeContext(contextId) } catch {}
+                    // Leave status as-is if pending (user decides); active only on successful detect
+                    console.log(`[ManualLogin] Browser closed for ${account.email}`)
+                })
+            }
 
             return { success: true, message: 'Browser đã mở! Hãy đăng nhập Google. App sẽ tự lưu phiên khi phát hiện thành công.' }
         } catch (error) {
             openManualBrowsers.delete(id)
             return {
                 success: false,
-                message: error instanceof Error ? error.message : 'Lỗi không xác định',
+                message: toFriendlyAccountError(error),
             }
         }
     })
