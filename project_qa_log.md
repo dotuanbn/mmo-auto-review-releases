@@ -172,3 +172,9 @@ Last updated: 2026-05-28
 - Fix (targeted, per plan/SOP): Added norm+early 'Thiếu mật khẩu' guard in login() (before createContext) + ipc callers + checkLiveDie; rewrote enterEmail/enterPassword with primary selectors + wait visible 15s + humanType+fill fallback; new clickNextButton (id/button/role=button/text + Enter); explicit pwd wait; improved requires2FA/enter2FA with waits; cleaned isLoggedIn call; status unchanged (pending on non-disabled). Only 3 files. Reuses BrowserService fully.
 - Verification: npm run typecheck:main + :renderer = PASS (0 errors). No pw ever logged. Self-review: no other modules touched (traffic/review/manual safe), funcs small, fallbacks defensive, cookie detect primary preserved. No N+1/DI/sec issues.
 - Recorded in memory. Short output only.
+
+## 2026-06-xx (Auto-login: recovery email "Verify it's you" challenge)
+- User: Auto-login types email+pass but fails "Verify it's you" (/challenge/selection) even when recoveryEmail saved. Req: in GoogleAuthHandler.login after pwd: detect selection/verify title -> if recoveryEmail click "Confirm your recovery email"/"Xác nhận email khôi phục" (text search + clickable parent), wait input[name=knowledgePreregisteredEmailResponse] or type=email, humanType+fill, reuse clickNext, verify login. No recov/other chal -> 'Cần xác minh thủ công: <loại>' (pending, not banned). Pass recoveryEmail from ipc callers. Reuses, ~12s waits, no secrets.
+- Fix: extended login sig + callers (testLogin, loginVisible), added handleRecoveryEmailChallenge + 2 small helpers (detect/click opt/wait input). 2 files. typecheck PASS. Per SOP, user short-final constraint, context/qa sync.
+- Self-review: catch per step, reuse clickNext/isDisabled/humanType/isGoogleLoggedIn (cookies), pending only on non-disabled, no break 2FA/manual/traffic, strict TS, <50LOC helpers. No secret log. 
+- Recorded. Short output only.

@@ -54,7 +54,8 @@ export class GoogleAuthHandler {
         email: string,
         password: string,
         config?: BrowserConfig,
-        twoFactorSecret?: string | null
+        twoFactorSecret?: string | null,
+        recoveryEmail?: string | null
     ): Promise<{ success: boolean; contextId: number; error?: string; requires2FA?: boolean }> {
         const normalizedEmail = this.normalizeEmailForLogin(email)
         if (!normalizedEmail || !normalizedEmail.trim()) {
@@ -92,6 +93,12 @@ export class GoogleAuthHandler {
 
             if (await this.isAccountDisabledOrSuspended(page)) {
                 return { success: false, contextId, error: 'Account disabled or suspended by Google' }
+            }
+
+            // Handle "Verify it's you" (challenge/selection) recovery email step if present (after password)
+            const chal = await this.handleRecoveryEmailChallenge(page, recoveryEmail || null).catch(() => null)
+            if (chal && chal.error) {
+                return { success: false, contextId, error: chal.error }
             }
 
             // Auto handle TOTP 2FA if secret available
@@ -362,6 +369,128 @@ export class GoogleAuthHandler {
         } catch {
             return false
         }
+    }
+
+    // Handle recovery email challenge after password (selection -> kpe input). Returns early error only for pending cases (never banned here).
+    private async handleRecoveryEmailChallenge(page: Page, recoveryEmail: string | null): Promise<{ handled?: boolean; error?: string }> {
+        try {
+            await browserService.randomDelay(1200, 2200)
+            const url = page.url()
+            let bodyText = ''
+            try {
+                bodyText = (await page.textContent('body', { timeout: 4000 }).catch(() => '')) || ''
+            } catch {}
+            const lower = bodyText.toLowerCase()
+            const isSelection = url.includes('/challenge/selection') ||
+                url.includes('/v3/signin/challenge') ||
+                /verify it'?s you|xác minh đó là bạn/i.test(lower) ||
+                /challenge/i.test(url)
+            if (!isSelection) return { handled: false }
+
+            const hasRecoveryOpt = /confirm your recovery email|xác nhận email khôi phục/i.test(lower)
+            const isPhoneLike = /phone|sms|verification code at|use your phone|xác nhận bằng điện thoại|get a verification code/i.test(lower)
+
+            if (!recoveryEmail || !recoveryEmail.trim()) {
+                const msg = hasRecoveryOpt
+                    ? 'Cần xác minh thủ công: Xác nhận email khôi phục'
+                    : (isPhoneLike ? 'Cần xác minh thủ công: Xác minh điện thoại' : 'Cần xác minh thủ công: Bước xác minh Google')
+                return { handled: true, error: msg }
+            }
+
+            // Have recoveryEmail: click option
+            const clicked = await this.clickRecoveryEmailOption(page)
+            if (!clicked) {
+                return { handled: true, error: 'Cần xác minh thủ công: Không tìm thấy tùy chọn email khôi phục' }
+            }
+            await browserService.randomDelay(1000, 2000)
+
+            // Wait input (primary name per Google v3 kpe, fallback type=email)
+            const inputSel = await this.waitForRecoveryEmailInput(page)
+            if (!inputSel) {
+                return { handled: true, error: 'Cần xác minh thủ công: Không tìm thấy ô nhập email khôi phục' }
+            }
+
+            try {
+                await browserService.humanType(page, inputSel, recoveryEmail.trim())
+            } catch {
+                await page.fill(inputSel, recoveryEmail.trim()).catch(() => {})
+            }
+            await browserService.randomDelay(400, 900)
+
+            // Reuse robust next (covers text EN/VI, role=button, #next, Enter fallback)
+            await this.clickNextButton(page, false)
+            await browserService.randomDelay(1800, 3200)
+
+            if (await this.isAccountDisabledOrSuspended(page)) {
+                return { handled: true, error: 'Account disabled or suspended by Google' }
+            }
+            return { handled: true }
+        } catch {
+            return { handled: false }
+        }
+    }
+
+    // Click "Confirm your recovery email" (EN/VI). Search text then clickable container (div[role], li, button etc).
+    private async clickRecoveryEmailOption(page: Page): Promise<boolean> {
+        const phrases = ['Confirm your recovery email', 'Xác nhận email khôi phục']
+        for (const phrase of phrases) {
+            try {
+                const loc = page.locator(`text="${phrase}"`).first()
+                if (await loc.count() > 0) {
+                    const visible = await loc.isVisible().catch(() => false)
+                    if (visible) {
+                        await loc.click({ timeout: 5000 }).catch(async () => {
+                            const h = await loc.elementHandle().catch(() => null)
+                            if (h) await h.click().catch(() => {})
+                        })
+                        return true
+                    }
+                }
+                // Fallback $ text=
+                const el = await page.$(`text=${phrase}`).catch(() => null)
+                if (el && await el.isVisible().catch(() => false)) {
+                    await el.click().catch(async () => {
+                        const box = await el.boundingBox().catch(() => null)
+                        if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => {})
+                    })
+                    return true
+                }
+            } catch {}
+        }
+        // Broad container scan
+        try {
+            const containers = await page.$$('div[role="link"],div[role="button"],li,button,[role="listitem"],a,[data-challengeid]')
+            for (const c of containers) {
+                const txt = ((await c.textContent().catch(() => '')) || '').toLowerCase()
+                if (txt.includes('confirm your recovery') || txt.includes('xác nhận email khôi phục')) {
+                    if (await c.isVisible().catch(() => false)) {
+                        await c.click().catch(async () => {
+                            const b = await c.boundingBox().catch(() => null)
+                            if (b) await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2).catch(() => {})
+                        })
+                        return true
+                    }
+                }
+            }
+        } catch {}
+        return false
+    }
+
+    // Wait for recovery email input with 12s timeout per sel (per req ~10-15s)
+    private async waitForRecoveryEmailInput(page: Page): Promise<string | null> {
+        const sels = [
+            'input[name="knowledgePreregisteredEmailResponse"]',
+            'input[type="email"]',
+            'input[autocomplete*="email" i]',
+            'input[name*="email" i]'
+        ]
+        for (const sel of sels) {
+            try {
+                await page.waitForSelector(sel, { state: 'visible', timeout: 12000 })
+                return sel
+            } catch { /* try next */ }
+        }
+        return null
     }
 
     // Handle 2FA with backup code

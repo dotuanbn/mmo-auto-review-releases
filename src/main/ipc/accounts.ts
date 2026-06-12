@@ -167,7 +167,8 @@ export function registerAccountHandlers() {
                 account.email,
                 account.password,
                 { headless: loadSettings().headless ?? false, profilePath },
-                account.twoFactorSecret || undefined
+                account.twoFactorSecret || undefined,
+                account.recoveryEmail || undefined
             )
             contextId = loginResult.contextId >= 0 ? loginResult.contextId : null
 
@@ -245,7 +246,8 @@ export function registerAccountHandlers() {
                 account.email,
                 account.password,
                 { headless: false, profilePath },
-                account.twoFactorSecret || undefined
+                account.twoFactorSecret || undefined,
+                account.recoveryEmail || undefined
             )
             contextId = loginResult.contextId >= 0 ? loginResult.contextId : null
 
