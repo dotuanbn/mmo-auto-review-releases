@@ -39,7 +39,7 @@ interface AccountStore {
     // Actions
     fetchAccounts: () => Promise<void>
     fetchStats: () => Promise<void>
-    addAccount: (data: { email: string; password: string; recoveryEmail?: string; recoveryPhone?: string; loginType?: 'auto' | 'manual'; twoFactorSecret?: string }) => Promise<void>
+    addAccount: (data: { email: string; password: string; recoveryEmail?: string; recoveryPhone?: string; loginType?: 'auto' | 'manual'; twoFactorSecret?: string }) => Promise<any>
     updateAccount: (id: number, data: Partial<Account>) => Promise<void>
     deleteAccount: (id: number) => Promise<void>
     importAccounts: (accounts: { email: string; password: string; twoFactorSecret?: string; loginType?: 'auto' | 'manual' }[]) => Promise<number>
@@ -77,11 +77,14 @@ export const useAccountStore = create<AccountStore>((set, get) => ({
     addAccount: async (data) => {
         set({ loading: true, error: null })
         try {
-            await window.electronAPI.accounts.add(data)
+            const created = await window.electronAPI.accounts.add(data)
             await get().fetchAccounts()
             await get().fetchStats()
+            set({ loading: false })
+            return created
         } catch (error) {
             set({ error: error instanceof Error ? error.message : 'Failed to add account', loading: false })
+            return undefined
         }
     },
 

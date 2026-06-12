@@ -94,6 +94,13 @@ function AccountsTab() {
     const [checkingAll, setCheckingAll] = useState(false)
     const dropdownRef = useRef<HTMLDivElement | null>(null)
 
+    // Normalize short email (no @) -> @gmail.com before save/login. Applied for add + import.
+    const normalizeEmail = (email: string): string => {
+        const t = (email || '').trim()
+        if (!t) return t
+        return t.includes('@') ? t : `${t}@gmail.com`
+    }
+
     useEffect(() => {
         fetchAccounts()
         fetchStats()
@@ -115,9 +122,63 @@ function AccountsTab() {
 
     const handleAddAccount = async () => {
         if (!newAccount.email || !newAccount.password) return
-        await addAccount(newAccount as any)
+        const payload = { ...newAccount, email: normalizeEmail(newAccount.email) }
+        const created: any = await addAccount(payload as any)
         setNewAccount({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' })
         setShowAddModal(false)
+
+        // Post-add auto-trigger per loginType (reuses existing testLogin / openManualLogin flows + loginStates UI)
+        // Non-blocking: modal closed, list refreshed inside addAccount; bg login updates status + temp loginStates.
+        if (created && created.id) {
+            const id: number = created.id
+            const lt: 'auto' | 'manual' = created.loginType || 'auto'
+            if (lt === 'auto') {
+                setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Đang đăng nhập...' } }))
+                try {
+                    const result = await testLogin(id)
+                    setLoginStates(prev => ({
+                        ...prev,
+                        [id]: { status: result?.success ? 'success' : 'failed', message: result?.message }
+                    }))
+                    setTimeout(() => {
+                        setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                    }, 5000)
+                } catch {
+                    setLoginStates(prev => ({ ...prev, [id]: { status: 'failed', message: 'Lỗi auto login' } }))
+                    setTimeout(() => {
+                        setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                    }, 5000)
+                }
+            } else {
+                setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Dang mo browser...' } }))
+                try {
+                    const result = await window.electronAPI.accounts.openManualLogin(id)
+                    if (result.success) {
+                        setLoginStates(prev => ({
+                            ...prev,
+                            [id]: { status: 'logging_in', message: 'Browser da mo - hay dang nhap!' }
+                        }))
+                        // Manual poll/close in main will auto set active/pending + cookies; state cleared on next user action or refresh
+                    } else {
+                        setLoginStates(prev => ({
+                            ...prev,
+                            [id]: { status: 'failed', message: result.message }
+                        }))
+                        setTimeout(() => {
+                            setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                        }, 5000)
+                    }
+                } catch {
+                    setLoginStates(prev => ({
+                        ...prev,
+                        [id]: { status: 'failed', message: 'Loi mo browser' }
+                    }))
+                    setTimeout(() => {
+                        setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                    }, 5000)
+                }
+            }
+        }
     }
 
     const handleImport = async () => {
@@ -134,7 +195,7 @@ function AccountsTab() {
             const parts = line.split(/[:|,;\t]/).map(p => p.trim()).filter(Boolean)
             if (parts.length < 2) continue
             const entry: any = {
-                email: parts[0],
+                email: normalizeEmail(parts[0]),  // normalize here for import CSV too
                 password: parts[1],
                 recoveryEmail: parts[2] || undefined,
                 twoFactorSecret: parts[3] || undefined,

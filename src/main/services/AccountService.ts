@@ -74,6 +74,14 @@ export interface FullAccountImport {
 }
 
 export class AccountService {
+    // Normalize short email like "user123" -> "user123@gmail.com" before persist (single source for add + import)
+    private normalizeEmail(email: string | null | undefined): string | null | undefined {
+        if (!email || typeof email !== 'string') return email
+        const t = email.trim()
+        if (!t) return t
+        return t.includes('@') ? t : `${t}@gmail.com`
+    }
+
     // Heal profile path in case DB was copied from another computer
     private healProfilePath(account: Account): Account {
         if (!account.profilePath) return account
@@ -178,8 +186,9 @@ export class AccountService {
     // Create new account (supports loginType, twoFactorSecret)
     async create(data: NewAccount): Promise<Account> {
         const db = getDatabase()
+        const toInsert = { ...data, email: this.normalizeEmail(data.email) as any }
         const result = db.insert(schema.accounts).values({
-            ...data,
+            ...toInsert,
             createdAt: new Date(),
         }).returning().get()
         return result
@@ -279,8 +288,9 @@ export class AccountService {
 
         for (const acc of accounts) {
             try {
+                const email = this.normalizeEmail(acc.email) || acc.email
                 db.insert(schema.accounts).values({
-                    email: acc.email,
+                    email,
                     password: acc.password,
                     recoveryEmail: acc.recoveryEmail || null,
                     recoveryPhone: acc.recoveryPhone || null,
