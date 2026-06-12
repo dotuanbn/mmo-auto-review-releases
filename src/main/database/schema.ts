@@ -179,7 +179,7 @@ export const campaignSchedules = sqliteTable('campaign_schedules', {
 export const trafficCampaigns = sqliteTable('traffic_campaigns', {
     id: integer('id').primaryKey({ autoIncrement: true }),
     name: text('name').notNull(),
-    trafficMode: text('traffic_mode', { enum: ['direct', 'organic', 'web_seo'] }).default('direct').notNull(), // direct = open URL, organic = map search, web_seo = website search
+    trafficMode: text('traffic_mode', { enum: ['direct', 'organic', 'web_seo', 'map_search'] }).default('direct').notNull(), // direct = open URL, organic = map search, web_seo = website search, map_search = SEO search directly in Google Maps UI
     searchKeywords: text('search_keywords'), // JSON array of keywords for organic mode
     accountIds: text('account_ids').notNull(), // JSON array of account IDs
     locationIds: text('location_ids').notNull(), // JSON array of location IDs

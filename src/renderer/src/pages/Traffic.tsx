@@ -945,6 +945,9 @@ function CampaignsTab({ campaigns, onStart, onDelete, onDeleteMany, onViewReport
                                     {c.trafficMode === 'organic' && (
                                         <StatusPill tone="emerald">Organic</StatusPill>
                                     )}
+                                    {c.trafficMode === 'map_search' && (
+                                        <StatusPill tone="emerald">SEO Map</StatusPill>
+                                    )}
                                     <StatusPill tone={getStatusTone(c.status)}>{c.status}</StatusPill>
                                 </div>
                                 <div className="flex items-center gap-2">
@@ -1700,7 +1703,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
     const [visitsPerLocation, setVisitsPerLocation] = useState(10)
     const [delayMin, setDelayMin] = useState(10)
     const [delayMax, setDelayMax] = useState(30)
-    const [trafficMode, setTrafficMode] = useState<'direct' | 'organic' | 'web_seo'>('direct')
+    const [trafficMode, setTrafficMode] = useState<'direct' | 'organic' | 'web_seo' | 'map_search'>('direct')
     const [locationKeywords, setLocationKeywords] = useState<Record<number, string>>({})
     const [creating, setCreating] = useState(false)
     // Web SEO specific state
@@ -1770,7 +1773,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                 })
             } else {
                 // Direct / Organic mode
-                if (trafficMode === 'organic') {
+                if (trafficMode === 'organic' || trafficMode === 'map_search') {
                     for (const locId of selectedLocations) {
                         const kw = locationKeywords[locId]
                         if (kw && kw.trim()) {
@@ -1889,13 +1892,26 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                 <Search className="w-4 h-4" />
                                 {t('traffic.webSEO') || 'Web SEO'}
                             </button>
+                            <button
+                                type="button"
+                                onClick={() => setTrafficMode('map_search')}
+                                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-full border transition-all text-sm font-semibold ${trafficMode === 'map_search'
+                                    ? 'bg-[#8d74e8] text-white border-[#8d74e8] shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
+                                    : 'bg-white border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
+                                    }`}
+                            >
+                                <Search className="w-4 h-4" />
+                                {t('traffic.mapSearch') || 'SEO Map'}
+                            </button>
                         </div>
                         <p className="text-xs text-[#908a9e] mt-1">
                             {trafficMode === 'direct'
                                 ? t('traffic.directUrlDesc')
                                 : trafficMode === 'organic'
                                     ? t('traffic.organicSearchDesc')
-                                    : t('traffic.webSEODesc') || 'Tim Google -> Website muc tieu -> Tuong tac'}
+                                    : trafficMode === 'map_search'
+                                        ? (t('traffic.mapSearchDesc') || 'Tìm trực tiếp trên Google Maps → cuộn feed kết quả → vào map (SEO Maps)')
+                                        : t('traffic.webSEODesc') || 'Tim Google -> Website muc tieu -> Tuong tac'}
                         </p>
                     </div>
 
@@ -1984,7 +2000,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
                                 {t('traffic.selectLocations')} ({selectedLocations.length} {t('traffic.selected')})
                             </label>
-                            <div className={`${trafficMode === 'organic' ? 'max-h-60' : 'max-h-32'} overflow-y-auto rounded-[16px] border border-[#e9e4f2] bg-[#f7f7f9] p-2 space-y-1`}>
+                            <div className={`${(trafficMode === 'organic' || trafficMode === 'map_search') ? 'max-h-60' : 'max-h-32'} overflow-y-auto rounded-[16px] border border-[#e9e4f2] bg-[#f7f7f9] p-2 space-y-1`}>
                                 {locations.length === 0 && (
                                     <p className="text-[#908a9e] text-sm p-2">{t('traffic.noLocationsAvailable')}</p>
                                 )}
@@ -2012,7 +2028,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                                 <div className="text-xs text-[#908a9e] truncate max-w-xs">{loc.url}</div>
                                             </div>
                                         </label>
-                                        {trafficMode === 'organic' && selectedLocations.includes(loc.id) && (
+                                        {(trafficMode === 'organic' || trafficMode === 'map_search') && selectedLocations.includes(loc.id) && (
                                             <div className="px-2 pb-2 pl-8">
                                                 <input
                                                     type="text"

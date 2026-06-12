@@ -16,6 +16,7 @@ import PQueue from 'p-queue'
 import { OrganicSearchFlow } from './OrganicSearchFlow'
 import { AgenticSearchHandler } from './AgenticSearchHandler'
 import { WebSeoFlow } from './WebSeoFlow'
+import { MapSearchFlow } from './MapSearchFlow'
 import { agenticTrafficHandler } from './AgenticTrafficHandler'
 import { autonomousMapAgent } from './AutonomousMapAgent'
 import { applyStealth, DEFAULT_STEALTH_LEVEL } from './StealthPatcher'
@@ -2841,8 +2842,8 @@ export class TrafficBoostEngine {
                                     }
 
                                     // Navigate to location - branch by traffic mode
-                                    if (campaign.trafficMode === 'organic' || campaign.trafficMode === 'web_seo') {
-                                        // ORGANIC OR WEB_SEO MODE
+                                    if (campaign.trafficMode === 'organic' || campaign.trafficMode === 'web_seo' || campaign.trafficMode === 'map_search') {
+                                        // ORGANIC / MAP_SEARCH / WEB_SEO MODE (keyword per-location round-robin)
                                         let searchKeywords: string[] = [task.location.name]
                                         if ((task.location as any).searchKeywords) {
                                             try {
@@ -2874,7 +2875,7 @@ export class TrafficBoostEngine {
                                             failedVisits,
                                             message: avoidGoogleSearchForThread
                                                 ? `Thread ${threadIdx + 1}: CAPTCHA cooldown active, skipping Google search for this visit`
-                                                : `Thread ${threadIdx + 1}: ${campaign.trafficMode === 'organic' ? 'Organic' : 'Web SEO'} search "${keyword}"`,
+                                                : `Thread ${threadIdx + 1}: ${campaign.trafficMode === 'organic' ? 'Organic' : campaign.trafficMode === 'map_search' ? 'SEO Map' : 'Web SEO'} search "${keyword}"`,
                                         }))
                                         if (avoidGoogleSearchForThread) {
                                             this.recordAction(actionsPerformed, {
@@ -2889,6 +2890,14 @@ export class TrafficBoostEngine {
 
                                         if (avoidGoogleSearchForThread && campaign.trafficMode === 'organic') {
                                             this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct map navigation'
+                                            await page.goto(task.location.url, {
+                                                waitUntil: 'commit',
+                                                timeout: 20000,
+                                            })
+                                            await HumanBehavior.randomDelay(1200, 2600)
+                                        } else if (avoidGoogleSearchForThread && campaign.trafficMode === 'map_search') {
+                                            // map_search cooldown: direct map URL (per spec, avoid Google search UI)
+                                            this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct map navigation (map_search)'
                                             await page.goto(task.location.url, {
                                                 waitUntil: 'commit',
                                                 timeout: 20000,
@@ -2960,6 +2969,49 @@ export class TrafficBoostEngine {
                                                 await HumanBehavior.randomDelay(1000, 3000)
                                             }
                                             // After organic discovery flow, we're on the map page -> continue to SEO actions below
+                                        } else if (campaign.trafficMode === 'map_search') {
+                                            // MAP_SEARCH MODE: open maps.google.com/maps, type keyword (round-robin), scroll feed max 15 cards, match by name/placeId, click to detail.
+                                            // On not found within limit -> fallback to direct URL. Then common path runs autonomous KPI agent (since !== 'web_seo').
+                                            const mapSearchFlow = new MapSearchFlow((status: string) => {
+                                                this.threadDetails[threadIdx].currentAction = status
+                                                this.sendStatus(this.buildStatus({
+                                                    campaignName: campaign.name,
+                                                    currentRound,
+                                                    completedVisits,
+                                                    totalVisits,
+                                                    failedVisits,
+                                                }))
+                                            })
+
+                                            const mapSearchResult = await mapSearchFlow.execute(page, keyword, {
+                                                name: task.location.name,
+                                                address: task.location.address,
+                                                placeId: task.location.placeId,
+                                                url: task.location.url,
+                                            }, !!task.account)
+
+                                            // Log discovery actions with prefix
+                                            for (const a of mapSearchResult.actionsPerformed) {
+                                                this.recordAction(actionsPerformed, {
+                                                    action: `map_search_discovery:${a.action}`,
+                                                    success: a.success,
+                                                    source: 'map_search',
+                                                    detail: `Map search discovery: ${a.action}`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                            }
+
+                                            if (!mapSearchResult.foundMap) {
+                                                this.threadDetails[threadIdx].currentAction = 'Fallback: Direct navigation (map_search)'
+                                                console.log(`[TrafficBoost] MapSearchFlow did not find "${task.location.name}" within limit for "${keyword}", falling back to direct URL`)
+                                                await page.goto(task.location.url, {
+                                                    waitUntil: 'commit',
+                                                    timeout: 20000
+                                                })
+                                                await HumanBehavior.randomDelay(1000, 3000)
+                                            }
+                                            // On success or fallback we are on map page -> fall through to common consent/login/stabilize + autonomous KPI
                                         } else {
                                             // WEB SEO MODE
                                             let targetDomain = task.location.url

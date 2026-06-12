@@ -169,7 +169,7 @@ export function registerTrafficHandlers() {
     // Create campaign. Map traffic defaults to deterministic SEO automation.
     ipcMain.handle('trafficBoost:createCampaign', async (_event, data: {
         name: string
-        trafficMode?: 'direct' | 'organic' | 'web_seo'
+        trafficMode?: 'direct' | 'organic' | 'web_seo' | 'map_search'
         searchKeywords?: string[]
         accountIds: number[]
         locationIds: number[]
