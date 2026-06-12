@@ -60,6 +60,9 @@ export interface Location {
     targetReviews: number
     currentReviews: number
     status: 'pending' | 'in_progress' | 'done'
+    // Strong identifiers persisted from URL for deterministic target verification
+    cid?: string
+    featureHex?: string
 }
 
 export interface LocationCreate {
@@ -72,6 +75,8 @@ export interface LocationCreate {
     category?: string
     targetRating?: number
     targetReviews?: number
+    cid?: string
+    featureHex?: string
 }
 
 // Campaign types
@@ -192,7 +197,7 @@ export interface ElectronAPI {
     updateLocation: (id: number, data: Partial<Location>) => Promise<Location>
     deleteLocation: (id: number) => Promise<void>
     addFromUrl: (url: string, targetReviews?: number, phone?: string, website?: string) => Promise<Location>
-    parseGoogleMapsUrl: (url: string) => Promise<{ name: string; placeId?: string; address?: string }>
+    parseGoogleMapsUrl: (url: string) => Promise<{ name: string; placeId?: string; address?: string; cid?: string; featureHex?: string }>
 
     // Campaigns
     getCampaigns: () => Promise<Campaign[]>

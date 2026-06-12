@@ -1,4 +1,5 @@
 import { Page, BrowserContext } from 'playwright'
+import { parseMapIdentity, extractIdentity, identitiesMatch, describeMatch } from './MapIdentity'
 import { moveCursor, clickCursor } from './BrowserCursorOverlay'
 
 /**
@@ -400,18 +401,32 @@ export class HumanBehavior {
     }
 
     /**
-     * Verify that the current page is the target map/place detail (post-click guard).
-     * Strong check: URL contains placeId, or panel title matches normalized name (high confidence).
-     * Returns true only if confident we are on the intended target.
+     * Verify that the current page is the target map/place detail (post-click / post-goto guard).
+     * Priority: strong identity (placeId / featureHex / cid) via MapIdentity.
+     * Only fall back to normalized name+address match when TARGET has no strong identifier at all.
+     * Logs concise match reason on success.
      */
-    static async verifyOnTargetMap(page: import('playwright').Page, location: { name: string; placeId?: string | null; address?: string | null; url: string }): Promise<boolean> {
+    static async verifyOnTargetMap(page: import('playwright').Page, location: { name: string; placeId?: string | null; address?: string | null; url: string; cid?: string | null; featureHex?: string | null }): Promise<boolean> {
         try {
-            const currentUrl = page.url()
-            const pid = location.placeId
-            if (pid && (currentUrl.includes(pid) || currentUrl.includes(encodeURIComponent(pid)))) {
+            const currentUrl = page.url() || ''
+            const tgt = extractIdentity(location)
+            const landed = parseMapIdentity(currentUrl)
+
+            if (identitiesMatch(tgt, landed)) {
+                const how = describeMatch(tgt, landed)
+                // concise log only
+                console.log(`[MapIdentity] verify matched by ${how}`)
                 return true
             }
-            // Common Maps place detail title containers (desktop + some mobile)
+
+            const targetHasStrong = !!(tgt.placeId || tgt.featureHex || tgt.cid)
+
+            // If target has any strong ID, require ID match (no name fallback)
+            if (targetHasStrong) {
+                return false
+            }
+
+            // Target has NO strong IDs: fall back to existing strong name match (reuse normalizeName)
             const titleSelectors = [
                 'h1.DUwDvf', 'h1', '[role="heading"][aria-level="1"]',
                 'button[jsaction*="pane.place"] h1', '[data-attrid="title"] .DUwDvf',
@@ -425,19 +440,22 @@ export class HumanBehavior {
                         const nTxt = this.normalizeName(txt)
                         const nName = this.normalizeName(location.name)
                         if (nName && (nTxt === nName || nTxt.includes(nName) || this.highWordOverlap(nTxt, nName))) {
+                            console.log('[MapIdentity] verify matched by name (no target ID)')
                             return true
                         }
                     }
                 }
             }
-            // Fallback: if URL looks like a place detail and name appears in body
             if (currentUrl.includes('/maps/place/') || currentUrl.includes('!1s')) {
                 const body = await page.textContent('body').catch(() => '')
                 const nBody = this.normalizeName(body || '')
                 const nName = this.normalizeName(location.name)
-                if (nName && nBody.includes(nName)) return true
+                if (nName && nBody.includes(nName)) {
+                    console.log('[MapIdentity] verify matched by name-body (no target ID)')
+                    return true
+                }
             }
-        } catch { /* non-fatal verify fail */ }
+        } catch { /* non-fatal */ }
         return false
     }
 

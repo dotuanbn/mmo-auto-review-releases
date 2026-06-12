@@ -1,6 +1,7 @@
 import { Page } from 'playwright'
 import { HumanBehavior } from './HumanBehavior'
 import { contextualInterruptionResolver } from './ContextualInterruptionResolver'
+import { parseMapIdentity, extractIdentity, identitiesMatch, describeMatch } from './MapIdentity'
 
 // ============================================================
 // Types
@@ -11,6 +12,8 @@ export interface LocationInfo {
     address?: string | null
     placeId?: string | null
     url: string
+    cid?: string | null
+    featureHex?: string | null
 }
 
 export interface MapSearchFlowResult {
@@ -210,13 +213,22 @@ export class MapSearchFlow {
                     const text = await card.textContent().catch(() => '')
                     const href = await card.getAttribute('href').catch(() => '')
 
+                    const tgtId = extractIdentity(location)
+                    const cardId = href ? parseMapIdentity(href) : null
+                    const idMatch = identitiesMatch(tgtId, cardId)
+
                     const matches =
+                        idMatch ||
                         (text && this.isMatchingLocation(text, href, location)) ||
                         (href && location.placeId && href.includes(location.placeId)) ||
                         (href && location.name && this.isMatchingLocation(href, href, location))
 
                     if (matches) {
-                        this.onStatus(`Tìm thấy map trong feed Maps (card ${cardsScanned})`)
+                        if (idMatch) {
+                            this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cardId)})`)
+                        } else {
+                            this.onStatus(`Tìm thấy map trong feed Maps (card ${cardsScanned})`)
+                        }
 
                         // Prefer inner <a> if present, else click the card itself
                         const link = await card.$('a').catch(() => null)

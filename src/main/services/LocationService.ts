@@ -1,6 +1,7 @@
 import { eq, sql } from 'drizzle-orm'
 import { getDatabase, schema } from '../database'
 import type { Location, NewLocation } from '../database/schema'
+import { parseMapIdentity, extractIdentity } from '../automation/MapIdentity'
 
 export class LocationService {
     // Get all locations
@@ -155,36 +156,46 @@ export class LocationService {
         }
     }
 
-    // Parse Google Maps URL to extract info
-    async parseGoogleMapsUrl(url: string): Promise<{ name: string; placeId?: string; address?: string }> {
-        // Extract place ID from URL
+    // Parse Google Maps URL to extract info (enhanced with strong identifiers)
+    async parseGoogleMapsUrl(url: string): Promise<{ name: string; placeId?: string; address?: string; cid?: string; featureHex?: string }> {
+        const id = parseMapIdentity(url) || {}
+        // Crude name fallback from path (kept for UI display only; prefer real name from title later)
         const placeIdMatch = url.match(/place\/([^\/]+)/)
         const name = placeIdMatch ? decodeURIComponent(placeIdMatch[1].replace(/\+/g, ' ')) : 'Unknown Location'
 
-        // Extract coordinates if available
-        const coordsMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/)
+        // coords as weak address fallback
+        const coordsMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/) || url.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/)
+
+        // Prefer canonical ChIJ placeId when present in parsed identity
+        const pid = id.placeId || (placeIdMatch ? placeIdMatch[1] : undefined)
 
         return {
             name,
-            placeId: placeIdMatch ? placeIdMatch[1] : undefined,
+            placeId: pid,
             address: coordsMatch ? `${coordsMatch[1]}, ${coordsMatch[2]}` : undefined,
+            cid: id.cid,
+            featureHex: id.featureHex,
         }
     }
 
-    // Create from Google Maps URL
+    // Create from Google Maps URL (auto-extracts strong identifiers from url for later matching)
     async createFromUrl(url: string, targetReviews: number = 10, phone?: string, website?: string): Promise<Location> {
         const parsed = await this.parseGoogleMapsUrl(url)
+        const id = extractIdentity({ url, placeId: parsed.placeId })
         return this.create({
             name: parsed.name,
             url,
-            placeId: parsed.placeId,
+            placeId: id.placeId || parsed.placeId,
             address: parsed.address,
             phone,
             website,
+            // persist strong ids when present in url (no UI change required)
+            cid: id.cid,
+            featureHex: id.featureHex,
             targetReviews,
             targetRating: 5,
             createdAt: new Date(),
-        })
+        } as any)
     }
 
     // Get statistics

@@ -281,6 +281,8 @@ function createTables() {
       place_id TEXT,
       address TEXT,
       url TEXT NOT NULL,
+      cid TEXT,
+      feature_hex TEXT,
       phone TEXT,
       website TEXT,
       category TEXT,
@@ -577,6 +579,17 @@ function runMigrations() {
     if (!locInfoMigrate.some((col: any) => col.name === 'website')) {
       console.log('Migration: Adding website to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN website TEXT')
+    }
+
+    // Strong map identity columns for target verification (placeId already existed; add cid + feature_hex)
+    const locInfo2 = sqlite.prepare("PRAGMA table_info(locations)").all() as any[]
+    if (!locInfo2.some((col: any) => col.name === 'cid')) {
+      console.log('Migration: Adding cid to locations table')
+      sqlite.exec('ALTER TABLE locations ADD COLUMN cid TEXT')
+    }
+    if (!locInfo2.some((col: any) => col.name === 'feature_hex')) {
+      console.log('Migration: Adding feature_hex to locations table')
+      sqlite.exec('ALTER TABLE locations ADD COLUMN feature_hex TEXT')
     }
 
     console.log('Database migrations completed')

@@ -191,3 +191,17 @@ Last updated: 2026-05-28
 - Fix (targeted, only accounts.ts + Accounts.tsx): widened to 10min + liveCtx check in poll IIFE + finally cleanup map; on poll detected: closeContext after save; strong myaccount URL supplement inside tryDetect (before save) still pulls ck for DB; hardened isFinal pending with "if not already active" guard (prevents demote); added 3s watcher in all 3 manual open call sites (post-add + 2 handlers) that does fetchAccounts + useAccountStore.getState check for status=active then set success + timeout clear (makes row go active + clears spinner/msg). Reuses isGoogleLoggedIn/closeContext exactly, no other files.
 - Verification: npm run typecheck (full) PASS (0 errors). No cookies/pw ever logged in msgs. Edits confined. Per SOP short final output.
 - Recorded. Short output only.
+
+## 2026-06-xx (Strong Google Maps target identity verification)
+- User req: make target verification use unique identifiers (placeId ChIJ, featureHex 0x..:0x.., cid) before any KPI/boost actions in map traffic, not just name/address (dupe risk). Audit schema+create paths+flows first.
+- Context sync + full read of schema, index.ts (migrations), LocationService+ipc, Locations.tsx, shared/preload types, MapSearchFlow/OrganicSearchFlow (card scan + verify paths), HumanBehavior.verifyOnTargetMap, TrafficBoostEngine (direct + ensure + autonomous), normalizeName usage.
+- Created src/main/automation/MapIdentity.ts (parseMapIdentity with regex for ChIJ/0x:0x/cid/!3d@coords; extractIdentity merge; identitiesMatch by placeId>featureHex>cid+cross hex2dec; describeMatch for logs; no pw dep).
+- Schema: added cid + featureHex (drizzle). DB: CREATE TABLE + runMigrations() PRAGMA check+ALTER (safe pattern, no data loss).
+- LocationService: parseGoogleMapsUrl now uses parse + returns cid/feature; createFromUrl extracts+persists strong ids from user url (primary add path). No UI edit.
+- Updated shared/types + preload for new optional fields + richer parse return.
+- Upgraded verifyOnTargetMap: ID match first (logs "matched by placeId|featureHex|cid|name"), strict require ID if target has any; name+normalize fallback ONLY when target has zero strong ids.
+- MapSearchFlow + OrganicSearchFlow: on card/href scan, parse + identitiesMatch prefer (priority click + status log); post-click always goes thru upgraded verify (back+continue on fail); LocationInfo extended.
+- Direct mode (TrafficBoostEngine): after goto + ensureDirect, explicit verify + 1x safe fallback re-goto(url) + re-verify before proceeding to autonomous/KPI (bounded, no infinite). Search fallbacks also hit same guard.
+- typecheck:main + :renderer = PASS (0 errors). No break to traffic/campaign/login/stealth. Logs concise only on match success. Reuses normalizeName. Fallbacks preserved (name when target lacks ID; existing max scroll/attempts).
+- Per SOP 4-step + Antigravity: plan before code, small targeted edits, self-review (defensive, strict ID, migration safe, <50LOC helpers, no N+1/side effects), short final only.
+- Recorded. Short output only.

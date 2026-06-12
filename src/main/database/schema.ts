@@ -62,6 +62,8 @@ export const locations = sqliteTable('locations', {
     placeId: text('place_id'),
     address: text('address'),
     url: text('url').notNull(),
+    cid: text('cid'),
+    featureHex: text('feature_hex'),
     category: text('category'),
     searchKeywords: text('search_keywords'), // JSON array of keywords for organic search, e.g. ["kaff viet nam", "kaff hanoi"]
     phone: text('phone'),

@@ -17,6 +17,7 @@ import { OrganicSearchFlow } from './OrganicSearchFlow'
 import { AgenticSearchHandler } from './AgenticSearchHandler'
 import { WebSeoFlow } from './WebSeoFlow'
 import { MapSearchFlow } from './MapSearchFlow'
+import { extractIdentity, identitiesMatch, parseMapIdentity } from './MapIdentity'
 import { agenticTrafficHandler } from './AgenticTrafficHandler'
 import { autonomousMapAgent } from './AutonomousMapAgent'
 import { applyStealth, DEFAULT_STEALTH_LEVEL } from './StealthPatcher'
@@ -3134,6 +3135,43 @@ export class TrafficBoostEngine {
                                             actionContext,
                                             !!task.account
                                         )
+
+                                        // Direct mode: verify target identity (strong ID priority) before any KPI/boost actions.
+                                        // Per requirement: only run tăng chỉ số after confirmed; one safe re-goto fallback then proceed (bounded, no loop).
+                                        try {
+                                            const vLoc = {
+                                                name: task.location?.name || '',
+                                                placeId: task.location?.placeId,
+                                                address: task.location?.address,
+                                                url: task.location?.url || '',
+                                                cid: (task.location as any)?.cid,
+                                                featureHex: (task.location as any)?.featureHex,
+                                            }
+                                            let verified = await HumanBehavior.verifyOnTargetMap(page, vLoc as any).catch(() => false)
+                                            if (!verified) {
+                                                this.recordAction(actionsPerformed, {
+                                                    action: 'direct_target_verify_fallback',
+                                                    success: true,
+                                                    source: 'runtime',
+                                                    detail: `Re-nav to location.url after verify fail (${page.url()})`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                                await page.goto(task.location.url, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {})
+                                                await HumanBehavior.randomDelay(1200, 2800)
+                                                verified = await HumanBehavior.verifyOnTargetMap(page, vLoc as any).catch(() => false)
+                                            }
+                                            if (verified) {
+                                                this.recordAction(actionsPerformed, {
+                                                    action: 'direct_target_verified',
+                                                    success: true,
+                                                    source: 'map_identity',
+                                                    detail: `Target confirmed before boost`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                            }
+                                        } catch { /* defensive: never block direct path */ }
                                     }
                                     await this.cleanupExtraTabsForThread(page, threadIdx, 'after_navigation')
                                     await this.handleGoogleLoginIfNeeded(

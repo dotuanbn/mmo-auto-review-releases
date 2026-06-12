@@ -1,6 +1,6 @@
 # Project Context
 
-Last checked: 2026-06-xx (maxMapScroll for map_search added)
+Last checked: 2026-06-xx (strong Map target identity via placeId/featureHex/cid + verify before KPI; MapIdentity helper)
 
 ## Stack
 

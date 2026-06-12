@@ -98,7 +98,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         add: (data: { name: string; url: string; placeId?: string; address?: string; phone?: string; website?: string; category?: string; targetRating?: number; targetReviews?: number }) =>
             ipcRenderer.invoke('locations:add', data),
         addFromUrl: (url: string, targetReviews?: number, phone?: string, website?: string) => ipcRenderer.invoke('locations:addFromUrl', url, targetReviews, phone, website),
-        parseUrl: (url: string) => ipcRenderer.invoke('locations:parseUrl', url),
+        parseUrl: (url: string) => ipcRenderer.invoke('locations:parseUrl', url), // returns {name, placeId?, address?, cid?, featureHex?}
         update: (id: number, data: any) => ipcRenderer.invoke('locations:update', id, data),
         delete: (id: number) => ipcRenderer.invoke('locations:delete', id),
         getStats: () => ipcRenderer.invoke('locations:getStats'),
@@ -564,7 +564,7 @@ declare global {
                 getPending: () => Promise<any[]>
                 add: (data: any) => Promise<any>
                 addFromUrl: (url: string, targetReviews?: number, phone?: string, website?: string) => Promise<any>
-                parseUrl: (url: string) => Promise<any>
+                parseUrl: (url: string) => Promise<{ name: string; placeId?: string; address?: string; cid?: string; featureHex?: string }>
                 update: (id: number, data: any) => Promise<any>
                 delete: (id: number) => Promise<{ success: boolean; error?: string }>
                 getStats: () => Promise<any>

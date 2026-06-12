@@ -1,6 +1,7 @@
 import { Page } from 'playwright'
 import { HumanBehavior } from './HumanBehavior'
 import { contextualInterruptionResolver } from './ContextualInterruptionResolver'
+import { parseMapIdentity, extractIdentity, identitiesMatch, describeMatch } from './MapIdentity'
 
 // ============================================================
 // Types
@@ -11,6 +12,8 @@ export interface LocationInfo {
     address?: string | null
     placeId?: string | null
     url: string
+    cid?: string | null
+    featureHex?: string | null
 }
 
 export type OrganicAction = 'directions' | 'call' | 'website' | 'share' | 'view_photos' | 'view_reviews' | 'view_menu' | 'save_place' | 'browse_questions' | 'view_nearby' | 'view_street_view' | 'search_interactions'
@@ -228,8 +231,13 @@ export class OrganicSearchFlow {
 
             for (const el of localResults) {
                 const text = await el.textContent().catch(() => '')
-                if (text && this.isMatchingLocationLegacy(text, location)) {
-                    this.onStatus(`Tìm thấy map trong Local Pack!`)
+                const href = await el.getAttribute('href').catch(() => '') || ''
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
+                if (idHit || (text && this.isMatchingLocationLegacy(text, location))) {
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map trong Local Pack!`)
 
                     // Try to find the clickable link/title within this element
                     const link = await el.$('a[href*="maps"], a[href*="place"], a[data-cid]')
@@ -242,7 +250,7 @@ export class OrganicSearchFlow {
                     await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
                     await HumanBehavior.randomDelay(2000, 4000)
 
-                    // VERIFY after click; back+continue if wrong map
+                    // VERIFY after click (now identity-first); back+continue if wrong
                     if (await HumanBehavior.verifyOnTargetMap(page, location).catch(() => false)) return true
                     await page.goBack().catch(() => {})
                     await HumanBehavior.randomDelay(800, 1500)
@@ -255,11 +263,16 @@ export class OrganicSearchFlow {
             for (const card of placeCards) {
                 const text = await card.textContent().catch(() => '')
                 const href = await card.getAttribute('href').catch(() => '')
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
                 if (
+                    idHit ||
                     (text && this.isMatchingLocation(text, location, href)) ||
                     (href && location.placeId && href.includes(location.placeId))
                 ) {
-                    this.onStatus(`Tìm thấy map qua place card!`)
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map qua place card!`)
                     await card.click()
                     await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
                     await HumanBehavior.randomDelay(2000, 4000)
@@ -288,11 +301,16 @@ export class OrganicSearchFlow {
                 const href = await link.getAttribute('href').catch(() => '')
                 const text = await link.textContent().catch(() => '')
 
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
                 if (
+                    idHit ||
                     (text && this.isMatchingLocation(text, location, href)) ||
                     (href && location.placeId && href.includes(location.placeId))
                 ) {
-                    this.onStatus(`Tìm thấy map trong kết quả organic!`)
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map trong kết quả organic!`)
                     await link.click()
                     await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
                     await HumanBehavior.randomDelay(2000, 4000)
@@ -322,8 +340,13 @@ export class OrganicSearchFlow {
 
             for (const result of mapResults) {
                 const text = await result.textContent().catch(() => '')
-                if (text && this.isMatchingLocationLegacy(text, location)) {
-                    this.onStatus(`Tìm thấy map trong tab Maps!`)
+                const href = await result.getAttribute('href').catch(() => '')
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
+                if (idHit || (text && this.isMatchingLocationLegacy(text, location))) {
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map trong tab Maps!`)
 
                     const link = await result.$('a')
                     if (link) {
