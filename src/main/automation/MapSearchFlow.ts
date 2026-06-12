@@ -211,9 +211,9 @@ export class MapSearchFlow {
                     const href = await card.getAttribute('href').catch(() => '')
 
                     const matches =
-                        (text && this.isMatchingLocation(text, location)) ||
+                        (text && this.isMatchingLocation(text, href, location)) ||
                         (href && location.placeId && href.includes(location.placeId)) ||
-                        (href && location.name && this.isMatchingLocation(href, location))
+                        (href && location.name && this.isMatchingLocation(href, href, location))
 
                     if (matches) {
                         this.onStatus(`Tìm thấy map trong feed Maps (card ${cardsScanned})`)
@@ -228,7 +228,16 @@ export class MapSearchFlow {
 
                         await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { })
                         await HumanBehavior.randomDelay(1800, 3500)
-                        return true
+
+                        // POST-CLICK VERIFY: only accept if we landed on the real target; else back and keep scanning
+                        const verified = await HumanBehavior.verifyOnTargetMap(page, location).catch(() => false)
+                        if (verified) {
+                            return true
+                        }
+                        // Wrong map clicked - back out and continue feed scan (within max limit)
+                        await page.goBack().catch(() => { })
+                        await HumanBehavior.randomDelay(900, 1600)
+                        continue
                     }
                 } catch { /* card read/click error, continue */ }
             }
@@ -261,45 +270,47 @@ export class MapSearchFlow {
     }
 
     /**
-     * Fuzzy match on name + address parts (reused logic style from OrganicSearchFlow)
+     * Strict match: prefer strong identifiers (placeId / CID in href or attr), else require high-confidence name+address overlap.
+     * Only return true when sufficiently confident to click (no loose substring).
      */
-    private isMatchingLocation(text: string, location: LocationInfo): boolean {
-        const normalizedText = this.normalize(text)
-        const normalizedName = this.normalize(location.name)
+    private isMatchingLocation(text: string, href: string | null, location: LocationInfo): boolean {
+        const nText = HumanBehavior.normalizeName(text)
+        const nName = HumanBehavior.normalizeName(location.name)
+        if (!nName) return false
 
-        if (!normalizedName) return false
-        if (normalizedText.includes(normalizedName)) {
-            return true
+        // 1) Strong ID priority (placeId in href is reliable)
+        if (location.placeId) {
+            const pid = location.placeId
+            if (href && (href.includes(pid) || href.includes(encodeURIComponent(pid)))) return true
+            if (text && text.includes(pid)) return true
         }
 
-        if (location.address) {
-            const normalizedAddress = this.normalize(location.address)
-            const addressParts = normalizedAddress.split(/[,\s]+/).filter(p => p.length > 3)
-            const matchCount = addressParts.filter(part => normalizedText.includes(part)).length
-            if (matchCount >= Math.ceil(addressParts.length * 0.5)) {
-                const nameParts = normalizedName.split(/\s+/).filter(p => p.length > 2)
-                const nameMatchCount = nameParts.filter(part => normalizedText.includes(part)).length
-                if (nameMatchCount >= Math.ceil(nameParts.length * 0.5)) {
-                    return true
-                }
-            }
+        // 2) Strict name match (full-ish, not partial token): high word overlap or contains full name
+        if (nText === nName || nText.includes(nName)) {
+            // If address present, require some corroboration to raise confidence
+            if (!location.address) return true
+            const nAddr = HumanBehavior.normalizeName(location.address)
+            const addrParts = nAddr.split(/[,\s]+/).filter(p => p.length > 3)
+            const addrHits = addrParts.filter(p => nText.includes(p)).length
+            if (addrHits >= Math.max(1, Math.ceil(addrParts.length * 0.4))) return true
+            // else fall to name-only high overlap below
         }
-
-        // PlaceId in href/text sometimes helps
-        if (location.placeId && normalizedText.includes(this.normalize(location.placeId))) {
-            return true
+        const nameWords = nName.split(/\s+/).filter(p => p.length > 1)
+        const textSet = new Set(nText.split(/\s+/))
+        const nameHits = nameWords.filter(w => textSet.has(w)).length
+        const nameScore = nameWords.length ? nameHits / nameWords.length : 0
+        if (nameScore >= 0.85) {
+            if (!location.address) return true
+            const nAddr = HumanBehavior.normalizeName(location.address)
+            const addrParts = nAddr.split(/[,\s]+/).filter(p => p.length > 3)
+            const addrHits = addrParts.filter(p => nText.includes(p)).length
+            if (addrHits >= Math.ceil(addrParts.length * 0.4)) return true
         }
-
         return false
     }
 
-    private normalize(value?: string): string {
-        if (!value) return ''
-        return value
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .toLowerCase()
-            .replace(/\s+/g, ' ')
-            .trim()
+    // Legacy thin wrapper (some call sites used 2-arg). Delegates with null href.
+    private isMatchingLocationLegacy(text: string, location: LocationInfo): boolean {
+        return this.isMatchingLocation(text, null, location)
     }
 }

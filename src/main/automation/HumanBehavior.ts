@@ -382,6 +382,76 @@ export class HumanBehavior {
             Math.floor(readingTimeMs + variation)
         )
     }
+
+    /**
+     * Shared name normalization for strict location matching (Vietnamese diacritics safe).
+     * Uses NFD + unicode Diacritic property (covers most accents), with đ/Đ fallback.
+     */
+    static normalizeName(value?: string | null): string {
+        if (!value) return ''
+        return value
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/đ/g, 'd')
+            .replace(/Đ/g, 'D')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim()
+    }
+
+    /**
+     * Verify that the current page is the target map/place detail (post-click guard).
+     * Strong check: URL contains placeId, or panel title matches normalized name (high confidence).
+     * Returns true only if confident we are on the intended target.
+     */
+    static async verifyOnTargetMap(page: import('playwright').Page, location: { name: string; placeId?: string | null; address?: string | null; url: string }): Promise<boolean> {
+        try {
+            const currentUrl = page.url()
+            const pid = location.placeId
+            if (pid && (currentUrl.includes(pid) || currentUrl.includes(encodeURIComponent(pid)))) {
+                return true
+            }
+            // Common Maps place detail title containers (desktop + some mobile)
+            const titleSelectors = [
+                'h1.DUwDvf', 'h1', '[role="heading"][aria-level="1"]',
+                'button[jsaction*="pane.place"] h1', '[data-attrid="title"] .DUwDvf',
+                '.x3AX1-Lfntke-haAclf', '.lMbq3e'
+            ]
+            for (const sel of titleSelectors) {
+                const el = await page.$(sel).catch(() => null)
+                if (el) {
+                    const txt = await el.textContent().catch(() => '')
+                    if (txt) {
+                        const nTxt = this.normalizeName(txt)
+                        const nName = this.normalizeName(location.name)
+                        if (nName && (nTxt === nName || nTxt.includes(nName) || this.highWordOverlap(nTxt, nName))) {
+                            return true
+                        }
+                    }
+                }
+            }
+            // Fallback: if URL looks like a place detail and name appears in body
+            if (currentUrl.includes('/maps/place/') || currentUrl.includes('!1s')) {
+                const body = await page.textContent('body').catch(() => '')
+                const nBody = this.normalizeName(body || '')
+                const nName = this.normalizeName(location.name)
+                if (nName && nBody.includes(nName)) return true
+            }
+        } catch { /* non-fatal verify fail */ }
+        return false
+    }
+
+    /**
+     * High word overlap helper (internal for verify/normalize users)
+     */
+    private static highWordOverlap(a: string, b: string): boolean {
+        const aw = a.split(' ').filter(w => w.length > 1)
+        const bw = b.split(' ').filter(w => w.length > 1)
+        if (!bw.length) return false
+        const setA = new Set(aw)
+        const hit = bw.filter(w => setA.has(w)).length
+        return hit / bw.length >= 0.8
+    }
 }
 
 export const humanBehavior = new HumanBehavior()

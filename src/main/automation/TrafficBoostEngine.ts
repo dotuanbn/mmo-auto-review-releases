@@ -2348,10 +2348,13 @@ export class TrafficBoostEngine {
             throw new Error('No locations configured')
         }
 
-        // Get accounts
-        const accounts = accountIds.length > 0
-            ? db.select().from(schema.accounts).all().filter(a => accountIds.includes(a.id))
-            : [null] // null = anonymous browsing (no account)
+        // Get accounts (use only the campaign-selected IDs; defensively drop banned/suspended so we don't waste visits on dead accounts)
+        let accounts: any[] = []
+        if (accountIds.length > 0) {
+            const all = db.select().from(schema.accounts).all()
+            accounts = all.filter(a => accountIds.includes(a.id) && a.status !== 'banned' && a.status !== 'suspended')
+        }
+        if (accounts.length === 0) accounts = [null] // anonymous / no usable account
 
         // Get locations
         const allLocations = db.select().from(schema.locations).all().filter(l => locationIds.includes(l.id))
@@ -2814,6 +2817,29 @@ export class TrafficBoostEngine {
                                     if (watchdogTriggered) {
                                         throw new Error('VISIT_ABORTED_BY_WATCHDOG')
                                     }
+
+                                    // BUG1 FIX: if campaign selected an account for this task, restore its Google cookies into the (ephemeral) context.
+                                    // This makes the browser actually logged-in so isLoggedIn flows + login-only actions (save/share etc) work for ALL trafficModes incl map_search.
+                                    // Keeps clean-slate ephemeral (no profilePath) but injects auth session for the chosen account.
+                                    if (task.account?.cookies) {
+                                        try {
+                                            const ctx = browserService.getContext(contextId!)
+                                            if (ctx) {
+                                                const ck = JSON.parse(task.account.cookies || '[]')
+                                                if (Array.isArray(ck) && ck.length > 0) {
+                                                    await ctx.addCookies(ck).catch(() => {})
+                                                    this.recordAction(actionsPerformed, {
+                                                        action: 'account_session_restored',
+                                                        success: true,
+                                                        detail: task.account.email || String(task.account.id),
+                                                        threadId: threadIdx,
+                                                        timestamp: new Date().toISOString(),
+                                                    }, actionContext)
+                                                }
+                                            }
+                                        } catch { /* non-fatal: fall back to anonymous for this visit */ }
+                                    }
+
                                     stopPageMonitor = this.startThreadPageMonitor(threadIdx, page)
                                     await this.cleanupExtraTabsForThread(page, threadIdx, 'visit_start')
 
