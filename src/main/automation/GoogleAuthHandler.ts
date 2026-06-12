@@ -55,7 +55,8 @@ export class GoogleAuthHandler {
         password: string,
         config?: BrowserConfig,
         twoFactorSecret?: string | null,
-        recoveryEmail?: string | null
+        recoveryEmail?: string | null,
+        recoveryPhone?: string | null
     ): Promise<{ success: boolean; contextId: number; error?: string; requires2FA?: boolean }> {
         const normalizedEmail = this.normalizeEmailForLogin(email)
         if (!normalizedEmail || !normalizedEmail.trim()) {
@@ -95,33 +96,20 @@ export class GoogleAuthHandler {
                 return { success: false, contextId, error: 'Account disabled or suspended by Google' }
             }
 
-            // Handle "Verify it's you" (challenge/selection) recovery email step if present (after password)
-            const chal = await this.handleRecoveryEmailChallenge(page, recoveryEmail || null).catch(() => null)
-            if (chal && chal.error) {
-                return { success: false, contextId, error: chal.error }
+            // NEW: Challenge resolver loop (post-password): covers reCAPTCHA, selection/kpe (reuses handle), TOTP, phone, passkey/safety/consent prompts, etc.
+            // Max ~10 rounds, stabilize delays, total ~3min budget. Returns success or clear 'pending' message (never swallows to banned).
+            const loopRes = await this.runChallengeResolverLoop(
+                page,
+                twoFactorSecret || null,
+                recoveryEmail || null,
+                recoveryPhone || null
+            ).catch(() => ({ success: false, error: 'Cần xác minh thủ công' }))
+
+            if (!loopRes.success) {
+                return { success: false, contextId, error: loopRes.error || 'Cần xác minh thủ công' }
             }
 
-            // Auto handle TOTP 2FA if secret available
-            if (await this.requires2FA(page)) {
-                if (twoFactorSecret) {
-                    const code = this.generateTOTP(twoFactorSecret)
-                    if (code) {
-                        const submitted = await this.enter2FACode(page, code)
-                        if (submitted) {
-                            await browserService.randomDelay(1800, 3200)
-                            if (await this.isAccountDisabledOrSuspended(page)) {
-                                return { success: false, contextId, error: 'Account disabled or suspended by Google' }
-                            }
-                            const loggedIn = await this.isLoggedIn(page)
-                            if (loggedIn) {
-                                return { success: true, contextId }
-                            }
-                        }
-                    }
-                }
-                return { success: false, contextId, error: '2FA required - please complete manually', requires2FA: true }
-            }
-
+            // Final guard (in case loop exited early on loggedIn)
             if (await this.isAccountDisabledOrSuspended(page)) {
                 return { success: false, contextId, error: 'Account disabled or suspended by Google' }
             }
@@ -533,6 +521,266 @@ export class GoogleAuthHandler {
     // Save session after successful login
     async saveSession(contextId: number, profilePath: string): Promise<void> {
         await browserService.saveContextState(contextId, profilePath)
+    }
+
+    // ============================================================
+    // CHALLENGE RESOLVER LOOP (post-password)
+    // Max ~10 rounds, 1.5-3s stabilize per round, ~3min total guard.
+    // Reuses: isLoggedIn (cookie via browserService), handleRecoveryEmailChallenge, enter2FACode, clickNextButton, humanType, generateTOTP.
+    // Every step try/catch isolated. No secret/password logging.
+    // ============================================================
+
+    private async runChallengeResolverLoop(
+        page: Page,
+        twoFactorSecret: string | null,
+        recoveryEmail: string | null,
+        recoveryPhone: string | null
+    ): Promise<{ success: boolean; error?: string }> {
+        const MAX_ROUNDS = 10
+        const MAX_MS = 3 * 60 * 1000
+        const start = Date.now()
+
+        for (let round = 0; round < MAX_ROUNDS; round++) {
+            if (Date.now() - start > MAX_MS) break
+
+            // Early logged-in (cookie primary)
+            try {
+                const ctx = page.context()
+                if (await browserService.isGoogleLoggedIn(undefined, ctx).catch(() => false)) return { success: true }
+                const u = page.url()
+                if (u.includes('myaccount.google.com') || (u.includes('google.com') && !/signin|challenge|ServiceLogin|Login/i.test(u))) {
+                    return { success: true }
+                }
+            } catch {}
+
+            const res = await this.handleOneChallengeRound(page, twoFactorSecret, recoveryEmail, recoveryPhone).catch(() => ({ done: false }))
+            if ((res as any).success === false && (res as any).error) {
+                return { success: false, error: (res as any).error }
+            }
+            if ((res as any).done) return { success: true }
+
+            // per-round stabilize + isolated catch already in handleOne
+            await browserService.randomDelay(1200, 1800)
+        }
+
+        // Final cookie check
+        try {
+            const ctx = page.context()
+            if (await browserService.isGoogleLoggedIn(undefined, ctx).catch(() => false)) return { success: true }
+        } catch {}
+        return { success: false, error: 'Cần xác minh thủ công' }
+    }
+
+    // One round: detect + handle one challenge type. Returns {done?, error?}. Keeps driver short.
+    private async handleOneChallengeRound(
+        page: Page,
+        twoFactorSecret: string | null,
+        recoveryEmail: string | null,
+        recoveryPhone: string | null
+    ): Promise<{ done?: boolean; error?: string }> {
+        await browserService.randomDelay(1400, 2600)
+
+        let bodyText = ''
+        try { bodyText = (await page.textContent('body', { timeout: 3200 }).catch(() => '')) || '' } catch {}
+        const lower = bodyText.toLowerCase()
+        const url = page.url()
+
+        if (await this.isAccountDisabledOrSuspended(page)) {
+            return { error: 'Account disabled or suspended by Google' }
+        }
+
+        // 1) reCAPTCHA
+        if (url.includes('/challenge/recaptcha') || /recaptcha|"i'?m not a robot|không phải là robot/i.test(lower)) {
+            const rc = await this.handleRecaptchaCheckbox(page)
+            if (rc === 'image') return { error: 'reCAPTCHA image challenge - cần thủ công' }
+            if (rc === 'solved') {
+                await this.clickNextButton(page, false)
+                return {}
+            }
+        }
+
+        // 2/3) selection + kpe (reuse + 1x "try another")
+        if (url.includes('/challenge/selection') || url.includes('/v3/signin/challenge') ||
+            /verify it'?s you|xác minh đó là bạn|challenge\/selection/i.test(lower)) {
+            if (recoveryEmail) {
+                await this.clickButtonByTexts(page, ['Try another way', 'Thử cách khác', 'Use another way']).catch(() => {})
+                await browserService.randomDelay(700, 1300)
+            }
+            const chal = await this.handleRecoveryEmailChallenge(page, recoveryEmail).catch(() => null)
+            if (chal && chal.error) return { error: chal.error }
+            return {}
+        }
+
+        if (url.includes('/challenge/kpe') || /knowledgePreregisteredEmail|recovery email|email khôi phục/i.test(lower)) {
+            if (recoveryEmail && recoveryEmail.trim()) {
+                const inputSel = await this.waitForRecoveryEmailInput(page)
+                if (inputSel) {
+                    try { await browserService.humanType(page, inputSel, recoveryEmail.trim()) } catch { await page.fill(inputSel, recoveryEmail.trim()).catch(() => {}) }
+                    await browserService.randomDelay(350, 800)
+                }
+            } else {
+                return { error: 'Cần xác minh thủ công: Xác nhận email khôi phục' }
+            }
+            await this.clickNextButton(page, false)
+            return {}
+        }
+
+        // 8) TOTP
+        if (await this.requires2FA(page)) {
+            if (twoFactorSecret) {
+                const code = this.generateTOTP(twoFactorSecret)
+                if (code) {
+                    await this.enter2FACode(page, code)
+                    await browserService.randomDelay(1600, 2400)
+                    return {}
+                }
+            }
+            return { error: '2FA required - please complete manually' }
+        }
+
+        // 6) recovery phone
+        if (/confirm your recovery phone|xác nhận.*điện thoại|recovery phone|số điện thoại khôi phục/i.test(lower)) {
+            if (recoveryPhone && recoveryPhone.trim()) {
+                if (await this.tryFillRecoveryPhone(page, recoveryPhone.trim())) {
+                    await this.clickNextButton(page, false)
+                    return {}
+                }
+            }
+            return { error: 'Cần xác minh thủ công: Xác nhận điện thoại khôi phục' }
+        }
+
+        // 4/5/9 prompts
+        if (await this.dismissPostLoginPrompts(page)) return {}
+
+        // consent direct
+        if (/continue|tiếp tục|confirm|đồng ý|i understand|agree|ok|đã hiểu/i.test(lower)) {
+            if (await this.clickButtonByTexts(page, ['Continue', 'Tiếp tục', 'Confirm', 'Tôi đồng ý', 'I understand', 'Agree', 'OK'])) {
+                return {}
+            }
+        }
+
+        return {}
+    }
+
+    // --- reCAPTCHA checkbox handler (frame + fallback). Returns 'image' for bframe to force pending (per spec) ---
+    private async handleRecaptchaCheckbox(page: Page): Promise<'solved' | 'image' | 'notfound'> {
+        try {
+            // Primary: anchor iframe (checkbox)
+            const anchorCandidates = [
+                'iframe[src*="recaptcha/api2/anchor"]',
+                'iframe[title*="reCAPTCHA"]',
+                'iframe[src*="recaptcha"]',
+            ]
+            for (const sel of anchorCandidates) {
+                const frame = page.frameLocator(sel).first()
+                const box = frame.locator('#recaptcha-anchor, .recaptcha-checkbox-border, [role="checkbox"]')
+                const cnt = await box.count().catch(() => 0)
+                if (cnt > 0) {
+                    await box.first().click({ timeout: 4500 }).catch(async () => {
+                        const h = await box.first().elementHandle().catch(() => null)
+                        if (h) {
+                            const b = await h.boundingBox().catch(() => null)
+                            if (b) await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2).catch(() => {})
+                        }
+                    })
+                    await browserService.randomDelay(2200, 4200) // wait for green tick / network
+                    const aria = await box.first().getAttribute('aria-checked').catch(() => null)
+                    if (aria === 'true' || aria === 'mixed') return 'solved'
+                    // If after click still no, check if image bframe spawned
+                }
+            }
+
+            // Detect image challenge (bframe) -> cannot solve -> pending per spec
+            const bframeSels = ['iframe[src*="recaptcha/api2/bframe"]', 'iframe[title*="recaptcha challenge"]', 'iframe[src*="bframe"]']
+            for (const bs of bframeSels) {
+                const bf = page.frameLocator(bs).first()
+                const hasImg = await bf.locator('img, .rc-image-tile-wrapper, canvas, .rc-imageselect').count().catch(() => 0)
+                if (hasImg > 0) return 'image'
+            }
+            return 'notfound'
+        } catch {
+            return 'notfound'
+        }
+    }
+
+    // Robust click by visible text phrases. Prefer "Not now"/Skip for feature prompts (per spec 4,5).
+    private async clickButtonByTexts(page: Page, phrases: string[]): Promise<boolean> {
+        const skipFirst = ['Not now', 'Để sau', 'Skip', 'Skip for now', 'Maybe later', 'Not now']
+        const ordered = [...skipFirst.filter(p => phrases.some(ph => ph.toLowerCase().includes(p.toLowerCase().slice(0,4)))), ...phrases]
+        for (const phrase of ordered) {
+            try {
+                // locator has-text + role/button variants (EN/VI tolerant)
+                const loc = page.locator(
+                    `button:has-text("${phrase}"), [role="button"]:has-text("${phrase}"), div[role="button"]:has-text("${phrase}"), button[type="button"]:has-text("${phrase}")`
+                ).first()
+                if (await loc.count().catch(() => 0) > 0) {
+                    const vis = await loc.isVisible().catch(() => false)
+                    if (vis) {
+                        await loc.click({ timeout: 3500 }).catch(async () => {
+                            const h = await loc.elementHandle().catch(() => null)
+                            if (h) {
+                                const b = await h.boundingBox().catch(() => null)
+                                if (b) await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2).catch(() => {})
+                            }
+                        })
+                        return true
+                    }
+                }
+                // text= fallback (existing pattern in handler)
+                const el = await page.$(`text=${phrase}`).catch(() => null)
+                if (el && await el.isVisible().catch(() => false)) {
+                    await el.click().catch(async () => {
+                        const b = await el.boundingBox().catch(() => null)
+                        if (b) await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2).catch(() => {})
+                    })
+                    return true
+                }
+            } catch { /* next phrase */ }
+        }
+        return false
+    }
+
+    // Dismiss common post-login / passkey / safety / consent prompts (4,5,9)
+    private async dismissPostLoginPrompts(page: Page): Promise<boolean> {
+        // Priority skip for "Not now" flows (passkey, sync, "Simplify sign-in", ads, keep safe)
+        const skipPhrases = ['Not now', 'Để sau', 'Skip', 'Skip for now', 'Maybe later', 'Not now']
+        if (await this.clickButtonByTexts(page, skipPhrases)) return true
+
+        // Passkey / "Use your passkey" / "Simplify your sign-in"
+        const passkey = ['Try another way', 'Thử cách khác', 'Use another way', 'Use password instead']
+        if (await this.clickButtonByTexts(page, passkey)) return true
+
+        // Generic "I understand" / consent light
+        const light = ['I understand', 'Đã hiểu', 'Got it']
+        if (await this.clickButtonByTexts(page, light)) return true
+
+        return false
+    }
+
+    // Best-effort: fill known recovery phone into visible tel/email-like on confirm phone screen
+    private async tryFillRecoveryPhone(page: Page, phone: string): Promise<boolean> {
+        if (!phone) return false
+        const sels = [
+            'input[type="tel"]',
+            'input[name*="phone" i]',
+            'input[autocomplete*="tel" i]',
+            'input[aria-label*="phone" i]',
+            'input[type="text"]',
+        ]
+        for (const sel of sels) {
+            try {
+                const el = await page.waitForSelector(sel, { state: 'visible', timeout: 2200 }).catch(() => null)
+                if (el) {
+                    await page.fill(sel, '').catch(async () => { const h = await page.$(sel); await h?.fill('').catch(() => {}) })
+                    await page.type(sel, phone, { delay: 45 }).catch(async () => {
+                        await browserService.humanType(page, sel, phone).catch(() => {})
+                    })
+                    await browserService.randomDelay(300, 700)
+                    return true
+                }
+            } catch { /* next */ }
+        }
+        return false
     }
 }
 

@@ -394,7 +394,9 @@ export class AccountService {
                     headless: true,
                     profilePath,
                 },
-                account.twoFactorSecret || undefined
+                account.twoFactorSecret || undefined,
+                account.recoveryEmail || undefined,
+                account.recoveryPhone || undefined
             )
             contextId = loginResult.contextId >= 0 ? loginResult.contextId : null
 
