@@ -385,7 +385,23 @@ export function registerAccountHandlers() {
                 try {
                     const ctx = browserService.getContext(contextId) || rawContext
                     if (!ctx) return false
-                    const isLogged = await browserService.isGoogleLoggedIn(contextId, ctx as any).catch(() => false)
+                    let isLogged = await browserService.isGoogleLoggedIn(contextId, ctx as any).catch(() => false)
+                    if (!isLogged) {
+                        // Strong supplement per spec: myaccount URL or left signin page => treat as logged (then save whatever cookies present now)
+                        try {
+                            const pages = (typeof (ctx as any).pages === 'function')
+                                ? (ctx as any).pages().filter((p: any) => !p.isClosed?.())
+                                : []
+                            for (const p of pages) {
+                                const url = (typeof p.url === 'function') ? p.url() : ''
+                                if (url.includes('myaccount.google.com') ||
+                                    (url.includes('google.com') && !/signin|ServiceLogin|accounts\.google\.com\/(signin|Login)/i.test(url))) {
+                                    isLogged = true
+                                    break
+                                }
+                            }
+                        } catch { /* per spec strong url signal */ }
+                    }
                     if (isLogged) {
                         await accountService.updateStatus(id, 'active')
                         await accountService.updateLastUsed(id)
@@ -398,29 +414,44 @@ export function registerAccountHandlers() {
                         return true
                     }
                     if (isFinalCheck) {
-                        // User closed without completing: explicit pending (never banned for manual)
-                        await accountService.updateStatus(id, 'pending')
+                        // User closed without completing: explicit pending (never banned for manual).
+                        // Guard: do not demote an already-active (race with poll-detect + auto-close emitting close event).
+                        const curr = await accountService.getById(id).catch(() => null)
+                        if (!curr || curr.status !== 'active') {
+                            await accountService.updateStatus(id, 'pending')
+                        }
                     }
                     return false
                 } catch {
                     if (isFinalCheck) {
-                        await accountService.updateStatus(id, 'pending').catch(() => {})
+                        const curr = await accountService.getById(id).catch(() => null)
+                        if (!curr || curr.status !== 'active') {
+                            await accountService.updateStatus(id, 'pending').catch(() => {})
+                        }
                     }
                     return false
                 }
             }
 
-            // Poll WIDE window (up to ~5min) every 2.5s; stop early on detect or manual close
+            // Poll WIDE window (~10min max) every ~2.5s using isGoogleLoggedIn (cookie primary) on the live manual context;
+            // stop on detect (then auto-close), user close, or ctx gone. Supplement: strong myaccount URL as signal + still save current cookies.
             ;(async () => {
-                const deadline = Date.now() + 5 * 60 * 1000
-                while (Date.now() < deadline) {
-                    if (!openManualBrowsers.has(id)) break
-                    const detected = await tryDetectAndSave(false)
-                    if (detected) {
-                        openManualBrowsers.delete(id) // stop poll, leave visible browser for user to close
-                        break
+                const deadline = Date.now() + 10 * 60 * 1000
+                try {
+                    while (Date.now() < deadline) {
+                        if (!openManualBrowsers.has(id)) break
+                        const liveCtx = browserService.getContext(contextId)
+                        if (!liveCtx) { openManualBrowsers.delete(id); break }
+                        const detected = await tryDetectAndSave(false)
+                        if (detected) {
+                            openManualBrowsers.delete(id)
+                            try { await browserService.closeContext(contextId) } catch {}
+                            break
+                        }
+                        await new Promise(r => setTimeout(r, 2500))
                     }
-                    await new Promise(r => setTimeout(r, 2500))
+                } finally {
+                    openManualBrowsers.delete(id)
                 }
             })()
 

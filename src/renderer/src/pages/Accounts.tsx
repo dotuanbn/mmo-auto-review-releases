@@ -181,7 +181,24 @@ function AccountsTab() {
                             ...prev,
                             [id]: { status: 'logging_in', message: 'Browser da mo - hay dang nhap!' }
                         }))
-                        // Manual poll/close in main will auto set active/pending + cookies; state cleared on next user action or refresh
+                        // Watch for bg detect (poll + isGoogleLoggedIn + close in main): refetch until status=active (from store), flip loginStates success so pill shows 'active' immediately.
+                        const watchForActive = async (attempts = 0) => {
+                            if (attempts > 120) return // ~6min safety
+                            try {
+                                await fetchAccounts()
+                                const list = (useAccountStore as any).getState ? (useAccountStore as any).getState().accounts : accounts
+                                const acc = (list || []).find((a: any) => a && a.id === id)
+                                if (acc && acc.status === 'active') {
+                                    setLoginStates(prev => ({ ...prev, [id]: { status: 'success', message: 'Dang nhap thu cong thanh cong!' } }))
+                                    setTimeout(() => {
+                                        setLoginStates(prev => { const n = { ...prev }; delete n[id]; return n })
+                                    }, 4500)
+                                    return
+                                }
+                            } catch {}
+                            setTimeout(() => watchForActive(attempts + 1), 3000)
+                        }
+                        watchForActive(0)
                     } else {
                         setLoginStates(prev => ({
                             ...prev,
@@ -298,6 +315,24 @@ function AccountsTab() {
                     ...prev,
                     [id]: { status: 'logging_in', message: 'Browser da mo - hay dang nhap!' }
                 }))
+                // Watch for bg detect (dropdown manual open path)
+                const watchForActive = async (attempts = 0) => {
+                    if (attempts > 120) return
+                    try {
+                        await fetchAccounts()
+                        const list = (useAccountStore as any).getState ? (useAccountStore as any).getState().accounts : accounts
+                        const acc = (list || []).find((a: any) => a && a.id === id)
+                        if (acc && acc.status === 'active') {
+                            setLoginStates(prev => ({ ...prev, [id]: { status: 'success', message: 'Dang nhap thu cong thanh cong!' } }))
+                            setTimeout(() => {
+                                setLoginStates(prev => { const n = { ...prev }; delete n[id]; return n })
+                            }, 4500)
+                            return
+                        }
+                    } catch {}
+                    setTimeout(() => watchForActive(attempts + 1), 3000)
+                }
+                watchForActive(0)
             } else {
                 setLoginStates(prev => ({
                     ...prev,
