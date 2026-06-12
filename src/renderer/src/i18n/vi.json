@@ -319,6 +319,8 @@
     "organicSearchDesc": "Tìm trên Google → tìm bản đồ → tương tác tự nhiên (SEO thực tế)",
     "mapSearch": "SEO Map",
     "mapSearchDesc": "Tìm trực tiếp trên Google Maps → cuộn feed kết quả (tối đa 15) → vào map mục tiêu (SEO trên Maps)",
+    "maxMapScroll": "Số map tối đa khi cuộn tìm",
+    "maxMapScrollHint": "Giới hạn số kết quả map cuộn trong feed trước khi fallback về URL trực tiếp (mặc định 15, tối đa 100).",
     "selected": "đã chọn",
     "noAccountsAvailable": "Không có tài khoản. Thêm tài khoản trước.",
     "selectAll": "Chọn tất cả",

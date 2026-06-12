@@ -367,6 +367,8 @@
     "organicSearchDesc": "Search on Google → find the map → interact naturally (realistic SEO)",
     "mapSearch": "SEO Map",
     "mapSearchDesc": "Search directly on Google Maps → scroll results feed (max 15) → open target map (Maps SEO)",
+    "maxMapScroll": "Max maps to scroll before fallback",
+    "maxMapScrollHint": "Limit of map results to scroll in feed before falling back to direct URL (default 15, max 100).",
     "selected": "selected",
     "noAccountsAvailable": "No accounts available. Add accounts first.",
     "selectAll": "Select All",

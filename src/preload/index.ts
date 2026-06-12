@@ -208,6 +208,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
             actionsPerVisit?: number
             fixedActionCount?: boolean
             enabledActions?: string[]
+            trafficMode?: 'direct' | 'organic' | 'web_seo' | 'map_search'
+            searchKeywords?: string[]
+            maxMapScroll?: number
         }) => ipcRenderer.invoke('trafficBoost:createCampaign', data),
         updateCampaign: (id: number, data: any) => ipcRenderer.invoke('trafficBoost:updateCampaign', id, data),
         deleteCampaign: (id: number) => ipcRenderer.invoke('trafficBoost:deleteCampaign', id),

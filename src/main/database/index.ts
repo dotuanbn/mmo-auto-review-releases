@@ -234,6 +234,7 @@ function createTables() {
       name TEXT NOT NULL,
       traffic_mode TEXT NOT NULL DEFAULT 'direct',
       search_keywords TEXT,
+      max_map_scroll INTEGER NOT NULL DEFAULT 15,
       account_ids TEXT NOT NULL,
       location_ids TEXT NOT NULL,
       threads_count INTEGER NOT NULL DEFAULT 1,
@@ -487,6 +488,10 @@ function runMigrations() {
     if (!tcInfo.some((col: any) => col.name === 'ai_auto_control')) {
       console.log('Migration: Adding ai_auto_control to traffic_campaigns table')
       sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN ai_auto_control INTEGER NOT NULL DEFAULT 0")
+    }
+    if (!tcInfo.some((col: any) => col.name === 'max_map_scroll')) {
+      console.log('Migration: Adding max_map_scroll to traffic_campaigns table')
+      sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN max_map_scroll INTEGER NOT NULL DEFAULT 15")
     }
 
     // Agent knowledge table migration + indexes

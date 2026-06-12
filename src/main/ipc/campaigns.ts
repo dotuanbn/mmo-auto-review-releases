@@ -29,6 +29,7 @@ export function registerCampaignHandlers() {
         delayMin?: number
         delayMax?: number
         maxReviewsPerAccountPerDay?: number
+        maxMapScroll?: number // accepted (traffic field) for listed completeness; ignored here
     }) => {
         return campaignService.create(data)
     })

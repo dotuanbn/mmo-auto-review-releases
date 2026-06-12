@@ -1,6 +1,6 @@
 # Project Context
 
-Last checked: 2026-05-28
+Last checked: 2026-06-xx (maxMapScroll for map_search added)
 
 ## Stack
 

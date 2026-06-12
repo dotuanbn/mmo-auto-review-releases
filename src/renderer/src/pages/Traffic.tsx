@@ -78,6 +78,7 @@ interface Campaign {
     startedAt: string | null
     trafficMode?: string
     searchKeywords?: string | null
+    maxMapScroll?: number
     accounts?: { id: number; email: string }[]
     locations?: { id: number; name: string; url: string }[]
 }
@@ -1706,6 +1707,8 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
     const [trafficMode, setTrafficMode] = useState<'direct' | 'organic' | 'web_seo' | 'map_search'>('direct')
     const [locationKeywords, setLocationKeywords] = useState<Record<number, string>>({})
     const [creating, setCreating] = useState(false)
+    // map_search specific: max cards to scroll (UI default 15, min 1; passed only relevant for mode)
+    const [maxMapScroll, setMaxMapScroll] = useState(15)
     // Web SEO specific state
     const [websiteUrl, setWebsiteUrl] = useState('')
     const [webSeoKeyword, setWebSeoKeyword] = useState('')
@@ -1770,6 +1773,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     delayMinSeconds: normalizedDelayMin,
                     delayMaxSeconds: normalizedDelayMax,
                     trafficMode,
+                    maxMapScroll,
                 })
             } else {
                 // Direct / Organic mode
@@ -1793,6 +1797,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     delayMinSeconds: normalizedDelayMin,
                     delayMaxSeconds: normalizedDelayMax,
                     trafficMode,
+                    maxMapScroll,
                 })
             }
         } catch (error: any) {
@@ -2059,6 +2064,24 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     </button>
                                 </div>
                             )}
+                        </div>
+                    )}
+
+                    {/* map_search specific: max scroll threshold (only for SEO Map mode, near keyword config area) */}
+                    {trafficMode === 'map_search' && (
+                        <div>
+                            <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
+                                {t('traffic.maxMapScroll') || 'Số map tối đa khi cuộn tìm'}
+                            </label>
+                            <input
+                                type="number"
+                                value={maxMapScroll}
+                                onChange={e => setMaxMapScroll(Math.max(1, Math.min(100, parseInt(e.target.value) || 15)))}
+                                min={1}
+                                max={100}
+                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                            />
+                            <p className="text-xs text-[#908a9e] mt-0.5">Tối đa số map cuộn trong feed trước khi fallback URL trực tiếp (mặc định 15).</p>
                         </div>
                     )}
 

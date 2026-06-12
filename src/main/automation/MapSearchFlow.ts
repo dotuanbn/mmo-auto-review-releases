@@ -24,7 +24,8 @@ export interface MapSearchFlowResult {
 // Status callback for live monitoring
 type StatusCallback = (status: string) => void
 
-const MAX_MAP_CARDS_TO_SCAN = 15
+const DEFAULT_MAX_MAP_CARDS_TO_SCAN = 15
+const MAX_ALLOWED_MAP_CARDS_TO_SCAN = 100
 const MAPS_URL = 'https://www.google.com/maps'
 
 // ============================================================
@@ -55,7 +56,7 @@ export class MapSearchFlow {
         }
     }
 
-    async execute(page: Page, keyword: string, location: LocationInfo, isLoggedIn: boolean = false): Promise<MapSearchFlowResult> {
+    async execute(page: Page, keyword: string, location: LocationInfo, isLoggedIn: boolean = false, maxMapScroll?: number): Promise<MapSearchFlowResult> {
         const result: MapSearchFlowResult = {
             success: false,
             foundMap: false,
@@ -63,6 +64,14 @@ export class MapSearchFlow {
             searchKeyword: keyword,
             message: '',
         }
+
+        // Compute effective max with clamp: invalid/<1 -> DEFAULT 15; cap at 100
+        const effectiveMax = (() => {
+            if (typeof maxMapScroll !== 'number' || !Number.isFinite(maxMapScroll) || maxMapScroll < 1) {
+                return DEFAULT_MAX_MAP_CARDS_TO_SCAN
+            }
+            return Math.min(MAX_ALLOWED_MAP_CARDS_TO_SCAN, Math.floor(maxMapScroll))
+        })()
 
         try {
             this.onStatus(`Đang mở Google Maps: "${keyword}"`)
@@ -82,11 +91,11 @@ export class MapSearchFlow {
             await HumanBehavior.randomDelay(1500, 3000)
             await this.resolveUnexpectedPrompt(page, 'after_search_submit')
 
-            // Scroll feed and find target (max 15 cards)
+            // Scroll feed and find target (use effective max from param or default)
             this.onStatus(`Đang quét feed Maps tìm: ${location.name}`)
-            const found = await this.scrollAndFindTargetInFeed(page, location)
+            const found = await this.scrollAndFindTargetInFeed(page, location, effectiveMax)
             if (!found) {
-                result.message = `Map "${location.name}" not found after scanning ${MAX_MAP_CARDS_TO_SCAN} cards`
+                result.message = `Map "${location.name}" not found after scanning ${effectiveMax} cards`
                 return result
             }
             result.foundMap = true
@@ -179,7 +188,7 @@ export class MapSearchFlow {
         }
     }
 
-    private async scrollAndFindTargetInFeed(page: Page, location: LocationInfo): Promise<boolean> {
+    private async scrollAndFindTargetInFeed(page: Page, location: LocationInfo, maxCards: number): Promise<boolean> {
         let cardsScanned = 0
 
         // Prefer the results feed panel
@@ -193,7 +202,7 @@ export class MapSearchFlow {
             const cards = await page.$$(cardSelectors).catch(() => [])
 
             for (const card of cards) {
-                if (cardsScanned >= MAX_MAP_CARDS_TO_SCAN) break
+                if (cardsScanned >= maxCards) break
 
                 cardsScanned++
 
@@ -224,12 +233,12 @@ export class MapSearchFlow {
                 } catch { /* card read/click error, continue */ }
             }
 
-            if (cardsScanned >= MAX_MAP_CARDS_TO_SCAN) {
+            if (cardsScanned >= maxCards) {
                 break
             }
 
             // Scroll the feed or page to load more
-            this.onStatus(`Đang cuộn feed Maps (${cardsScanned}/${MAX_MAP_CARDS_TO_SCAN})...`)
+            this.onStatus(`Đang cuộn feed Maps (${cardsScanned}/${maxCards})...`)
             try {
                 const feed = await page.$(feedSelector).catch(() => null)
                 if (feed) {

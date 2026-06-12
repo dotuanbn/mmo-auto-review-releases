@@ -181,6 +181,7 @@ export const trafficCampaigns = sqliteTable('traffic_campaigns', {
     name: text('name').notNull(),
     trafficMode: text('traffic_mode', { enum: ['direct', 'organic', 'web_seo', 'map_search'] }).default('direct').notNull(), // direct = open URL, organic = map search, web_seo = website search, map_search = SEO search directly in Google Maps UI
     searchKeywords: text('search_keywords'), // JSON array of keywords for organic mode
+    maxMapScroll: integer('max_map_scroll').default(15).notNull(), // max cards to scroll in map_search mode before fallback to direct URL
     accountIds: text('account_ids').notNull(), // JSON array of account IDs
     locationIds: text('location_ids').notNull(), // JSON array of location IDs
     threadsCount: integer('threads_count').default(1).notNull(), // 1-10 concurrent browsers

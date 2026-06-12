@@ -2988,7 +2988,7 @@ export class TrafficBoostEngine {
                                                 address: task.location.address,
                                                 placeId: task.location.placeId,
                                                 url: task.location.url,
-                                            }, !!task.account)
+                                            }, !!task.account, (campaign.maxMapScroll ?? undefined))
 
                                             // Log discovery actions with prefix
                                             for (const a of mapSearchResult.actionsPerformed) {

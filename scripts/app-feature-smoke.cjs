@@ -246,6 +246,7 @@ async function main() {
           delayMinSeconds: 0,
           delayMaxSeconds: 1,
           aiAutoControl: false,
+          maxMapScroll: 15,
         })
         ids.trafficCampaignId = campaign.id
         await api.trafficBoost.updateCampaign(campaign.id, { name: 'Smoke Traffic Campaign Updated', aiAutoControl: false })

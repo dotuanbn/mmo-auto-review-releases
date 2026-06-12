@@ -171,6 +171,7 @@ export function registerTrafficHandlers() {
         name: string
         trafficMode?: 'direct' | 'organic' | 'web_seo' | 'map_search'
         searchKeywords?: string[]
+        maxMapScroll?: number
         accountIds: number[]
         locationIds: number[]
         threadsCount?: number
@@ -186,10 +187,14 @@ export function registerTrafficHandlers() {
             const delayMaxSeconds = Math.max(delayMinSeconds, delayMaxSecondsInput)
             const threadsCount = Math.max(1, Math.floor(data.threadsCount ?? 1))
 
+            const providedMax = typeof data.maxMapScroll === 'number' ? data.maxMapScroll : 15
+            const clampedMax = Math.max(1, Math.min(100, Math.floor(providedMax)))
+
             return db.insert(trafficCampaigns).values({
                 name: data.name,
                 trafficMode: data.trafficMode || 'direct',
                 searchKeywords: data.searchKeywords ? JSON.stringify(data.searchKeywords) : null,
+                maxMapScroll: clampedMax,
                 accountIds: JSON.stringify(data.accountIds),
                 locationIds: JSON.stringify(data.locationIds),
                 threadsCount,
@@ -243,6 +248,10 @@ export function registerTrafficHandlers() {
 
             if (typeof data.aiAutoControl === 'boolean') {
                 updateData.aiAutoControl = data.aiAutoControl
+            }
+
+            if (typeof data.maxMapScroll === 'number') {
+                updateData.maxMapScroll = Math.max(1, Math.min(100, Math.floor(data.maxMapScroll)))
             }
 
             return db.update(trafficCampaigns)
