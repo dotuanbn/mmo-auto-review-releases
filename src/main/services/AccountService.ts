@@ -364,6 +364,10 @@ export class AccountService {
         if (!account) {
             return { alive: false, error: 'Account not found' }
         }
+        if (!account.password || !account.password.trim()) {
+            await this.updateStatus(id, 'pending')
+            return { alive: false, error: 'Thiếu mật khẩu (cập nhật lại tài khoản)' }
+        }
 
         // Update status to checking
         await this.updateStatus(id, 'checking')

@@ -150,6 +150,10 @@ export function registerAccountHandlers() {
             if (isManualAccount(account)) {
                 return { success: false, message: 'Tài khoản thủ công: Hãy dùng nút Đăng nhập thủ công' }
             }
+            if (!account.password || !account.password.trim()) {
+                await accountService.updateStatus(id, 'pending')
+                return { success: false, message: 'Thiếu mật khẩu (cập nhật lại tài khoản)' }
+            }
 
             await accountService.updateStatus(id, 'checking')
 
@@ -223,6 +227,10 @@ export function registerAccountHandlers() {
 
             if (isManualAccount(account)) {
                 return { success: false, message: 'Tài khoản thủ công: Hãy dùng nút Đăng nhập thủ công' }
+            }
+            if (!account.password || !account.password.trim()) {
+                await accountService.updateStatus(id, 'pending')
+                return { success: false, message: 'Thiếu mật khẩu (cập nhật lại tài khoản)' }
             }
 
             await accountService.updateStatus(id, 'checking')

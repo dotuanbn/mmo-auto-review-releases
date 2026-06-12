@@ -42,6 +42,13 @@ export class GoogleAuthHandler {
         }
     }
 
+    // Small inline email normalizer (defensive; AccountService already normalizes on write)
+    private normalizeEmailForLogin(email: string): string {
+        const t = (email || '').trim()
+        if (!t) return t
+        return t.includes('@') ? t : `${t}@gmail.com`
+    }
+
     // Login to Google account (supports auto 2FA TOTP if secret provided)
     async login(
         email: string,
@@ -49,6 +56,14 @@ export class GoogleAuthHandler {
         config?: BrowserConfig,
         twoFactorSecret?: string | null
     ): Promise<{ success: boolean; contextId: number; error?: string; requires2FA?: boolean }> {
+        const normalizedEmail = this.normalizeEmailForLogin(email)
+        if (!normalizedEmail || !normalizedEmail.trim()) {
+            return { success: false, contextId: -1, error: 'Thiếu email' }
+        }
+        if (!password || !password.trim()) {
+            return { success: false, contextId: -1, error: 'Thiếu mật khẩu' }
+        }
+
         const contextId = await browserService.createContext(config)
         const page = browserService.getPage(contextId)
 
@@ -57,18 +72,19 @@ export class GoogleAuthHandler {
         }
 
         try {
-            await page.goto('https://accounts.google.com/signin', { waitUntil: 'networkidle' })
-            await browserService.randomDelay(1000, 2000)
+            // Use domcontentloaded + explicit input wait for reliability on v3 identifier pages
+            await page.goto('https://accounts.google.com/signin', { waitUntil: 'domcontentloaded' })
+            await browserService.randomDelay(800, 1600)
 
-            await this.enterEmail(page, email)
-            await browserService.randomDelay(2000, 4000)
+            await this.enterEmail(page, normalizedEmail)
+            await browserService.randomDelay(1800, 3200)
 
             if (await this.hasError(page)) {
                 return { success: false, contextId, error: 'Email not found or invalid' }
             }
 
             await this.enterPassword(page, password)
-            await browserService.randomDelay(2000, 4000)
+            await browserService.randomDelay(1800, 3200)
 
             if (await this.hasPasswordError(page)) {
                 return { success: false, contextId, error: 'Incorrect password' }
@@ -85,7 +101,7 @@ export class GoogleAuthHandler {
                     if (code) {
                         const submitted = await this.enter2FACode(page, code)
                         if (submitted) {
-                            await browserService.randomDelay(2000, 4000)
+                            await browserService.randomDelay(1800, 3200)
                             if (await this.isAccountDisabledOrSuspended(page)) {
                                 return { success: false, contextId, error: 'Account disabled or suspended by Google' }
                             }
@@ -116,31 +132,94 @@ export class GoogleAuthHandler {
                 contextId,
                 error: error instanceof Error ? error.message : 'Unknown error'
             }
+        } finally {
+            // Ensure page/context left in clean state for caller to decide close/save (per existing finally in ipc)
         }
     }
 
-    // Enter email in login form
+    // Enter email in login form (v3 identifier: #identifierId primary)
     private async enterEmail(page: Page, email: string): Promise<void> {
-        const emailInput = 'input[type="email"]'
-        await page.waitForSelector(emailInput, { timeout: 10000 })
-        await browserService.humanType(page, emailInput, email)
-        await browserService.randomDelay(500, 1000)
+        // Primary per current Google: input#identifierId ; fallback type=email for resilience
+        const emailSelectors = ['input#identifierId', 'input[type="email"]']
+        let emailInputSel = emailSelectors[0]
+        for (const sel of emailSelectors) {
+            try {
+                await page.waitForSelector(sel, { state: 'visible', timeout: 15000 })
+                emailInputSel = sel
+                break
+            } catch {
+                // try next
+            }
+        }
+        // Final wait (will throw if none)
+        await page.waitForSelector(emailInputSel, { state: 'visible', timeout: 15000 })
 
-        // Click next button
-        const nextButton = 'button:has-text("Next"), button:has-text("Tiếp theo"), #identifierNext'
-        await page.click(nextButton)
+        // Prefer human-like, fallback to fill for reliability if click/type blocked
+        try {
+            await browserService.humanType(page, emailInputSel, email)
+        } catch {
+            await page.fill(emailInputSel, email).catch(() => {})
+        }
+        await browserService.randomDelay(400, 900)
+
+        await this.clickNextButton(page, true) // email step
     }
 
-    // Enter password in login form
-    private async enterPassword(page: Page, password: string): Promise<void> {
-        const passwordInput = 'input[type="password"]'
-        await page.waitForSelector(passwordInput, { timeout: 15000 })
-        await browserService.humanType(page, passwordInput, password)
-        await browserService.randomDelay(500, 1000)
+    // Robust Next click: support button, div[role=button], #id variants, text (EN/VI), fallback Enter
+    private async clickNextButton(page: Page, isEmailStep = false): Promise<void> {
+        const id = isEmailStep ? '#identifierNext' : '#passwordNext'
+        const candidates = [
+            `${id} button`,
+            id,
+            'button:has-text("Next"), button:has-text("Tiếp theo")',
+            'div[role="button"]:has-text("Next"), div[role="button"]:has-text("Tiếp theo")',
+            '[role="button"]:has-text("Next"), [role="button"]:has-text("Tiếp theo")',
+            'button[type="button"]:has-text("Next")',
+        ]
+        let clicked = false
+        for (const sel of candidates) {
+            try {
+                const el = await page.waitForSelector(sel, { state: 'visible', timeout: 2500 }).catch(() => null)
+                if (el) {
+                    await el.click().catch(async () => {
+                        // fallback click via coords if needed
+                        const box = await el.boundingBox().catch(() => null)
+                        if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+                    })
+                    clicked = true
+                    break
+                }
+            } catch { /* next */ }
+        }
+        if (!clicked) {
+            // Last resort: press Enter after typing (many flows accept it on focused input)
+            await page.keyboard.press('Enter').catch(() => {})
+        }
+        await browserService.randomDelay(300, 700)
+    }
 
-        // Click next button
-        const nextButton = 'button:has-text("Next"), button:has-text("Tiếp theo"), #passwordNext'
-        await page.click(nextButton)
+    // Enter password in login form (name=Passwd primary for current Google)
+    private async enterPassword(page: Page, password: string): Promise<void> {
+        // Wait explicitly for password step after email Next (critical)
+        const pwdSelectors = ['input[name="Passwd"]', 'input[type="password"]']
+        let pwdSel = pwdSelectors[0]
+        for (const sel of pwdSelectors) {
+            try {
+                await page.waitForSelector(sel, { state: 'visible', timeout: 15000 })
+                pwdSel = sel
+                break
+            } catch { /* try next */ }
+        }
+        await page.waitForSelector(pwdSel, { state: 'visible', timeout: 15000 })
+
+        try {
+            await browserService.humanType(page, pwdSel, password)
+        } catch {
+            await page.fill(pwdSel, password).catch(() => {})
+        }
+        await browserService.randomDelay(400, 900)
+
+        await this.clickNextButton(page, false)
     }
 
     // Check for login errors
@@ -168,59 +247,59 @@ export class GoogleAuthHandler {
         }
     }
 
-    // Check if 2FA is required (TOTP code input)
+    // Check if 2FA is required (TOTP code input) — waited visible checks
     private async requires2FA(page: Page): Promise<boolean> {
         try {
             const twoFASelectors = [
-                'input[type="tel"]',
                 '#totpPin',
                 'input[name="totpPin"]',
                 'input[autocomplete="one-time-code"]',
-                'text="2-Step Verification"',
-                'text="Xác minh 2 bước"',
-                'text="Enter code"',
-                'text="Nhập mã"',
+                'input[type="tel"]',
+                'input[aria-label*="code" i]',
             ]
             for (const selector of twoFASelectors) {
-                const element = await page.$(selector)
-                if (element) return true
+                const el = await page.waitForSelector(selector, { state: 'visible', timeout: 2200 }).catch(() => null)
+                if (el) return true
             }
-            // Fallback: look for common 6-digit prompt text
+            // Text prompts (short non-blocking)
             const bodyText = await page.textContent('body').catch(() => '')
-            if (bodyText && /enter.*code|nhập.*mã|2-step|2 bước|verification code/i.test(bodyText)) return true
+            if (bodyText && /enter.*code|nhập.*mã|2-step|2 bước|verification code|totp|google authenticator/i.test(bodyText)) return true
             return false
         } catch {
             return false
         }
     }
 
-    // Enter TOTP code (auto for secret case)
+    // Enter TOTP code (auto for secret case) — waited + fill + enter
     private async enter2FACode(page: Page, code: string): Promise<boolean> {
         try {
             const selectors = [
                 '#totpPin',
                 'input[name="totpPin"]',
-                'input[type="tel"]',
                 'input[autocomplete="one-time-code"]',
+                'input[type="tel"]',
                 'input[aria-label*="code" i]',
             ]
-            let input = null
+            let inputSel: string | null = null
             for (const sel of selectors) {
-                input = await page.$(sel)
-                if (input) break
+                const el = await page.waitForSelector(sel, { state: 'visible', timeout: 4000 }).catch(() => null)
+                if (el) { inputSel = sel; break }
             }
-            if (!input) {
-                // Try any visible text/tel input on 2fa step
-                const inputs = await page.$$('input[type="text"], input[type="tel"]')
-                if (inputs.length > 0) input = inputs[0]
+            if (!inputSel) {
+                const any = await page.waitForSelector('input[type="text"], input[type="tel"]', { state: 'visible', timeout: 3000 }).catch(() => null)
+                if (any) inputSel = 'input[type="text"], input[type="tel"]'
             }
-            if (input) {
-                await input.fill('')
-                await input.type(code, { delay: 60 })
-                await browserService.randomDelay(400, 800)
-                // Submit
-                await page.keyboard.press('Enter')
-                await browserService.randomDelay(1500, 2500)
+            if (inputSel) {
+                await page.fill(inputSel, '').catch(async () => {
+                    const h = await page.$(inputSel!)
+                    if (h) await h.fill('').catch(() => {})
+                })
+                await page.type(inputSel, code, { delay: 55 }).catch(async () => {
+                    await browserService.humanType(page, inputSel!, code).catch(() => {})
+                })
+                await browserService.randomDelay(300, 700)
+                await page.keyboard.press('Enter').catch(() => {})
+                await browserService.randomDelay(1400, 2400)
                 return true
             }
             return false
@@ -233,10 +312,9 @@ export class GoogleAuthHandler {
     private async isLoggedIn(page: Page): Promise<boolean> {
         try {
             const ctx = page.context()
-            // Prefer context-based (cookie check primary + light page check); fall back to page if no ctx
-            if (ctx && (browserService as any).isGoogleLoggedIn) {
-                // We don't have contextId here, but can pass the live context object
-                const ok = await (browserService as any).isGoogleLoggedIn(undefined, ctx).catch(() => false)
+            // Direct call (public on BrowserService); cookie-based primary
+            if (ctx) {
+                const ok = await browserService.isGoogleLoggedIn(undefined, ctx).catch(() => false)
                 if (ok) return true
             }
             // Fallback legacy light check (URL/avatar) to keep behavior for edge
