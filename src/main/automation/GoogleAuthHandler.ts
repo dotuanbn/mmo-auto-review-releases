@@ -74,6 +74,10 @@ export class GoogleAuthHandler {
                 return { success: false, contextId, error: 'Incorrect password' }
             }
 
+            if (await this.isAccountDisabledOrSuspended(page)) {
+                return { success: false, contextId, error: 'Account disabled or suspended by Google' }
+            }
+
             // Auto handle TOTP 2FA if secret available
             if (await this.requires2FA(page)) {
                 if (twoFactorSecret) {
@@ -82,6 +86,9 @@ export class GoogleAuthHandler {
                         const submitted = await this.enter2FACode(page, code)
                         if (submitted) {
                             await browserService.randomDelay(2000, 4000)
+                            if (await this.isAccountDisabledOrSuspended(page)) {
+                                return { success: false, contextId, error: 'Account disabled or suspended by Google' }
+                            }
                             const loggedIn = await this.isLoggedIn(page)
                             if (loggedIn) {
                                 return { success: true, contextId }
@@ -90,6 +97,10 @@ export class GoogleAuthHandler {
                     }
                 }
                 return { success: false, contextId, error: '2FA required - please complete manually', requires2FA: true }
+            }
+
+            if (await this.isAccountDisabledOrSuspended(page)) {
+                return { success: false, contextId, error: 'Account disabled or suspended by Google' }
             }
 
             const isLoggedIn = await this.isLoggedIn(page)
@@ -218,27 +229,59 @@ export class GoogleAuthHandler {
         }
     }
 
-    // Check if successfully logged in
+    // Check if successfully logged in (now uses shared reliable helper via context cookies primary)
     private async isLoggedIn(page: Page): Promise<boolean> {
         try {
-            // Wait for redirect to myaccount or google.com
-            await page.waitForURL(/myaccount\.google\.com|google\.com\/(?!ServiceLogin)/, {
-                timeout: 10000
-            })
-            return true
-        } catch {
-            // Check for avatar or account menu
+            const ctx = page.context()
+            // Prefer context-based (cookie check primary + light page check); fall back to page if no ctx
+            if (ctx && (browserService as any).isGoogleLoggedIn) {
+                // We don't have contextId here, but can pass the live context object
+                const ok = await (browserService as any).isGoogleLoggedIn(undefined, ctx).catch(() => false)
+                if (ok) return true
+            }
+            // Fallback legacy light check (URL/avatar) to keep behavior for edge
+            const url = page.url()
+            if (url.includes('myaccount.google.com') || (url.includes('google.com') && !/signin|ServiceLogin/i.test(url))) return true
             const avatarSelectors = [
                 'img[aria-label*="Google Account"]',
                 'a[aria-label*="Google Account"]',
                 'img.gb_D',
             ]
-
             for (const selector of avatarSelectors) {
                 const avatar = await page.$(selector)
                 if (avatar) return true
             }
+            return false
+        } catch {
+            return false
+        }
+    }
 
+    // Detect real Google account disabled/suspended signals (for correct 'banned'/'suspended' only)
+    private async isAccountDisabledOrSuspended(page: Page): Promise<boolean> {
+        try {
+            const disabledTexts = [
+                'account has been disabled',
+                'your account is disabled',
+                'account disabled',
+                'account suspended',
+                'your account has been suspended',
+                'violated Google',
+                'disabled for violating',
+                'tài khoản đã bị vô hiệu hóa',
+                'tài khoản bị đình chỉ',
+                'bị vô hiệu hóa',
+            ]
+            const bodyText = await page.textContent('body').catch(() => '') || ''
+            const lower = bodyText.toLowerCase()
+            for (const t of disabledTexts) {
+                if (lower.includes(t.toLowerCase())) return true
+            }
+            // Also check common disabled landing
+            const url = page.url()
+            if (/disabled|accountdisabled|suspended/i.test(url)) return true
+            return false
+        } catch {
             return false
         }
     }

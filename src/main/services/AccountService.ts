@@ -415,20 +415,19 @@ export class AccountService {
                 // Check for specific error types
                 if (loginResult.error?.includes('2FA') || loginResult.error?.includes('2-Step')) {
                     await this.updateStatus(id, 'pending')
-                    // Try 2FA if secret is available
                     if (account.twoFactorSecret) {
                         const totpCode = this.generateTOTPCode(account.twoFactorSecret)
-                        // TODO: Implement 2FA submission
                         return { alive: false, needs2FA: true, error: '2FA required but not yet implemented' }
                     }
                     return { alive: false, needs2FA: true, error: '2FA required but no secret stored' }
                 }
 
-                // Mark as banned/suspended based on error
-                if (loginResult.error?.includes('banned') || loginResult.error?.includes('suspended')) {
-                    await this.updateStatus(id, 'suspended')
+                // Map correctly: only real Google disabled/suspended -> banned/suspended; auth fail/wrong pass/incomplete -> pending
+                const err = (loginResult.error || '').toLowerCase()
+                if (err.includes('disabled') || err.includes('suspended')) {
+                    await this.updateStatus(id, err.includes('suspended') ? 'suspended' : 'banned')
                 } else {
-                    await this.updateStatus(id, 'banned')
+                    await this.updateStatus(id, 'pending')
                 }
 
                 return { alive: false, error: loginResult.error }

@@ -169,7 +169,6 @@ export function registerAccountHandlers() {
 
             if (loginResult.success) {
                 await googleAuthHandler.saveSession(contextId!, profilePath)
-                // Explicitly persist cookies JSON to accounts.cookies for Traffic/Review engines
                 try {
                     const { browserService } = await import('../automation/BrowserService')
                     const ctx = browserService.getContext(contextId!)
@@ -188,7 +187,13 @@ export function registerAccountHandlers() {
                 return { success: false, message: '2FA required but no valid secret - use manual login', needs2FA: true }
             }
 
-            await accountService.updateStatus(id, 'banned')
+            // Only banned/suspended on explicit Google disabled; auth fail (wrong pass etc) = pending for retry
+            const err = (loginResult.error || '').toLowerCase()
+            if (err.includes('disabled') || err.includes('suspended')) {
+                await accountService.updateStatus(id, err.includes('suspended') ? 'suspended' : 'banned')
+            } else {
+                await accountService.updateStatus(id, 'pending')
+            }
             return { success: false, message: loginResult.error || 'Auto login failed' }
         } catch (error) {
             await accountService.updateStatus(id, 'pending')
@@ -262,7 +267,13 @@ export function registerAccountHandlers() {
                 }
             }
 
-            await accountService.updateStatus(id, 'banned')
+            // Only banned/suspended on explicit Google disabled; other fails (pass, incomplete) = pending
+            const err = (loginResult.error || '').toLowerCase()
+            if (err.includes('disabled') || err.includes('suspended')) {
+                await accountService.updateStatus(id, err.includes('suspended') ? 'suspended' : 'banned')
+            } else {
+                await accountService.updateStatus(id, 'pending')
+            }
             return { success: false, message: loginResult.error || 'Visible login failed' }
         } catch (error) {
             await accountService.updateStatus(id, 'pending')
@@ -358,16 +369,13 @@ export function registerAccountHandlers() {
             // Persist profilePath
             await accountService.update(id, { profilePath })
 
-            // Detect + save cookies/state to accounts.cookies (compat with engines); idempotent
-            const trySaveLoginState = async () => {
+            // Shared reliable detect (cookies primary via BrowserService helper) + save for engine compat
+            const tryDetectAndSave = async (isFinalCheck = false): Promise<boolean> => {
                 try {
                     const ctx = browserService.getContext(contextId) || rawContext
-                    if (!ctx) return
-                    const currentPage = browserService.getPage(contextId) || (ctx.pages ? ctx.pages().find((p: any) => !p.isClosed()) : null)
-                    const url = currentPage ? currentPage.url() : ''
-                    const hasAvatar = currentPage ? await currentPage.$('img[aria-label*="Google Account"], a[aria-label*="Google Account"]').catch(() => null) : null
-                    const loggedByUrl = url.includes('myaccount') || (url.includes('google.com') && !/signin|ServiceLogin|accounts\.google\.com\/ServiceLogin/i.test(url))
-                    if (loggedByUrl || hasAvatar) {
+                    if (!ctx) return false
+                    const isLogged = await browserService.isGoogleLoggedIn(contextId, ctx as any).catch(() => false)
+                    if (isLogged) {
                         await accountService.updateStatus(id, 'active')
                         await accountService.updateLastUsed(id)
                         try { await ctx.storageState({ path: join(profilePath, 'state.json') }).catch(() => {}) } catch {}
@@ -376,26 +384,41 @@ export function registerAccountHandlers() {
                             if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
                         } catch {}
                         console.log(`[ManualLogin] Detected login for ${account.email}, saved cookies + active`)
+                        return true
                     }
-                } catch {}
+                    if (isFinalCheck) {
+                        // User closed without completing: explicit pending (never banned for manual)
+                        await accountService.updateStatus(id, 'pending')
+                    }
+                    return false
+                } catch {
+                    if (isFinalCheck) {
+                        await accountService.updateStatus(id, 'pending').catch(() => {})
+                    }
+                    return false
+                }
             }
 
-            // Poll for detection (non-blocking, ~60s; stops if map entry removed)
+            // Poll WIDE window (up to ~5min) every 2.5s; stop early on detect or manual close
             ;(async () => {
-                for (let i = 0; i < 12; i++) {
-                    await new Promise(r => setTimeout(r, 5000))
+                const deadline = Date.now() + 5 * 60 * 1000
+                while (Date.now() < deadline) {
                     if (!openManualBrowsers.has(id)) break
-                    await trySaveLoginState()
+                    const detected = await tryDetectAndSave(false)
+                    if (detected) {
+                        openManualBrowsers.delete(id) // stop poll, leave visible browser for user to close
+                        break
+                    }
+                    await new Promise(r => setTimeout(r, 2500))
                 }
             })()
 
-            // On user close (or external), save state/cookies then cleanup service map (no force-kill of active)
+            // On user close (or external close): LAST CHECK cookies before context gone; active if logged, else pending (no banned)
             if (rawContext) {
                 rawContext.on('close', async () => {
                     openManualBrowsers.delete(id)
-                    await trySaveLoginState()
+                    await tryDetectAndSave(true) // final cookie check
                     try { await browserService.closeContext(contextId) } catch {}
-                    // Leave status as-is if pending (user decides); active only on successful detect
                     console.log(`[ManualLogin] Browser closed for ${account.email}`)
                 })
             }

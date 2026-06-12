@@ -530,6 +530,48 @@ export class BrowserService {
         }
     }
 
+    // Reliable Google login detection: PRIMARY = cookies (SID/SAPISID/__Secure-*PSID group on google.com)
+    // Fallback light check on existing pages (no disruptive nav for visible manual windows)
+    // Used by manual/auto login + checkLiveDie. Never logs cookie values/secrets.
+    private hasValidGoogleSessionCookies(cookies: any[]): boolean {
+        if (!Array.isArray(cookies) || cookies.length === 0) return false
+        const gCookies = cookies.filter((c: any) => c && typeof c.domain === 'string' && c.domain.includes('google'))
+        if (gCookies.length === 0) return false
+        const names = new Set(gCookies.map((c: any) => c.name))
+        // SID group or Secure PSID variants are sufficient for active Google session
+        return names.has('SID') || names.has('SAPISID') || names.has('__Secure-1PSID') || names.has('__Secure-3PSID') ||
+            names.has('HSID') || names.has('SSID') || names.has('APISID')
+    }
+
+    async isGoogleLoggedIn(contextId?: number, context?: BrowserContext): Promise<boolean> {
+        try {
+            let ctx = context
+            if (!ctx && typeof contextId === 'number') {
+                ctx = this.contexts.get(contextId)
+            }
+            if (!ctx) return false
+
+            const ck = await ctx.cookies().catch(() => [])
+            if (this.hasValidGoogleSessionCookies(ck)) return true
+
+            // Light supplement (no goto): existing pages URL + avatar (does not disturb user manual flow)
+            const pages = (typeof (ctx as any).pages === 'function') ? (ctx as any).pages().filter((p: any) => !p.isClosed?.()) : []
+            for (const p of pages) {
+                try {
+                    const url = (typeof p.url === 'function') ? p.url() : ''
+                    if (url.includes('myaccount.google.com') || (url.includes('google.com') && !/signin|ServiceLogin|accounts\.google\.com\/(signin|Login)/i.test(url))) {
+                        return true
+                    }
+                    const hasAvatar = await p.$('img[aria-label*="Google Account"], a[aria-label*="Google Account"]').catch(() => null)
+                    if (hasAvatar) return true
+                } catch { /* per page */ }
+            }
+            return false
+        } catch {
+            return false
+        }
+    }
+
     async saveContextState(contextId: number, profilePath: string): Promise<void> {
         const settings = loadSettings()
         if (settings.saveProfiles === false) return
