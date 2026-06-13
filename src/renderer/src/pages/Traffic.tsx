@@ -759,7 +759,7 @@ export function Traffic() {
             />
 
             {/* Tab Content */}
-            {activeTab === 'campaigns' && (
+            {activeTab === 'campaigns' && !showCreateModal && (
                 <CampaignsTab
                     campaigns={campaigns}
                     onStart={handleStartCampaign}

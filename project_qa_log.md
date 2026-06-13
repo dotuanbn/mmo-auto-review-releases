@@ -1,6 +1,13 @@
 # Project QA Log
 
-Last updated: 2026-05-28
+Last updated: 2026-06-xx
+
+## 2026-06-xx (Traffic Booster planned changes)
+
+- Implemented exactly: (1) src/renderer/src/pages/Traffic.tsx now renders `<CampaignsTab .../>` only when `activeTab==='campaigns' && !showCreateModal` (perf: skip heavy list while create modal open; mirrors prior Campaigns page optimization). (2) src/main/automation/TrafficBoostEngine.ts: in per-visit queue path, `if (task.account) profilePath = this.ensureAccountProfile(task.account) else undefined`; `BrowserConfig` now spreads `...(profilePath ? { profilePath } : {})`; `contextId = await pRetry( () => profilePath ? browserService.createContext(config) : browserService.createEphemeralContext(config) )`. Reused existing ensure (self-heal + DB update) and BrowserService contract. Also conditionalized nearby recycle log for correctness when profile used.
+- Both `npm run typecheck:renderer` and `npm run typecheck:main` exit 0 (clean, no errors). No other files touched. No 'any' added, strict narrowing, existing error paths + pRetry + proxy logic untouched.
+- Per SOP + Antigravity: context/qa read first, short plan (only 2 modules, clear I/O: modal flag + task.account.profilePath), targeted edits, self-review (no layer mixing, no N+1, DI/BrowserService as source-of-truth preserved, recycle/final cleanup already had profilePath guards, <50LOC net delta per file, comments accurate). No unit tests added (request scope; E2E via smoke harnesses).
+- Recorded; typechecks confirmed compiles.
 
 ## 2026-05-12
 
@@ -204,4 +211,23 @@ Last updated: 2026-05-28
 - Direct mode (TrafficBoostEngine): after goto + ensureDirect, explicit verify + 1x safe fallback re-goto(url) + re-verify before proceeding to autonomous/KPI (bounded, no infinite). Search fallbacks also hit same guard.
 - typecheck:main + :renderer = PASS (0 errors). No break to traffic/campaign/login/stealth. Logs concise only on match success. Reuses normalizeName. Fallbacks preserved (name when target lacks ID; existing max scroll/attempts).
 - Per SOP 4-step + Antigravity: plan before code, small targeted edits, self-review (defensive, strict ID, migration safe, <50LOC helpers, no N+1/side effects), short final only.
+- Recorded. Short output only.
+
+## 2026-06-12 (Fix Traffic Booster lag & Google Account profile usage)
+
+- User reported that clicking "Tạo chiến dịch" in Traffic Booster was lagging, and selected Google accounts were not used during execution (running in unlogged profiles instead).
+- Root Cause:
+  1. UI lag: The `CampaignsTab` was kept in the DOM tree while the create campaign modal was open, forcing full re-render on any modal state changes.
+  2. Google login ignore: `TrafficBoostEngine.ts` forced `profilePath = undefined` and launched `browserService.createEphemeralContext(config)` for all visit threads, neglecting the persistent user Chrome profiles containing the real Google sessions.
+- Fixes applied:
+  1. Hided `CampaignsTab` when `showCreateModal === true` in `Traffic.tsx`.
+  2. Modified `TrafficBoostEngine.ts` to retrieve `task.account.profilePath`, self-heal it relative to `app.getPath('userData')`, and call `browserService.createContext` for accounts with valid profiles, reserving `createEphemeralContext` only for guest/anonymous runs.
+- Verification passed: `npm run typecheck:renderer`, `npm run typecheck:main`, `npm run lint`, and `npm run gate:quick` all passed with exit 0.
+- Recorded. Short output only.
+
+## 2026-06-xx (Traffic account login session bugfix for campaigns)
+- Root (self-read per trace): ensureAccountProfile forced unrelated 'traffic_profiles/account_*' (fresh) overriding login's 'profiles/profile_*' (or prior) persisted via createContext+launchPersistent+saveSession+storageState; accounts select carried .cookies but addCookies (BUG1) was silent catch, insufficient alone for Google auth restore, no post-create isGoogleLoggedIn verify -> always anon for selected active accounts.
+- Fix (targeted, reuse first): ensure now prefers+reuses account.profilePath when exists (so persistent profile from login used for traffic -> auto full session); hardened addCookies (BC parse array|{cookies}, filter valid name/value/domain/path, normalize sameSite/secure for .google, safe non-value log); after launch+restore always verify isGoogleLoggedIn for task.account, warn+record 'account_session_verify_failed' (explicit reason, anon fallback kept). 1 file + memory. typecheck:main+renderer=0. No login/other-engine/traffic-mode changes. BC for old cookies rows.
+- Per SOP/Antigravity + user terse constraint: context/qa first, short plan (profile reuse + verify + BC cookies), only TrafficBoostEngine.ts edits (reuse in ensure, robust restore+verify in per-visit), self-review (no sec leak, no N+1, DI/BrowserService preserved, <50LOC net, try/catch never break, anon safe + visible reason).
+- typecheck:main: PASS; typecheck:renderer: PASS.
 - Recorded. Short output only.

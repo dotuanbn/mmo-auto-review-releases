@@ -1070,8 +1070,17 @@ export class TrafficBoostEngine {
     private ensureAccountProfile(account: any): string {
         const db = getDatabase()
         const userDataPath = app.getPath('userData')
-        const profilesDir = join(userDataPath, 'traffic_profiles')
 
+        // Prefer reuse of existing profilePath (set by login/ProfileService/manual) when dir exists.
+        // This ensures campaign uses the SAME persistent profile dir as the logged-in session (launchPersistent loads cookies/state auto).
+        // Only fallback to traffic_profiles/ for legacy accounts without a prior profilePath (then addCookies fallback applies).
+        if (account.profilePath && existsSync(account.profilePath)) {
+            // Optional self-heal only if obviously stale (non-current userData) but exists check already passed above? keep as-is for this machine.
+            console.log(`[TrafficBoost] Reusing account profile for ${account.email}: ${account.profilePath}`)
+            return account.profilePath
+        }
+
+        const profilesDir = join(userDataPath, 'traffic_profiles')
         if (!existsSync(profilesDir)) {
             mkdirSync(profilesDir, { recursive: true })
         }
@@ -1083,7 +1092,7 @@ export class TrafficBoostEngine {
             mkdirSync(profilePath, { recursive: true })
         }
 
-        // Self-heal: If the database contains an old absolute path from another Windows user, update it
+        // Self-heal only for this fallback path (legacy case)
         if (account.profilePath !== profilePath) {
             try {
                 db.update(schema.accounts)
@@ -2625,10 +2634,13 @@ export class TrafficBoostEngine {
                                     // Ignore page monitor teardown errors.
                                 }
 
-                                // CLEAN-SLATE: Skip session save — ephemeral context is in-memory only.
-                                // No cookies, cache, or state is persisted between visits.
-                                // This ensures Google sees a completely new user each time.
-                                console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Clean-slate mode — session not saved (ephemeral context)`)
+                                // For ephemeral (no profilePath): skip save (in-memory only, clean-slate per visit).
+                                // For profilePath: persistent launchPersistentContext already writes live state to disk; we still close here (final stop may snapshot).
+                                if (profilePath) {
+                                    console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Persistent profile — close context (state lives in ${profilePath})`)
+                                } else {
+                                    console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Clean-slate mode — session not saved (ephemeral context)`)
+                                }
 
                                 try {
                                     await browserService.closeContext(contextId)
@@ -2643,10 +2655,13 @@ export class TrafficBoostEngine {
 
                             try {
                                 await this.runWithTimeout(async () => {
-                                    // CLEAN-SLATE: Traffic visits use ephemeral (in-memory) contexts.
-                                    // No persistent profile needed — zero disk I/O, zero SSD wear.
-                                    // Each visit gets a brand-new browser state (cookies, localStorage, cache).
-                                    profilePath = undefined
+                                    // Retrieve and self-heal task.account.profilePath (via ensureAccountProfile which computes, mkdirs, DB-updates if stale).
+                                    // Pass healed path into config; branch to createContext (persistent profile) vs createEphemeralContext (anonymous).
+                                    if (task.account) {
+                                        profilePath = this.ensureAccountProfile(task.account)
+                                    } else {
+                                        profilePath = undefined
+                                    }
 
                                     // Create browser context with account's profile + proxy
                                     // Try FProxy API first, then static proxies
@@ -2731,10 +2746,11 @@ export class TrafficBoostEngine {
                                     }
                                 }
 
-                                // EPHEMERAL CONFIG: No profilePath → 100% in-memory browser context
+                                // Config: pass profilePath (when present) so create* decides persistent vs ephemeral.
                                 const config: BrowserConfig = {
                                     headless: globalSettings.headless ?? false,
                                     proxy: proxyConfig,
+                                    ...(profilePath ? { profilePath } : {}),
                                 }
 
                                 // Update thread detail with proxy info
@@ -2743,11 +2759,15 @@ export class TrafficBoostEngine {
                                     proxyInfo: proxyInfoStr,
                                 }
 
-                                // Use ephemeral context: in-memory, zero disk I/O, fresh fingerprint per visit
+                                // Call createContext (if profilePath healed for account) else createEphemeralContext. Matches BrowserConfig.profilePath contract.
                                 contextId = await pRetry(
                                     async () => {
                                         try {
-                                            return await browserService.createEphemeralContext(config)
+                                            if (profilePath) {
+                                                return await browserService.createContext(config)
+                                            } else {
+                                                return await browserService.createEphemeralContext(config)
+                                            }
                                         } catch (error) {
                                             if (this.isBrowserContextClosedError(error)) {
                                                 this.threadDetails[threadIdx].currentAction = 'Browser disconnected - recreating context'
@@ -2819,16 +2839,27 @@ export class TrafficBoostEngine {
                                         throw new Error('VISIT_ABORTED_BY_WATCHDOG')
                                     }
 
-                                    // BUG1 FIX: if campaign selected an account for this task, restore its Google cookies into the (ephemeral) context.
-                                    // This makes the browser actually logged-in so isLoggedIn flows + login-only actions (save/share etc) work for ALL trafficModes incl map_search.
-                                    // Keeps clean-slate ephemeral (no profilePath) but injects auth session for the chosen account.
+                                    // Restore session for selected account: prefer persistent profilePath (reused in ensure -> launchPersistent auto-loads prior login state).
+                                    // Fallback: use saved cookies blob (from login ctx.cookies) via addCookies for legacy/compat cases.
+                                    // Parse robust + BC (old string may be array or {cookies:[]}), filter valid shape, light normalize for google addCookies compat. Never log values.
                                     if (task.account?.cookies) {
                                         try {
                                             const ctx = browserService.getContext(contextId!)
                                             if (ctx) {
-                                                const ck = JSON.parse(task.account.cookies || '[]')
-                                                if (Array.isArray(ck) && ck.length > 0) {
-                                                    await ctx.addCookies(ck).catch(() => {})
+                                                let ckRaw: any = []
+                                                try { ckRaw = JSON.parse(task.account.cookies || '[]') } catch {}
+                                                let ck: any[] = Array.isArray(ckRaw) ? ckRaw : (ckRaw && Array.isArray(ckRaw.cookies) ? ckRaw.cookies : [])
+                                                // Required by Playwright addCookies + filter garbage/expired; normalize sameSite/secure for cross-domain google
+                                                ck = ck.filter((c: any) => c && typeof c.name === 'string' && typeof c.value === 'string' && typeof c.domain === 'string' && typeof c.path === 'string')
+                                                    .map((c: any) => {
+                                                        let domain = c.domain
+                                                        if (domain && /google\.com$/i.test(domain) && !domain.startsWith('.')) domain = '.' + domain.replace(/^www\./i, '')
+                                                        const sameSite = (c.sameSite === 'None' || c.sameSite === 'Lax' || c.sameSite === 'Strict') ? c.sameSite : 'Lax'
+                                                        const secure = sameSite === 'None' ? true : (c.secure !== false)
+                                                        return { ...c, domain, sameSite, secure }
+                                                    })
+                                                if (ck.length > 0) {
+                                                    await ctx.addCookies(ck).catch((e: any) => { console.log(`[TrafficBoost] addCookies warn (non-fatal, ${ck.length} cookies) for account:`, e?.message?.slice(0, 120)) })
                                                     this.recordAction(actionsPerformed, {
                                                         action: 'account_session_restored',
                                                         success: true,
@@ -2839,6 +2870,24 @@ export class TrafficBoostEngine {
                                                 }
                                             }
                                         } catch { /* non-fatal: fall back to anonymous for this visit */ }
+                                    }
+
+                                    // VERIFY after profile/cookies load: if account was chosen (active) but still not detected logged-in, WARN clearly + record (audit visible to user).
+                                    // Do not block; run visit anon but reason is explicit so user knows to re-login or check profile. Reuses BrowserService.isGoogleLoggedIn (cookie-primary).
+                                    if (task.account) {
+                                        try {
+                                            const logged = await browserService.isGoogleLoggedIn(contextId!).catch(() => false)
+                                            if (!logged) {
+                                                console.warn(`[TrafficBoost] WARNING: Selected account ${task.account.email} (status active/cookies present) but isGoogleLoggedIn=false after context. Running visit ANONYMOUS. Re-login the account or verify profilePath.`)
+                                                this.recordAction(actionsPerformed, {
+                                                    action: 'account_session_verify_failed',
+                                                    success: false,
+                                                    detail: `${task.account.email || task.account.id} (ran anonymous)`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                            }
+                                        } catch { /* never break visit */ }
                                     }
 
                                     stopPageMonitor = this.startThreadPageMonitor(threadIdx, page)
