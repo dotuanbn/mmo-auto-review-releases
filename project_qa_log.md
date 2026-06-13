@@ -2,6 +2,14 @@
 
 Last updated: 2026-06-xx
 
+## 2026-06-xx (Fix keyword concat bug on reopen form for organic/map_search)
+
+- User: saved searchKeywords (JSON array on locations) when reopen create campaign form + select loc (for organic & map_search) showed concatenated w/o sep (e.g. "A B C" instead of "A, B, C").
+- Root (self full read Traffic.tsx + greps on searchKeywords across src): single load site inside CreateCampaignModal locations checkbox onChange did `saved.join('\n')` (which renders as no-sep in <input type=text>); also skipped entirely on parse-to-string or non-JSON raw string values. Save used split(/[\n,]+/) + JSON on loc; campaign create did not carry kw (kw per-loc on loc rows). No involvement from stores/preload/ipc/engine.
+- Fix (display/roundtrip ONLY per req): edited the 1 load block to join array with ', ' and fallback to raw string value if !array (JSON or legacy). Parse/save/create logic, split, toggle, onCreate payloads 100% untouched. Applied to shared organic+map_search path.
+- typecheck (npm run typecheck full): PASS (0). Self-review: targeted display only (SOP step 2/4), no break campaign creation/traffic/login, strict TS, string|null handled, roundtrip "a,b,c"->["a","b","c"]->display "a, b, c"->re-split+trim still yields correct arr, no new files/deps, <30 net LOC, no 'any', no side effects. Per user final-output constraint + Antigravity 4-step + memory policy.
+- Recorded; 1 file edited.
+
 ## 2026-06-xx (Traffic Booster planned changes)
 
 - Implemented exactly: (1) src/renderer/src/pages/Traffic.tsx now renders `<CampaignsTab .../>` only when `activeTab==='campaigns' && !showCreateModal` (perf: skip heavy list while create modal open; mirrors prior Campaigns page optimization). (2) src/main/automation/TrafficBoostEngine.ts: in per-visit queue path, `if (task.account) profilePath = this.ensureAccountProfile(task.account) else undefined`; `BrowserConfig` now spreads `...(profilePath ? { profilePath } : {})`; `contextId = await pRetry( () => profilePath ? browserService.createContext(config) : browserService.createEphemeralContext(config) )`. Reused existing ensure (self-heal + DB update) and BrowserService contract. Also conditionalized nearby recycle log for correctness when profile used.

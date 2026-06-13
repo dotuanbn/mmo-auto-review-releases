@@ -2056,12 +2056,23 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                                 onChange={() => {
                                                     toggleLocation(loc.id)
                                                     if (!selectedLocations.includes(loc.id) && loc.searchKeywords) {
+                                                        let kwStr = ''
+                                                        const raw = loc.searchKeywords
                                                         try {
-                                                            const saved = JSON.parse(loc.searchKeywords)
+                                                            const saved = JSON.parse(raw)
                                                             if (Array.isArray(saved) && saved.length > 0) {
-                                                                setLocationKeywords(prev => ({ ...prev, [loc.id]: saved.join('\n') }))
+                                                                kwStr = saved.join(', ')
+                                                            } else if (typeof saved === 'string' && saved.trim()) {
+                                                                kwStr = saved
                                                             }
-                                                        } catch { /* ignore */ }
+                                                        } catch {
+                                                            if (typeof raw === 'string' && raw.trim()) {
+                                                                kwStr = raw
+                                                            }
+                                                        }
+                                                        if (kwStr) {
+                                                            setLocationKeywords(prev => ({ ...prev, [loc.id]: kwStr }))
+                                                        }
                                                     }
                                                 }}
                                                 className="rounded border-[#e9e4f2] text-[#8d74e8] focus:ring-[#8d74e8]"
