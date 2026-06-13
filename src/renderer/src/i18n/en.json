@@ -570,6 +570,25 @@
     "subtitle": "Configure application behavior and automation",
     "loadingSettings": "Loading settings...",
     "darkMode": "Dark mode",
-    "darkModeDesc": "Switch the app shell and workspace to a low-light interface."
+    "darkModeDesc": "Switch the app shell and workspace to a low-light interface.",
+    "storage": "Storage",
+    "dataDirectory": "Data Directory",
+    "dataDirectoryDesc": "Location for browser profiles, session data and logs",
+    "dataDirectoryPlaceholder": "Default: Application data folder",
+    "browseDirectory": "Browse",
+    "storageUsage": "Storage Usage",
+    "totalSize": "Total Size",
+    "profiles": "Browser Profiles (profiles)",
+    "trafficProfiles": "Traffic Profiles (traffic_profiles)",
+    "database": "Database",
+    "screenshots": "Screenshots",
+    "openFolder": "Open folder",
+    "clearCaches": "Clear browser caches",
+    "clearCachesDone": "Caches cleared",
+    "refresh": "Refresh",
+    "noProfileData": "No profile data yet — login an account to create profiles",
+    "accountsWithCookies": "Accounts with cookies",
+    "items": "items",
+    "size": "Size"
   }
 }

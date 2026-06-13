@@ -275,11 +275,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
             ipcRenderer.invoke('profiles:migrate', payload),
     },
 
-    // Portable data root + migration
+    // Portable data root + migration + storage usage
     data: {
         getRoot: () => ipcRenderer.invoke('data:getRoot'),
         detectLegacy: () => ipcRenderer.invoke('data:detectLegacy'),
         migrateLegacy: (sourcePath?: string) => ipcRenderer.invoke('data:migrateLegacy', sourcePath),
+        getStorageInfo: () => ipcRenderer.invoke('data:getStorageInfo'),
+        openPath: (targetPath: string) => ipcRenderer.invoke('data:openPath', targetPath),
+        clearCaches: () => ipcRenderer.invoke('data:clearCaches'),
     },
 
     // App updates
@@ -657,6 +660,9 @@ declare global {
                 getRoot: () => Promise<any>
                 detectLegacy: () => Promise<any[]>
                 migrateLegacy: (sourcePath?: string) => Promise<any>
+                getStorageInfo: () => Promise<any>
+                openPath: (targetPath: string) => Promise<any>
+                clearCaches: () => Promise<any>
             }
             updates: {
                 getState: () => Promise<any>

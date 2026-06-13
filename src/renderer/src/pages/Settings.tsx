@@ -512,6 +512,7 @@ export function Settings() {
     })
     const [soakStatus, setSoakStatus] = useState<SoakTestStatus | null>(null)
     const [maintenanceBusy, setMaintenanceBusy] = useState(false)
+    const [storageInfo, setStorageInfo] = useState<any>(null)
 
     useEffect(() => {
         loadSettings()
@@ -543,13 +544,14 @@ export function Settings() {
 
     const loadV2Maintenance = async () => {
         try {
-            const [root, legacy, updater, ragStatsResult, mcpHealthResult, soakStatusResult] = await Promise.all([
+            const [root, legacy, updater, ragStatsResult, mcpHealthResult, soakStatusResult, storage] = await Promise.all([
                 window.electronAPI.data.getRoot(),
                 window.electronAPI.data.detectLegacy(),
                 window.electronAPI.updates.getState(),
                 window.electronAPI.rag?.getStats?.() ?? Promise.resolve(null),
                 window.electronAPI.mcp?.getHealth?.() ?? Promise.resolve(null),
                 window.electronAPI.soak?.status?.() ?? Promise.resolve(null),
+                window.electronAPI.data.getStorageInfo?.() ?? Promise.resolve(null),
             ])
             setDataRootInfo(root)
             setLegacyRoots(Array.isArray(legacy) ? legacy : [])
@@ -563,6 +565,7 @@ export function Settings() {
             if (soakStatusResult) {
                 setSoakStatus(soakStatusResult)
             }
+            if (storage) setStorageInfo(storage)
         } catch (error) {
             console.error('Failed to load V2 maintenance data:', error)
         }
@@ -690,6 +693,15 @@ export function Settings() {
     }
 
     const formatPercent = (value: number) => `${Math.max(0, Math.min(100, value * 100)).toFixed(1)}%`
+
+    const formatBytes = (bytes: number): string => {
+        if (!bytes || bytes <= 0) return '0 B'
+        const units = ['B', 'KB', 'MB', 'GB']
+        let i = 0
+        let val = bytes
+        while (val >= 1024 && i < units.length - 1) { val /= 1024; i++ }
+        return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+    }
 
     const getUpdaterStatusLabel = (state: UpdaterState | null): string => {
         if (!state) return 'N/A'
@@ -1787,6 +1799,45 @@ export function Settings() {
                         </PrimaryButton>
                     </div>
                 </FormRow>
+
+                {/* Real disk usage - scanned from userData/profiles + traffic_profiles + DB */}
+                <div className="mt-3 space-y-2 rounded-[16px] border border-[#e9e4f2] bg-white p-3">
+                    <div className="flex items-center justify-between">
+                        <div className="text-sm font-medium text-[#17171f]">{t('settings.storageUsage', 'Storage Usage')}</div>
+                        <div className="flex items-center gap-2">
+                            <PrimaryButton variant="quiet" onClick={loadV2Maintenance} className="text-xs" icon={RefreshCw}>{t('settings.refresh', 'Refresh')}</PrimaryButton>
+                            <PrimaryButton variant="quiet" onClick={() => window.electronAPI.data.openPath?.(storageInfo?.dataRoot || dataRootInfo?.dataRoot)} className="text-xs" icon={FolderOpen}>{t('settings.openFolder', 'Open folder')}</PrimaryButton>
+                            <PrimaryButton tone="rose" variant="quiet" onClick={async () => {
+                                try { setMaintenanceBusy(true); const r = await window.electronAPI.data.clearCaches?.(); showMsg('success', `${t('settings.clearCachesDone', 'Caches cleared')} (${r?.cleared ?? 0})`); await loadV2Maintenance() } catch { showMsg('error', 'Clear failed') } finally { setMaintenanceBusy(false) }
+                            }} disabled={maintenanceBusy} className="text-xs" icon={Trash2}>{t('settings.clearCaches', 'Clear caches')}</PrimaryButton>
+                        </div>
+                    </div>
+
+                    <div className="text-xs text-[#6f697c] break-all">{storageInfo?.dataRoot || dataRootInfo?.dataRoot || 'N/A'}</div>
+                    <div className="text-xs"><span className="text-[#908a9e]">{t('settings.totalSize', 'Total')}:</span> <span className="font-medium text-[#17171f]">{formatBytes(storageInfo?.totalSize || 0)}</span></div>
+
+                    {(!storageInfo || (storageInfo.profileCount || 0) === 0) ? (
+                        <div className="text-xs text-[#6f697c] py-1">{t('settings.noProfileData', 'Chưa có dữ liệu profile — đăng nhập account để tạo')}</div>
+                    ) : (
+                        <div className="space-y-1 text-xs">
+                            {(storageInfo.items || []).map((it: any, idx: number) => (
+                                <div key={idx} className="flex items-center justify-between rounded border border-[#f0edf7] bg-[#faf8ff] px-2 py-1">
+                                    <div>
+                                        <span className="font-medium text-[#17171f]">{it.label || it.key}</span>
+                                        {typeof it.count === 'number' && <span className="ml-1 text-[#908a9e]">({it.count} {t('settings.items', 'items')})</span>}
+                                        {typeof it.cookies === 'number' && it.cookies > 0 && <span className="ml-1 text-emerald-600">({it.cookies} {t('settings.accountsWithCookies', 'cookies')})</span>}
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                        <span className="font-mono text-[#5f5a6d]">{formatBytes(it.size || 0)}</span>
+                                        {it.path && (
+                                            <button onClick={() => window.electronAPI.data.openPath?.(it.path)} className="text-[#8d74e8] hover:underline" title={t('settings.openFolder')}>↗</button>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
             </SectionPanel>
 
             {/* ==================== 9. RUNTIME V2 ==================== */}

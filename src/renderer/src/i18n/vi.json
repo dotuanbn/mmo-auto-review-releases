@@ -565,6 +565,25 @@
     "subtitle": "Configure application behavior and automation",
     "loadingSettings": "Đang tải cài đặt...",
     "darkMode": "Chế độ tối",
-    "darkModeDesc": "Chuyển giao diện ứng dụng sang tông tối dễ nhìn trong môi trường thiếu sáng."
+    "darkModeDesc": "Chuyển giao diện ứng dụng sang tông tối dễ nhìn trong môi trường thiếu sáng.",
+    "storage": "Lưu trữ",
+    "dataDirectory": "Thư mục dữ liệu",
+    "dataDirectoryDesc": "Nơi lưu hồ sơ trình duyệt, dữ liệu phiên và nhật ký",
+    "dataDirectoryPlaceholder": "Mặc định: Thư mục dữ liệu ứng dụng",
+    "browseDirectory": "Chọn thư mục",
+    "storageUsage": "Dung lượng lưu trữ",
+    "totalSize": "Tổng dung lượng",
+    "profiles": "Hồ sơ trình duyệt (profiles)",
+    "trafficProfiles": "Hồ sơ Traffic (traffic_profiles)",
+    "database": "Cơ sở dữ liệu",
+    "screenshots": "Ảnh chụp màn hình",
+    "openFolder": "Mở thư mục",
+    "clearCaches": "Xóa cache trình duyệt",
+    "clearCachesDone": "Đã xóa cache",
+    "refresh": "Làm mới",
+    "noProfileData": "Chưa có dữ liệu profile — đăng nhập account để tạo",
+    "accountsWithCookies": "Account có cookies",
+    "items": "mục",
+    "size": "Dung lượng"
   }
 }
