@@ -318,7 +318,8 @@ export function registerAccountHandlers() {
         }
     })
 
-    // Open browser for manual login - user logs in themselves (now reuses BrowserService for consistent channel/args/stealth/lock-clean; keeps context alive until user closes or login detected)
+    // Open browser for manual login (user completes themselves). Keeps visible context alive; polls strict isGoogleLoggedIn (strong cookies) up to ~10min.
+    // Only sets active + saves cookies + auto-closes when isGoogleLoggedIn(true). Timeout or close without => pending. No URL heuristics.
     ipcMain.handle('accounts:openManualLogin', async (_event, id: number) => {
         try {
             // Check if browser already open for this account
@@ -380,28 +381,13 @@ export function registerAccountHandlers() {
             // Persist profilePath
             await accountService.update(id, { profilePath })
 
-            // Shared reliable detect (cookies primary via BrowserService helper) + save for engine compat
+            // Detect ONLY via strict isGoogleLoggedIn (SAPISID+SID strong cookies). No URL heuristic (myaccount alone or "left signin" is not enough).
+            // If URL myaccount but cookies not yet strong => keep waiting (per spec).
             const tryDetectAndSave = async (isFinalCheck = false): Promise<boolean> => {
                 try {
                     const ctx = browserService.getContext(contextId) || rawContext
                     if (!ctx) return false
-                    let isLogged = await browserService.isGoogleLoggedIn(contextId, ctx as any).catch(() => false)
-                    if (!isLogged) {
-                        // Strong supplement per spec: myaccount URL or left signin page => treat as logged (then save whatever cookies present now)
-                        try {
-                            const pages = (typeof (ctx as any).pages === 'function')
-                                ? (ctx as any).pages().filter((p: any) => !p.isClosed?.())
-                                : []
-                            for (const p of pages) {
-                                const url = (typeof p.url === 'function') ? p.url() : ''
-                                if (url.includes('myaccount.google.com') ||
-                                    (url.includes('google.com') && !/signin|ServiceLogin|accounts\.google\.com\/(signin|Login)/i.test(url))) {
-                                    isLogged = true
-                                    break
-                                }
-                            }
-                        } catch { /* per spec strong url signal */ }
-                    }
+                    const isLogged = await browserService.isGoogleLoggedIn(contextId, ctx as any).catch(() => false)
                     if (isLogged) {
                         await accountService.updateStatus(id, 'active')
                         await accountService.updateLastUsed(id)
@@ -433,8 +419,8 @@ export function registerAccountHandlers() {
                 }
             }
 
-            // Poll WIDE window (~10min max) every ~2.5s using isGoogleLoggedIn (cookie primary) on the live manual context;
-            // stop on detect (then auto-close), user close, or ctx gone. Supplement: strong myaccount URL as signal + still save current cookies.
+            // Poll WIDE window (~10min max) every ~2.5s using strict isGoogleLoggedIn (SAPISID+SID cookies ONLY) on the live manual context;
+            // stop on detect (then auto-close + active), user close, or ctx gone. On timeout/close without strong cookies => pending (no fake active).
             ;(async () => {
                 const deadline = Date.now() + 10 * 60 * 1000
                 try {

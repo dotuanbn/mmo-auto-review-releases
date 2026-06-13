@@ -303,26 +303,13 @@ export class GoogleAuthHandler {
         }
     }
 
-    // Check if successfully logged in (now uses shared reliable helper via context cookies primary)
+    // Check if successfully logged in: ONLY via strict BrowserService.isGoogleLoggedIn (SAPISID+SID strong cookies).
+    // No URL or avatar fallback (prevents false-positive on myaccount during challenges or mid-flow).
     private async isLoggedIn(page: Page): Promise<boolean> {
         try {
             const ctx = page.context()
-            // Direct call (public on BrowserService); cookie-based primary
             if (ctx) {
-                const ok = await browserService.isGoogleLoggedIn(undefined, ctx).catch(() => false)
-                if (ok) return true
-            }
-            // Fallback legacy light check (URL/avatar) to keep behavior for edge
-            const url = page.url()
-            if (url.includes('myaccount.google.com') || (url.includes('google.com') && !/signin|ServiceLogin/i.test(url))) return true
-            const avatarSelectors = [
-                'img[aria-label*="Google Account"]',
-                'a[aria-label*="Google Account"]',
-                'img.gb_D',
-            ]
-            for (const selector of avatarSelectors) {
-                const avatar = await page.$(selector)
-                if (avatar) return true
+                return await browserService.isGoogleLoggedIn(undefined, ctx).catch(() => false)
             }
             return false
         } catch {
@@ -526,7 +513,8 @@ export class GoogleAuthHandler {
     // ============================================================
     // CHALLENGE RESOLVER LOOP (post-password)
     // Max ~10 rounds, 1.5-3s stabilize per round, ~3min total guard.
-    // Reuses: isLoggedIn (cookie via browserService), handleRecoveryEmailChallenge, enter2FACode, clickNextButton, humanType, generateTOTP.
+    // Confirms ONLY via strict isGoogleLoggedIn (SAPISID+SID cookies). Intermediate challenges/recaptcha/recovery never count as logged-in.
+    // Reuses: isLoggedIn (now strict), handleRecoveryEmailChallenge, enter2FACode, clickNextButton, humanType, generateTOTP.
     // Every step try/catch isolated. No secret/password logging.
     // ============================================================
 
@@ -543,14 +531,11 @@ export class GoogleAuthHandler {
         for (let round = 0; round < MAX_ROUNDS; round++) {
             if (Date.now() - start > MAX_MS) break
 
-            // Early logged-in (cookie primary)
+            // Early exit ONLY on strict cookie-based logged-in (SAPISID+SID). Never use URL (myaccount or non-signin) alone.
+            // Intermediate steps (recaptcha/recovery/challenge/kpe/consent) must not false-positive as success.
             try {
                 const ctx = page.context()
                 if (await browserService.isGoogleLoggedIn(undefined, ctx).catch(() => false)) return { success: true }
-                const u = page.url()
-                if (u.includes('myaccount.google.com') || (u.includes('google.com') && !/signin|challenge|ServiceLogin|Login/i.test(u))) {
-                    return { success: true }
-                }
             } catch {}
 
             const res = await this.handleOneChallengeRound(page, twoFactorSecret, recoveryEmail, recoveryPhone).catch(() => ({ done: false }))
@@ -563,7 +548,7 @@ export class GoogleAuthHandler {
             await browserService.randomDelay(1200, 1800)
         }
 
-        // Final cookie check
+        // Final strict cookie check only
         try {
             const ctx = page.context()
             if (await browserService.isGoogleLoggedIn(undefined, ctx).catch(() => false)) return { success: true }

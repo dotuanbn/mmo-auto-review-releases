@@ -240,3 +240,10 @@ Last updated: 2026-06-xx
 - 3: FProxy (actual: app interval + provider-synced dieAt/waiting_time): added pauseAutoRotate (capture rem), resumeAutoRotate (restore dieAt for freeze + restart + refresh-if-expired). Engine calls on p/r. Chose freeze-remaining (app-controlled) as rotation scheduled by app timer per real code; provider refresh as guard.
 - typecheck (full `npm run typecheck`): PASS (0 errors). No login/identity/progress break. Persist via existing campaign row + logs. Self-review: small funcs, safe awaits, strict optional, DB sync on p/r, proxy choice documented.
 - Recorded. Short final per request.
+
+## 2026-06-xx (Tighten login detect: fix false-positive 'active' + premature browser close)
+- Root: isGoogleLoggedIn used ANY-of (SID|HSID|SSID|APISID|NID|...); manual had "left signin/myaccount" heuristic forcing active+save+close without strong cookies; handler/loop had similar URL fallbacks during challenges.
+- Fix (per exact spec): BrowserService - strict hasStrong... : (SAPISID OR __Secure-1PSAPISID) AND (SID OR __Secure-1PSID) on .google.com + non-empty value; isGoogleLoggedIn true ONLY then + "login confirmed (SAPISID+SID present)" log (no values). Removed light URL/avatar supplement. accounts.ts openManualLogin - removed entire URL supplement block in tryDetect (myaccount now only signal, must pair with strict cookie); rely pure on isGoogle; timeout/close without => pending preserved. GoogleAuthHandler - isLoggedIn now cookie-only (no fallback); runChallengeResolverLoop removed URL early/final triggers (only strict cookie confirm; challenges stay pending). Also tightened AgenticLoginHandler URL-only to cookie check (already imported BS). TrafficBoost unchanged (reuses + explicit warn on !logged). 
+- Constraints: poll ~10min + pending safe kept; no traffic/map/pause/dropdown impact; no secret logs; <50LOC deltas; defensive catches.
+- typecheck (full): PASS (0). Self-review: strict AND only, all false-positive paths closed, BrowserService source-of-truth, no side effects.
+- Recorded. Short output only.

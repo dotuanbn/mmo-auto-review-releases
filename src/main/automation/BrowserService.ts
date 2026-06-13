@@ -530,17 +530,26 @@ export class BrowserService {
         }
     }
 
-    // Reliable Google login detection: PRIMARY = cookies (SID/SAPISID/__Secure-*PSID group on google.com)
-    // Fallback light check on existing pages (no disruptive nav for visible manual windows)
-    // Used by manual/auto login + checkLiveDie. Never logs cookie values/secrets.
-    private hasValidGoogleSessionCookies(cookies: any[]): boolean {
+    // Reliable Google login detection (STRICT): true ONLY if BOTH strong auth cookie groups present.
+    // - SAPISID group: 'SAPISID' OR '__Secure-1PSAPISID' (API auth, only after real sign-in)
+    // - SID group: 'SID' OR '__Secure-1PSID' (main session)
+    // Cookies must be on .google.com domain AND have non-empty value.
+    // HSID/SSID/APISID/NID/CONSENT or single group alone are NOT sufficient (appear early/mid-flow).
+    // Used by manual/auto login, challenge loops, TrafficBoost verify, checkLiveDie.
+    // Never logs cookie values. Concise confirm log only.
+    private hasStrongGoogleAuthCookies(cookies: any[]): boolean {
         if (!Array.isArray(cookies) || cookies.length === 0) return false
-        const gCookies = cookies.filter((c: any) => c && typeof c.domain === 'string' && c.domain.includes('google'))
+        const gCookies = cookies.filter((c: any) =>
+            c &&
+            typeof c.domain === 'string' &&
+            (c.domain === '.google.com' || c.domain.endsWith('.google.com') || c.domain.includes('google.com')) &&
+            c.value && String(c.value).trim().length > 0
+        )
         if (gCookies.length === 0) return false
         const names = new Set(gCookies.map((c: any) => c.name))
-        // SID group or Secure PSID variants are sufficient for active Google session
-        return names.has('SID') || names.has('SAPISID') || names.has('__Secure-1PSID') || names.has('__Secure-3PSID') ||
-            names.has('HSID') || names.has('SSID') || names.has('APISID')
+        const hasSapisid = names.has('SAPISID') || names.has('__Secure-1PSAPISID')
+        const hasSid = names.has('SID') || names.has('__Secure-1PSID')
+        return hasSapisid && hasSid
     }
 
     async isGoogleLoggedIn(contextId?: number, context?: BrowserContext): Promise<boolean> {
@@ -552,20 +561,13 @@ export class BrowserService {
             if (!ctx) return false
 
             const ck = await ctx.cookies().catch(() => [])
-            if (this.hasValidGoogleSessionCookies(ck)) return true
-
-            // Light supplement (no goto): existing pages URL + avatar (does not disturb user manual flow)
-            const pages = (typeof (ctx as any).pages === 'function') ? (ctx as any).pages().filter((p: any) => !p.isClosed?.()) : []
-            for (const p of pages) {
-                try {
-                    const url = (typeof p.url === 'function') ? p.url() : ''
-                    if (url.includes('myaccount.google.com') || (url.includes('google.com') && !/signin|ServiceLogin|accounts\.google\.com\/(signin|Login)/i.test(url))) {
-                        return true
-                    }
-                    const hasAvatar = await p.$('img[aria-label*="Google Account"], a[aria-label*="Google Account"]').catch(() => null)
-                    if (hasAvatar) return true
-                } catch { /* per page */ }
+            if (this.hasStrongGoogleAuthCookies(ck)) {
+                console.log('[BrowserService] login confirmed (SAPISID+SID present)')
+                return true
             }
+
+            // No light URL/avatar supplement: isGoogleLoggedIn returns true ONLY on the strict cookie AND above.
+            // (myaccount URL is secondary signal only in callers; still gated by this cookie check.)
             return false
         } catch {
             return false
