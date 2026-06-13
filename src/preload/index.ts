@@ -9,18 +9,26 @@ type AccountAddPayload = {
     recoveryEmail?: string
     recoveryPhone?: string
     loginType?: AccountLoginType
+    twoFactorSecret?: string
 }
 
-type AccountUpdatePayload = Partial<Pick<
-    Account,
-    'email' | 'password' | 'recoveryEmail' | 'recoveryPhone' | 'loginType' | 'status'
->>
+type AccountUpdatePayload = Partial<{
+    email?: string
+    password?: string
+    recoveryEmail?: string | null
+    recoveryPhone?: string | null
+    loginType?: 'auto' | 'manual'
+    status?: string
+    twoFactorSecret?: string | null
+}>
 
 type AccountImportPayload = {
     email: string
     password: string
     recoveryEmail?: string
     recoveryPhone?: string
+    twoFactorSecret?: string
+    loginType?: AccountLoginType
 }
 
 type AccountLiveCheckResult = {
@@ -81,6 +89,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getNew: () => ipcRenderer.invoke('fproxy:getNew'),
         getInfo: () => ipcRenderer.invoke('fproxy:getInfo'),
         test: () => ipcRenderer.invoke('fproxy:test'),
+        testApi: () => ipcRenderer.invoke('fproxy:testApi'), // Settings: test proxy API endpoint + live proxy connect
     },
 
     // Locations
@@ -90,7 +99,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         add: (data: { name: string; url: string; placeId?: string; address?: string; phone?: string; website?: string; category?: string; targetRating?: number; targetReviews?: number }) =>
             ipcRenderer.invoke('locations:add', data),
         addFromUrl: (url: string, targetReviews?: number, phone?: string, website?: string) => ipcRenderer.invoke('locations:addFromUrl', url, targetReviews, phone, website),
-        parseUrl: (url: string) => ipcRenderer.invoke('locations:parseUrl', url),
+        parseUrl: (url: string) => ipcRenderer.invoke('locations:parseUrl', url), // returns {name, placeId?, address?, cid?, featureHex?}
         update: (id: number, data: any) => ipcRenderer.invoke('locations:update', id, data),
         delete: (id: number) => ipcRenderer.invoke('locations:delete', id),
         getStats: () => ipcRenderer.invoke('locations:getStats'),
@@ -208,6 +217,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
             actionsPerVisit?: number
             fixedActionCount?: boolean
             enabledActions?: string[]
+            trafficMode?: 'direct' | 'organic' | 'web_seo' | 'map_search'
+            searchKeywords?: string[]
+            maxMapScroll?: number
         }) => ipcRenderer.invoke('trafficBoost:createCampaign', data),
         updateCampaign: (id: number, data: any) => ipcRenderer.invoke('trafficBoost:updateCampaign', id, data),
         deleteCampaign: (id: number) => ipcRenderer.invoke('trafficBoost:deleteCampaign', id),
@@ -215,6 +227,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         start: (id: number) => ipcRenderer.invoke('trafficBoost:start', id),
         stop: () => ipcRenderer.invoke('trafficBoost:stop'),
         pause: () => ipcRenderer.invoke('trafficBoost:pause'),
+        resume: () => ipcRenderer.invoke('trafficBoost:resume'),
         getStatus: () => ipcRenderer.invoke('trafficBoost:getStatus'),
         getReport: (id: number) => ipcRenderer.invoke('trafficBoost:getReport', id),
         getLogs: (campaignId: number) => ipcRenderer.invoke('trafficBoost:getLogs', campaignId),
@@ -263,11 +276,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
             ipcRenderer.invoke('profiles:migrate', payload),
     },
 
-    // Portable data root + migration
+    // Portable data root + migration + storage usage
     data: {
         getRoot: () => ipcRenderer.invoke('data:getRoot'),
         detectLegacy: () => ipcRenderer.invoke('data:detectLegacy'),
         migrateLegacy: (sourcePath?: string) => ipcRenderer.invoke('data:migrateLegacy', sourcePath),
+        getStorageInfo: () => ipcRenderer.invoke('data:getStorageInfo'),
+        openPath: (targetPath: string) => ipcRenderer.invoke('data:openPath', targetPath),
+        clearCaches: () => ipcRenderer.invoke('data:clearCaches'),
     },
 
     // App updates
@@ -553,7 +569,7 @@ declare global {
                 getPending: () => Promise<any[]>
                 add: (data: any) => Promise<any>
                 addFromUrl: (url: string, targetReviews?: number, phone?: string, website?: string) => Promise<any>
-                parseUrl: (url: string) => Promise<any>
+                parseUrl: (url: string) => Promise<{ name: string; placeId?: string; address?: string; cid?: string; featureHex?: string }>
                 update: (id: number, data: any) => Promise<any>
                 delete: (id: number) => Promise<{ success: boolean; error?: string }>
                 getStats: () => Promise<any>
@@ -645,6 +661,9 @@ declare global {
                 getRoot: () => Promise<any>
                 detectLegacy: () => Promise<any[]>
                 migrateLegacy: (sourcePath?: string) => Promise<any>
+                getStorageInfo: () => Promise<any>
+                openPath: (targetPath: string) => Promise<any>
+                clearCaches: () => Promise<any>
             }
             updates: {
                 getState: () => Promise<any>
@@ -653,6 +672,9 @@ declare global {
                 download: () => Promise<any>
                 install: () => Promise<any>
                 onState: (callback: (state: any) => void) => () => void
+            }
+            fproxy: {
+                testApi: () => Promise<{ success: boolean; message: string; ip?: string; latencyMs?: number; location?: string }>
             }
             reports: {
                 getActionTrace: (payload?: { campaignId?: number; limit?: number }) => Promise<any[]>

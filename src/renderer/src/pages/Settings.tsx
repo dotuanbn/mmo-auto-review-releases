@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import {
     Save,
     FolderOpen,
-    Clock,
     Zap,
     Database,
     RefreshCw,
@@ -21,16 +20,12 @@ import {
     FileText,
     Languages,
     Target,
-    Timer,
     Hash,
     Gauge,
     Key,
     TestTube2,
     Info,
-    BarChart3,
     Cpu,
-    MemoryStick,
-    Power,
     Moon
 } from 'lucide-react'
 import { useTranslation } from '../i18n'
@@ -45,9 +40,6 @@ import {
     Select,
     Badge,
     AlertBanner,
-    ProgressBar,
-    DataTable,
-    Divider,
 } from '../components/ui/surface'
 import { useTheme } from '../contexts/ThemeContext'
 
@@ -102,7 +94,8 @@ interface AppSettings {
     dataDir: string
 
     // App
-    autoUpdate: boolean
+    autoUpdate: boolean,
+    updateMode: 'auto' | 'manual'
 
     // Runtime Policy V2
     captchaMode: 'manual' | 'auto_skip' | 'hybrid'
@@ -136,71 +129,7 @@ interface AppSettings {
     analyticsKeyFilePath: string
 }
 
-interface DataRootInfo {
-    dataRoot: string
-}
 
-interface LegacyDataRoot {
-    path: string
-    exists: boolean
-    fileCount: number
-}
-
-interface UpdaterState {
-    enabled: boolean
-    status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error' | 'disabled'
-    checking: boolean
-    available: boolean
-    downloaded: boolean
-    progress: number
-    pendingInstall: boolean
-    blockedReason?: string
-    currentVersion: string
-    latestVersion?: string
-    error?: string
-    checkedAt?: string
-}
-
-interface RagStats {
-    enabled: boolean
-    totalEntries: number
-    retrievalCount: number
-    retrievalHitCount: number
-    hitRate: number
-    p95LatencyMs: number
-    avgLatencyMs: number
-    lastRetrievalAt?: string
-    updatedAt: string
-}
-
-interface McpAdapterHealth {
-    name: string
-    enabled: boolean
-    healthy: boolean
-    latencyMs?: number
-    detail?: string
-    checkedAt: string
-}
-
-interface McpHealthReport {
-    healthy: boolean
-    adapters: McpAdapterHealth[]
-    checkedAt: string
-}
-
-interface SoakTestStatus {
-    running: boolean
-    sessionId: string | null
-    startedAt: string | null
-    endsAt: string | null
-    durationHours: number
-    intervalSeconds: number
-    sampleCount: number
-    logPath: string | null
-    summaryPath: string | null
-    lastSnapshotAt: string | null
-    stopReason: string | null
-}
 
 const DEFAULTS: AppSettings = {
     headless: false,
@@ -237,6 +166,7 @@ const DEFAULTS: AppSettings = {
     maxRetries: 3,
     dataDir: '',
     autoUpdate: true,
+    updateMode: 'manual', // default manual for safety: only notify on check; user must click to download+install
 
     // Runtime Policy V2
     captchaMode: 'hybrid',
@@ -270,218 +200,6 @@ const DEFAULTS: AppSettings = {
     analyticsKeyFilePath: '',
 }
 
-/** ---- HF Model Status Dashboard (embedded component) ---- */
-function HFStatusDashboard() {
-    const [status, setStatus] = useState<any>(null)
-    const [loading, setLoading] = useState(false)
-    const [testResult, setTestResult] = useState<string | null>(null)
-    const [testLoading, setTestLoading] = useState(false)
-    const [preloadTask, setPreloadTask] = useState<string>('text-generation')
-
-    const fetchStatus = async () => {
-        try {
-            setLoading(true)
-            const s = await window.electronAPI.hfmodel.getStatus()
-            setStatus(s)
-        } catch (err) {
-            console.error('HF status fetch failed:', err)
-        } finally {
-            setLoading(false)
-        }
-    }
-
-    useEffect(() => {
-        fetchStatus()
-        const interval = setInterval(fetchStatus, 10_000) // refresh every 10s
-        return () => clearInterval(interval)
-    }, [])
-
-    const handlePreload = async () => {
-        try {
-            setLoading(true)
-            await window.electronAPI.hfmodel.preload(preloadTask)
-            await fetchStatus()
-        } catch (err: any) {
-            console.error('Preload failed:', err)
-        } finally {
-            setLoading(false)
-        }
-    }
-
-    const handleUnload = async (task: string) => {
-        try {
-            setLoading(true)
-            await window.electronAPI.hfmodel.unload(task)
-            await fetchStatus()
-        } catch (err: any) {
-            console.error('Unload failed:', err)
-        } finally {
-            setLoading(false)
-        }
-    }
-
-    const handleTest = async () => {
-        try {
-            setTestLoading(true)
-            setTestResult(null)
-            const result = await window.electronAPI.hfmodel.testGenerate(
-                'Write a short positive review about a coffee shop.'
-            )
-            setTestResult(result?.result || result?.error || JSON.stringify(result))
-        } catch (err: any) {
-            setTestResult(`Error: ${err.message}`)
-        } finally {
-            setTestLoading(false)
-        }
-    }
-
-    const handleDispose = async () => {
-        try {
-            setLoading(true)
-            await window.electronAPI.hfmodel.dispose()
-            setStatus(null)
-            await fetchStatus()
-        } catch (err: any) {
-            console.error('Dispose failed:', err)
-        } finally {
-            setLoading(false)
-        }
-    }
-
-    const workerRunning = status?.workerAlive === true
-    const loadedModels: Array<{ task: string; model: string; memoryMB: number }> = status?.loadedModels || []
-
-    return (
-        <div className="mt-3 space-y-3">
-            {/* Status Header */}
-            <div className="flex items-center justify-between rounded-[18px] border border-[#e9e4f2] bg-[#f4f1fa] p-3">
-                <div className="flex items-center gap-3">
-                    <div className={`h-2.5 w-2.5 rounded-full ${workerRunning ? 'bg-emerald-500 animate-pulse' : 'bg-[#908a9e]'}`} />
-                    <div>
-                        <span className="text-sm font-medium text-[#17171f]">Worker Status</span>
-                        <Badge tone={workerRunning ? 'emerald' : 'slate'} className="ml-2">
-                            {workerRunning ? 'RUNNING' : 'IDLE'}
-                        </Badge>
-                    </div>
-                </div>
-                <div className="flex items-center gap-2">
-                    <PrimaryButton
-                        variant="quiet"
-                        onClick={fetchStatus}
-                        disabled={loading}
-                        icon={RefreshCw}
-                        className={`h-8 w-8 !p-0 ${loading ? '[&_svg]:animate-spin' : ''}`}
-                    >
-                        {''}
-                    </PrimaryButton>
-                    {workerRunning && (
-                        <PrimaryButton
-                            tone="rose"
-                            onClick={handleDispose}
-                            disabled={loading}
-                            className="!px-2.5 !py-1 text-xs"
-                        >
-                            Dispose All
-                        </PrimaryButton>
-                    )}
-                </div>
-            </div>
-
-            {/* Loaded Models as DataTable */}
-            {loadedModels.length > 0 && (
-                <DataTable
-                    columns={[
-                        {
-                            key: 'task',
-                            header: 'Task',
-                            render: (row) => (
-                                <div className="flex items-center gap-2">
-                                    <Cpu className="h-3.5 w-3.5 text-[#8d74e8]" />
-                                    <span className="text-xs font-medium text-[#8d74e8]">{row.task}</span>
-                                </div>
-                            ),
-                        },
-                        {
-                            key: 'model',
-                            header: 'Model',
-                            render: (row) => (
-                                <span className="max-w-[200px] truncate font-mono text-xs text-[#17171f]">{row.model}</span>
-                            ),
-                        },
-                        {
-                            key: 'memory',
-                            header: 'Memory',
-                            render: (row) => (
-                                <span className="text-xs text-[#5f5a6d]">{row.memoryMB > 0 ? `${row.memoryMB}MB` : '-'}</span>
-                            ),
-                            align: 'right' as const,
-                        },
-                        {
-                            key: 'actions',
-                            header: '',
-                            render: (row) => (
-                                <button
-                                    onClick={() => handleUnload(row.task)}
-                                    className="text-xs font-semibold text-rose-600 hover:text-rose-500 transition-colors"
-                                >
-                                    Unload
-                                </button>
-                            ),
-                            align: 'right' as const,
-                        },
-                    ]}
-                    data={loadedModels.map((m, i) => ({ ...m, id: i }))}
-                />
-            )}
-
-            {/* Memory Info */}
-            {status?.totalMemoryMB > 0 && (
-                <div className="flex gap-3 text-xs text-[#5f5a6d]">
-                    <span>Worker Memory: {status.totalMemoryMB}MB</span>
-                    <span>System: {status.systemProfile || 'N/A'}</span>
-                </div>
-            )}
-
-            {/* Actions Row */}
-            <div className="flex flex-wrap items-center gap-2">
-                <Select
-                    value={preloadTask}
-                    onChange={(v) => setPreloadTask(v)}
-                    options={[
-                        { value: 'text-generation', label: 'Text Generation' },
-                        { value: 'zero-shot-classification', label: 'Classification' },
-                        { value: 'zero-shot-image-classification', label: 'Image Classification' },
-                    ]}
-                    className="w-44"
-                />
-                <PrimaryButton
-                    tone="cyan"
-                    onClick={handlePreload}
-                    disabled={loading}
-                    className="text-xs"
-                >
-                    {loading ? 'Loading...' : 'Preload'}
-                </PrimaryButton>
-                <PrimaryButton
-                    tone="emerald"
-                    onClick={handleTest}
-                    disabled={testLoading}
-                    className="text-xs"
-                >
-                    {testLoading ? 'Generating...' : 'Test Generate'}
-                </PrimaryButton>
-            </div>
-
-            {/* Test Result */}
-            {testResult && (
-                <AlertBanner type="success" title="Test Output:">
-                    <p className="font-mono text-xs whitespace-pre-wrap leading-relaxed">{testResult}</p>
-                </AlertBanner>
-            )}
-        </div>
-    )
-}
-
 export function Settings() {
     const { t, language, setLanguage } = useTranslation()
     const { isDark, toggleTheme } = useTheme()
@@ -495,33 +213,47 @@ export function Settings() {
     const [ollamaTesting, setOllamaTesting] = useState(false)
     const [ollamaStatus, setOllamaStatus] = useState<'idle' | 'valid' | 'invalid'>('idle')
     const [ollamaModels, setOllamaModels] = useState<string[]>([])
+    // Update state (live from main via onState)
+    const [updateState, setUpdateState] = useState<any>(null)
+    const [checkingUpdate, setCheckingUpdate] = useState(false)
+    // Proxy API test (Settings specific: test endpoint + live connect)
+    const [proxyApiTesting, setProxyApiTesting] = useState(false)
+    const [proxyApiStatus, setProxyApiStatus] = useState<'idle' | 'success' | 'error'>('idle')
+    const [proxyApiResult, setProxyApiResult] = useState<string>('')
     const [showResetConfirm, setShowResetConfirm] = useState(false)
     const [hasChanges, setHasChanges] = useState(false)
     const [originalSettings, setOriginalSettings] = useState<AppSettings>({ ...DEFAULTS })
-    const [fproxyTesting, setFproxyTesting] = useState(false)
-    const [fproxyResult, setFproxyResult] = useState<{ success: boolean; text: string } | null>(null)
-    const [dataRootInfo, setDataRootInfo] = useState<DataRootInfo | null>(null)
-    const [legacyRoots, setLegacyRoots] = useState<LegacyDataRoot[]>([])
-    const [updaterState, setUpdaterState] = useState<UpdaterState | null>(null)
-    const [ragStats, setRagStats] = useState<RagStats | null>(null)
-    const [mcpHealth, setMcpHealth] = useState<McpHealthReport | null>(null)
-    const [ragClearScope, setRagClearScope] = useState({
-        campaignId: '',
-        domain: '',
-        riskType: '',
-    })
-    const [soakStatus, setSoakStatus] = useState<SoakTestStatus | null>(null)
     const [maintenanceBusy, setMaintenanceBusy] = useState(false)
+    const [storageInfo, setStorageInfo] = useState<any>(null)
+    const [appVersion, setAppVersion] = useState<string>('1.0.6')
 
     useEffect(() => {
         loadSettings()
     }, [])
 
     useEffect(() => {
-        const unsubscribe = window.electronAPI.updates.onState((state: UpdaterState) => {
-            setUpdaterState(state)
-        })
-        return unsubscribe
+        // Load app version for About section (best effort)
+        if (window.electronAPI?.getVersion) {
+            window.electronAPI.getVersion().then((v: string) => { if (v) setAppVersion(v) }).catch(() => {})
+        }
+    }, [])
+
+    // Live update state + initial fetch (for About / Giới thiệu section)
+    useEffect(() => {
+        let unsub: (() => void) | null = null
+        const loadInitial = async () => {
+            try {
+                if (window.electronAPI?.updates?.getState) {
+                    const st = await window.electronAPI.updates.getState()
+                    if (st) setUpdateState(st)
+                }
+            } catch {}
+        }
+        loadInitial()
+        if (window.electronAPI?.updates?.onState) {
+            unsub = window.electronAPI.updates.onState((st: any) => setUpdateState(st))
+        }
+        return () => { if (unsub) unsub() }
     }, [])
 
     const loadSettings = async () => {
@@ -533,7 +265,7 @@ export function Settings() {
                 setSettings(merged)
                 setOriginalSettings(merged)
             }
-            await loadV2Maintenance()
+            await loadStorageInfo()
         } catch (error) {
             console.error('Failed to load settings:', error)
         } finally {
@@ -541,30 +273,12 @@ export function Settings() {
         }
     }
 
-    const loadV2Maintenance = async () => {
+    const loadStorageInfo = async () => {
         try {
-            const [root, legacy, updater, ragStatsResult, mcpHealthResult, soakStatusResult] = await Promise.all([
-                window.electronAPI.data.getRoot(),
-                window.electronAPI.data.detectLegacy(),
-                window.electronAPI.updates.getState(),
-                window.electronAPI.rag?.getStats?.() ?? Promise.resolve(null),
-                window.electronAPI.mcp?.getHealth?.() ?? Promise.resolve(null),
-                window.electronAPI.soak?.status?.() ?? Promise.resolve(null),
-            ])
-            setDataRootInfo(root)
-            setLegacyRoots(Array.isArray(legacy) ? legacy : [])
-            setUpdaterState(updater)
-            if (ragStatsResult) {
-                setRagStats(ragStatsResult)
-            }
-            if (mcpHealthResult) {
-                setMcpHealth(mcpHealthResult)
-            }
-            if (soakStatusResult) {
-                setSoakStatus(soakStatusResult)
-            }
+            const storage = await window.electronAPI.data.getStorageInfo?.().catch(() => null)
+            if (storage) setStorageInfo(storage)
         } catch (error) {
-            console.error('Failed to load V2 maintenance data:', error)
+            console.error('Failed to load storage info:', error)
         }
     }
 
@@ -625,6 +339,59 @@ export function Settings() {
         }
     }
 
+    // Update controls (wired to existing updates:* IPCs + live state)
+    const handleCheckUpdate = async () => {
+        setCheckingUpdate(true)
+        try {
+            const st = await window.electronAPI.updates?.check?.()
+            if (st) setUpdateState(st)
+        } catch (e: any) {
+            setUpdateState((prev: any) => ({ ...(prev || {}), error: e?.message || 'Check failed' }))
+        } finally {
+            setCheckingUpdate(false)
+        }
+    }
+    const handleUpdateNow = async () => {
+        try {
+            let st = updateState
+            if (!st?.downloaded) {
+                st = await window.electronAPI.updates?.download?.()
+                if (st) setUpdateState(st)
+            }
+            if (st?.downloaded || (await window.electronAPI.updates?.getState?.())?.downloaded) {
+                await window.electronAPI.updates?.install?.()
+            }
+        } catch (e: any) {
+            setUpdateState((prev: any) => ({ ...(prev || {}), error: e?.message || 'Update action failed' }))
+        }
+    }
+
+    // Proxy API test (calls fproxy:testApi via main; no full key ever logged/returned to UI)
+    const handleTestProxyApi = async () => {
+        const key = (settings as any).fproxyApiKey
+        if (!key || !key.trim()) return
+        setProxyApiTesting(true)
+        setProxyApiStatus('idle')
+        setProxyApiResult('')
+        try {
+            const res = await window.electronAPI.fproxy?.testApi?.()
+            if (res?.success) {
+                setProxyApiStatus('success')
+                const ipPart = res.ip ? `IP: ${res.ip}` : ''
+                const lat = typeof res.latencyMs === 'number' ? ` • ${res.latencyMs}ms` : ''
+                setProxyApiResult(`${t('settings.testSuccess')} ${ipPart}${lat}${res.location ? ` (${res.location})` : ''}`.trim())
+            } else {
+                setProxyApiStatus('error')
+                setProxyApiResult(res?.message ? t('settings.testFailed') + ': ' + res.message : t('settings.testFailed'))
+            }
+        } catch (e: any) {
+            setProxyApiStatus('error')
+            setProxyApiResult((e?.message || 'Lỗi kết nối').slice(0, 120))
+        } finally {
+            setProxyApiTesting(false)
+        }
+    }
+
     const handleTestApiKey = async () => {
         if (!settings.groqApiKey.trim()) return
         try {
@@ -646,7 +413,7 @@ export function Settings() {
             }
         } catch (e: any) {
             setApiStatus('invalid')
-            setApiError(e.message || 'Loi mang hoac khong the ket noi toi Google')
+            setApiError(e.message || t('settings.testFailed'))
         } finally {
             setApiTesting(false)
         }
@@ -689,149 +456,16 @@ export function Settings() {
         setTimeout(() => setMessage(null), 3000)
     }
 
-    const formatPercent = (value: number) => `${Math.max(0, Math.min(100, value * 100)).toFixed(1)}%`
-
-    const getUpdaterStatusLabel = (state: UpdaterState | null): string => {
-        if (!state) return 'N/A'
-        const labels: Record<UpdaterState['status'], string> = {
-            idle: 'Idle',
-            checking: 'Dang kiem tra',
-            available: 'Co ban cap nhat moi',
-            downloading: 'Dang tai cap nhat',
-            downloaded: 'Da tai xong',
-            error: 'Loi cap nhat',
-            disabled: 'Khong ho tro auto update',
-        }
-        return labels[state.status]
+    const formatBytes = (bytes: number): string => {
+        if (!bytes || bytes <= 0) return '0 B'
+        const units = ['B', 'KB', 'MB', 'GB']
+        let i = 0
+        let val = bytes
+        while (val >= 1024 && i < units.length - 1) { val /= 1024; i++ }
+        return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
     }
 
-    const handleMigrateLegacy = async () => {
-        try {
-            setMaintenanceBusy(true)
-            const preferred = legacyRoots.find(item => item.exists && item.fileCount > 0)
-            const result = await window.electronAPI.data.migrateLegacy(preferred?.path)
-            if (result?.success) {
-                showMsg('success', 'Da migrate du lieu cu thanh cong')
-            } else {
-                showMsg('error', result?.message || 'Khong tim thay du lieu cu de migrate')
-            }
-            await loadV2Maintenance()
-        } catch (error) {
-            console.error('Failed to migrate legacy data:', error)
-            showMsg('error', 'Migrate du lieu cu that bai')
-        } finally {
-            setMaintenanceBusy(false)
-        }
-    }
 
-    const handleClearRag = async () => {
-        try {
-            if (!window.electronAPI.rag?.clear) {
-                showMsg('error', 'RAG API unavailable')
-                return
-            }
-            setMaintenanceBusy(true)
-            const campaignRaw = ragClearScope.campaignId.trim()
-            let campaignId: number | undefined
-            if (campaignRaw) {
-                const parsed = Number.parseInt(campaignRaw, 10)
-                if (!Number.isFinite(parsed) || parsed <= 0) {
-                    showMsg('error', 'Campaign ID is invalid')
-                    return
-                }
-                campaignId = parsed
-            }
-            const domain = ragClearScope.domain.trim()
-            const riskType = ragClearScope.riskType.trim()
-            const scope: { campaignId?: number; domain?: string; riskType?: string } = {}
-            if (campaignId) {
-                scope.campaignId = campaignId
-            }
-            if (domain) {
-                scope.domain = domain
-            }
-            if (riskType) {
-                scope.riskType = riskType
-            }
-            const result = await window.electronAPI.rag.clear(Object.keys(scope).length ? scope : undefined)
-            showMsg('success', `Da xoa ${result?.deleted ?? 0} knowledge item(s)`)
-            await loadV2Maintenance()
-        } catch (error) {
-            console.error('Failed to clear RAG knowledge:', error)
-            showMsg('error', 'Xoa RAG knowledge that bai')
-        } finally {
-            setMaintenanceBusy(false)
-        }
-    }
-
-    const handleCheckAndDownloadUpdate = async () => {
-        try {
-            setMaintenanceBusy(true)
-            const state = await window.electronAPI.updates.checkAndDownload()
-            setUpdaterState(state)
-        } catch (error) {
-            console.error('Failed to check/download update:', error)
-            showMsg('error', 'Kiem tra hoac tai cap nhat that bai')
-        } finally {
-            setMaintenanceBusy(false)
-        }
-    }
-
-    const handleStartSoak8h = async () => {
-        try {
-            if (!window.electronAPI.soak?.start) {
-                showMsg('error', 'Soak API unavailable')
-                return
-            }
-            setMaintenanceBusy(true)
-            const status = await window.electronAPI.soak.start({
-                durationHours: 8,
-                intervalSeconds: 30,
-                tag: 'settings',
-            })
-            setSoakStatus(status)
-            showMsg('success', 'Da bat dau soak test 8h')
-        } catch (error) {
-            console.error('Failed to start soak test:', error)
-            showMsg('error', 'Bat dau soak test that bai')
-        } finally {
-            setMaintenanceBusy(false)
-        }
-    }
-
-    const handleStopSoak = async () => {
-        try {
-            if (!window.electronAPI.soak?.stop) {
-                showMsg('error', 'Soak API unavailable')
-                return
-            }
-            setMaintenanceBusy(true)
-            const status = await window.electronAPI.soak.stop('settings_stop')
-            setSoakStatus(status)
-            showMsg('success', 'Da dung soak test')
-        } catch (error) {
-            console.error('Failed to stop soak test:', error)
-            showMsg('error', 'Dung soak test that bai')
-        } finally {
-            setMaintenanceBusy(false)
-        }
-    }
-
-    const handleInstallUpdate = async () => {
-        try {
-            setMaintenanceBusy(true)
-            const state = await window.electronAPI.updates.install()
-            setUpdaterState(state)
-            if (state?.pendingInstall && state?.blockedReason) {
-                showMsg('error', state.blockedReason)
-            }
-        } catch (error) {
-            console.error('Failed to install update:', error)
-            showMsg('error', 'Cai dat cap nhat that bai')
-        } finally {
-            setMaintenanceBusy(false)
-        }
-    }
 
     // ---- Reusable helper components ----
     const NumberInput = ({ value, onChange, min, max, step = 1, suffix }: {
@@ -906,7 +540,7 @@ export function Settings() {
                 </AlertBanner>
             )}
 
-            {/* ==================== 0. APPEARANCE / LANGUAGE ==================== */}
+            {/* 1. CHUNG / APPEARANCE */}
             <SectionPanel icon={Languages} title={t('settings.appearance')} tone="violet">
                 <FormRow
                     icon={<Languages className="h-4 w-4 text-[#8d74e8]" />}
@@ -916,21 +550,15 @@ export function Settings() {
                     <div className="flex items-center gap-1.5">
                         <button
                             onClick={() => setLanguage('en')}
-                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'en'
-                                ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
-                                : 'border border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]'
-                                }`}
+                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'en' ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]' : 'border border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]'}`}
                             title="English"
                         >
                             EN
                         </button>
                         <button
                             onClick={() => setLanguage('vi')}
-                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'vi'
-                                ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
-                                : 'border border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]'
-                                }`}
-                            title="Tieng Viet"
+                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'vi' ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]' : 'border border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]'}`}
+                            title="Tiếng Việt"
                         >
                             VI
                         </button>
@@ -938,1152 +566,346 @@ export function Settings() {
                 </FormRow>
                 <FormRow
                     icon={<Moon className="h-4 w-4 text-[#8d74e8]" />}
-                    label={t('settings.darkMode', 'Dark mode')}
-                    description={t('settings.darkModeDesc', 'Switch the app shell and workspace to a low-light interface.')}
+                    label={t('settings.darkMode')}
+                    description={t('settings.darkModeDesc')}
                 >
                     <DSToggle checked={isDark} onChange={toggleTheme} />
                 </FormRow>
             </SectionPanel>
 
-            {/* ==================== 1. BROWSER ==================== */}
-            <SectionPanel icon={Globe} title={t('settings.browser')} tone="blue">
-                <FormRow
-                    icon={<Eye className="h-4 w-4 text-blue-500" />}
-                    label={t('settings.headlessMode')}
-                    description={t('settings.headlessModeDesc')}
-                >
+            {/* 2. TỰ ĐỘNG HÓA / AUTOMATION (real engine settings only) */}
+            <SectionPanel icon={Zap} title={t('settings.automation')} tone="blue">
+                {/* Browser */}
+                <div className="mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.browser')}</div>
+                <FormRow icon={<Eye className="h-4 w-4 text-blue-500" />} label={t('settings.headlessMode')} description={t('settings.headlessModeDesc')}>
                     <DSToggle checked={settings.headless} onChange={() => update('headless', !settings.headless)} />
                 </FormRow>
-
-                <FormRow
-                    icon={<Shield className="h-4 w-4 text-emerald-500" />}
-                    label={t('settings.hideAutomation')}
-                    description={t('settings.hideAutomationDesc')}
-                >
+                <FormRow icon={<Shield className="h-4 w-4 text-emerald-500" />} label={t('settings.hideAutomation')} description={t('settings.hideAutomationDesc')}>
                     <DSToggle checked={settings.hideAutomation} onChange={() => update('hideAutomation', !settings.hideAutomation)} />
                 </FormRow>
-
-                <FormRow
-                    icon={<Database className="h-4 w-4 text-[#8d74e8]" />}
-                    label={t('settings.saveProfiles')}
-                    description={t('settings.saveProfilesDesc')}
-                >
+                <FormRow icon={<Database className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.saveProfiles')} description={t('settings.saveProfilesDesc')}>
                     <DSToggle checked={settings.saveProfiles} onChange={() => update('saveProfiles', !settings.saveProfiles)} />
                 </FormRow>
-
-                <FormRow
-                    icon={<Monitor className="h-4 w-4 text-cyan-500" />}
-                    label={t('settings.maxConcurrentBrowsers')}
-                    description={t('settings.maxConcurrentBrowsersDesc')}
-                >
+                <FormRow icon={<Monitor className="h-4 w-4 text-cyan-500" />} label={t('settings.maxConcurrentBrowsers')} description={t('settings.maxConcurrentBrowsersDesc')}>
                     <NumberInput value={settings.maxConcurrentBrowsers} onChange={(v) => update('maxConcurrentBrowsers', v)} min={1} max={10} />
                 </FormRow>
-
-                <FormRow
-                    icon={<Shuffle className="h-4 w-4 text-amber-500" />}
-                    label={t('settings.randomizeUserAgent')}
-                    description={t('settings.randomizeUserAgentDesc')}
-                >
+                <FormRow icon={<Shuffle className="h-4 w-4 text-amber-500" />} label={t('settings.randomizeUserAgent')} description={t('settings.randomizeUserAgentDesc')}>
                     <DSToggle checked={settings.randomizeUserAgent} onChange={() => update('randomizeUserAgent', !settings.randomizeUserAgent)} />
                 </FormRow>
 
-                <FormRow
-                    icon={<Monitor className="h-4 w-4 text-[#8d74e8]" />}
-                    label={t('settings.defaultReviewLanguage')}
-                    description={t('settings.defaultReviewLanguageDesc')}
-                >
+                {/* Concurrency / CAPTCHA / Log */}
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.concurrency')}</div>
+                <FormRow icon={<Cpu className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.queueConcurrency')} description={t('settings.maxConcurrentBrowsersDesc')}>
+                    <NumberInput value={settings.queueConcurrency} onChange={(v) => update('queueConcurrency', v)} min={1} max={12} />
+                </FormRow>
+                <FormRow label={t('settings.queueInterval')} description="">
+                    <NumberInput value={settings.queueIntervalMs} onChange={(v) => update('queueIntervalMs', v)} min={500} max={30000} step={100} suffix="ms" />
+                </FormRow>
+                <FormRow label={t('settings.captchaMode')} description="">
                     <Select
-                        value={settings.defaultReviewLanguage}
-                        onChange={(v) => update('defaultReviewLanguage', v as 'vi' | 'en')}
+                        value={settings.captchaMode}
+                        onChange={(v) => update('captchaMode', v as AppSettings['captchaMode'])}
                         options={[
-                            { value: 'vi' as const, label: 'Tieng Viet' },
-                            { value: 'en' as const, label: 'English' },
+                            { value: 'hybrid', label: t('settings.captchaModeHybrid') },
+                            { value: 'manual', label: t('settings.captchaModeManual') },
+                            { value: 'auto_skip', label: t('settings.captchaModeAutoSkip') },
                         ]}
-                        className="w-36"
+                        className="w-52"
                     />
                 </FormRow>
-
-                <FormRow
-                    icon={<FileText className="h-4 w-4 text-rose-500" />}
-                    label={t('settings.defaultReviewStyle')}
-                    description={t('settings.defaultReviewStyleDesc')}
-                >
+                <FormRow label={t('settings.logLevel')} description="">
                     <Select
-                        value={settings.defaultReviewStyle}
-                        onChange={(v) => update('defaultReviewStyle', v as any)}
+                        value={settings.logLevel}
+                        onChange={(v) => update('logLevel', v as AppSettings['logLevel'])}
                         options={[
-                            { value: 'casual' as const, label: t('settings.styleCasual') },
-                            { value: 'professional' as const, label: t('settings.styleProfessional') },
-                            { value: 'enthusiastic' as const, label: t('settings.styleEnthusiastic') },
+                            { value: 'info', label: 'Info' },
+                            { value: 'debug', label: 'Debug' },
+                            { value: 'warn', label: 'Warn' },
+                            { value: 'error', label: 'Error' },
                         ]}
-                        className="w-36"
+                        className="w-32"
                     />
                 </FormRow>
 
-                <FormRow
-                    icon={<Gauge className="h-4 w-4 text-amber-500" />}
-                    label={t('settings.defaultReviewLength')}
-                    description={t('settings.defaultReviewLengthDesc')}
-                >
-                    <Select
-                        value={settings.defaultReviewLength}
-                        onChange={(v) => update('defaultReviewLength', v as any)}
-                        options={[
-                            { value: 'short' as const, label: t('settings.lengthShort') },
-                            { value: 'medium' as const, label: t('settings.lengthMedium') },
-                            { value: 'long' as const, label: t('settings.lengthLong') },
-                        ]}
-                        className="w-36"
-                    />
-                </FormRow>
-            </SectionPanel>
-
-            {/* ==================== 2. AI & FALLBACK ==================== */}
-            <SectionPanel icon={Bot} title={t('settings.aiSettings', 'AI & Fallback')} tone="violet">
-                {/* Groq Fallback */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-[#f9f7fe] p-3.5">
-                    <div className="flex items-center gap-2">
-                        <Key className="h-4 w-4 text-[#735bd6]" />
-                        <span className="text-sm font-medium text-[#17171f]">Ma API Groq (Auto Fallback)</span>
-                    </div>
-                    <div className="flex gap-2">
-                        <input
-                            type="password"
-                            value={settings.groqApiKey}
-                            onChange={(e) => update('groqApiKey', e.target.value)}
-                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-2 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/20"
-                            placeholder="Nhap API key tu Groq..."
-                            title="Groq API Key"
-                        />
-                        <PrimaryButton
-                            icon={apiTesting ? RefreshCw : TestTube2}
-                            onClick={handleTestApiKey}
-                            disabled={!settings.groqApiKey || apiTesting}
-                            className={apiTesting ? '[&_svg]:animate-spin' : ''}
-                        >
-                            Test
-                        </PrimaryButton>
-                    </div>
-                    {apiStatus !== 'idle' && (
-                        <AlertBanner type={apiStatus === 'valid' ? 'success' : 'error'}>
-                            {apiStatus === 'valid' ? 'Ket noi Groq API thanh cong!' : 'API Key khong hop le hoac loi mang.'}
-                            {apiStatus === 'invalid' && apiError && (
-                                <div className="mt-1 text-[11px] opacity-80 break-words">{apiError}</div>
-                            )}
-                        </AlertBanner>
-                    )}
-                    <div className="mt-2">
-                        <label className="mb-1.5 block text-xs text-[#6f697c]">Model</label>
-                        <Select
-                            value={settings.groqModel}
-                            onChange={(v) => update('groqModel', v)}
-                            options={[
-                                { value: 'gemma2-9b-it' as const, label: 'Llama 3.1 8B Instruct (Free)' },
-                                { value: 'llama-3.1-8b-instant' as const, label: 'Gemma 2 9B IT (Free)' },
-                                { value: 'mixtral-8x7b-32768' as const, label: 'Mistral 7B Instruct (Free)' },
-                                { value: 'cognitivecomputations/dolphin-mixtral-8x7b' as const, label: 'Dolphin Mixtral 8x7B (Free)' },
-                                { value: 'deepseek-r1-distill-llama-70b' as const, label: 'Qwen 2.5 72B Instruct (Free)' },
-                                { value: 'deepseek/deepseek-chat:free' as const, label: 'DeepSeek Chat (Free)' },
-                                { value: 'anthropic/claude-3-haiku' as const, label: 'Claude 3 Haiku (Paid)' },
-                                { value: 'openai/chatgpt-4o-latest' as const, label: 'GPT-4o (Paid)' },
-                            ]}
-                        />
-                    </div>
-                    <a
-                        href="#"
-                        onClick={(e) => {
-                            e.preventDefault();
-                            window.electronAPI.openExternal('https://console.groq.com/keys');
-                        }}
-                        className="mt-2 block text-xs text-[#735bd6] underline hover:text-[#8d74e8]"
-                    >
-                        Nhan vao day de nhan ma API Groq mien phi (Khuyen dung)
-                    </a>
-                </div>
-
-                {/* Local Ollama */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="flex items-center gap-2">
-                        <Database className="h-4 w-4 text-[#6f697c]" />
-                        <span className="text-sm font-medium text-[#17171f]">Local AI (Ollama)</span>
-                    </div>
-                    <div className="flex gap-2">
-                        <input
-                            type="text"
-                            value={settings.ollamaUrl}
-                            onChange={(e) => update('ollamaUrl', e.target.value)}
-                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-2 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/20"
-                            placeholder="http://localhost:11434"
-                        />
-                        <PrimaryButton
-                            variant="quiet"
-                            icon={ollamaTesting ? RefreshCw : TestTube2}
-                            onClick={handleTestOllama}
-                            disabled={!settings.ollamaUrl || ollamaTesting}
-                            className={ollamaTesting ? '[&_svg]:animate-spin' : ''}
-                        >
-                            {''}
-                        </PrimaryButton>
-                    </div>
-                    {ollamaStatus !== 'idle' && (
-                        <AlertBanner type={ollamaStatus === 'valid' ? 'success' : 'error'}>
-                            {ollamaStatus === 'valid' ? 'Ket noi Ollama thanh cong!' : 'Loi ket noi Ollama.'}
-                        </AlertBanner>
-                    )}
-                    {ollamaModels.length > 0 && (
-                        <div className="mt-2">
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Model</label>
-                            <Select
-                                value={settings.ollamaModel}
-                                onChange={(v) => update('ollamaModel', v)}
-                                options={ollamaModels.map(m => ({ value: m as string, label: m }))}
-                            />
-                        </div>
-                    )}
-                </div>
-            </SectionPanel>
-
-            {/* ==================== 3. ANALYTICS & APIS ==================== */}
-            <SectionPanel icon={BarChart3} title={t('settings.analytics')} tone="violet">
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="flex items-center gap-2">
-                        <Key className="h-4 w-4 text-[#8d74e8]" />
-                        <span className="text-sm font-medium text-[#17171f]">{t('settings.analyticsKeyFilePath')}</span>
-                    </div>
-                    <p className="text-xs text-[#6f697c]">
-                        {t('settings.analyticsKeyFilePathDesc')}
-                    </p>
-                    <div className="flex gap-2">
-                        <input
-                            type="text"
-                            value={settings.analyticsKeyFilePath}
-                            onChange={(e) => update('analyticsKeyFilePath', e.target.value)}
-                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-2 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                            placeholder="C:\path\to\service-account-key.json"
-                            readOnly
-                        />
-                        <PrimaryButton
-                            variant="dark"
-                            icon={FolderOpen}
-                            onClick={async () => {
-                                const path = await window.electronAPI.analytics.selectKeyFile()
-                                if (path) {
-                                    update('analyticsKeyFilePath', path)
-                                }
-                            }}
-                        >
-                            {t('settings.browseFile')}
-                        </PrimaryButton>
-                    </div>
-                </div>
-            </SectionPanel>
-
-            {/* ==================== 4. REVIEW DEFAULTS ==================== */}
-            <SectionPanel icon={Star} title={t('settings.reviewDefaults')} tone="amber">
-                <FormRow
-                    icon={<Star className="h-4 w-4 text-amber-500" />}
-                    label={t('settings.defaultRating')}
-                    description={t('settings.defaultRatingDesc')}
-                    tone="amber"
-                >
-                    <div className="flex items-center gap-1">
-                        {[1, 2, 3, 4, 5].map(star => (
-                            <button
-                                key={star}
-                                onClick={() => update('defaultRating', star)}
-                                className="transition-transform hover:scale-110"
-                                title={`${star} star${star > 1 ? 's' : ''}`}
-                            >
-                                <Star
-                                    className={`h-5 w-5 transition-colors ${star <= settings.defaultRating
-                                        ? 'fill-amber-400 text-amber-400'
-                                        : 'text-[#908a9e]'
-                                        }`}
-                                />
-                            </button>
-                        ))}
-                    </div>
-                </FormRow>
-
-                <FormRow
-                    icon={<Image className="h-4 w-4 text-emerald-500" />}
-                    label={t('settings.includePhotos')}
-                    description={t('settings.includePhotosDesc')}
-                >
-                    <DSToggle checked={settings.includePhotos} onChange={() => update('includePhotos', !settings.includePhotos)} />
-                </FormRow>
-
-                <FormRow
-                    icon={<Bot className="h-4 w-4 text-[#8d74e8]" />}
-                    label={t('settings.autoGenerateReview')}
-                    description={t('settings.autoGenerateReviewDesc')}
-                >
-                    <DSToggle checked={settings.autoGenerateReview} onChange={() => update('autoGenerateReview', !settings.autoGenerateReview)} />
-                </FormRow>
-
-                <FormRow
-                    icon={<Shield className="h-4 w-4 text-amber-500" />}
-                    label="Manual Confirm Before Submit"
-                    description="Recommended for production targets. App fills review but does not auto-submit unless target host is trusted."
-                    tone="amber"
-                >
-                    <DSToggle checked={settings.manualReviewSubmit} onChange={() => update('manualReviewSubmit', !settings.manualReviewSubmit)} />
-                </FormRow>
-
-                <FormRow
-                    icon={<Globe className="h-4 w-4 text-cyan-500" />}
-                    label="Allow Auto Submit On Trusted Hosts"
-                    description="Only used when manual confirm is enabled. Useful for staging/local QA."
-                >
-                    <DSToggle
-                        checked={settings.allowAutoSubmitOnTrustedHosts}
-                        onChange={() => update('allowAutoSubmitOnTrustedHosts', !settings.allowAutoSubmitOnTrustedHosts)}
-                    />
-                </FormRow>
-
-                <FormRow
-                    label="Trusted auto-submit hosts"
-                    description="Example: localhost, 127.0.0.1, *.staging.internal"
-                >
-                    <TextInput
-                        value={settings.trustedAutoSubmitHosts}
-                        onChange={(v) => update('trustedAutoSubmitHosts', v)}
-                        placeholder="localhost,127.0.0.1,*.internal"
-                        className="w-64"
-                    />
-                </FormRow>
-            </SectionPanel>
-
-            {/* ==================== 4. TRAFFIC DEFAULTS ==================== */}
-            <SectionPanel icon={Car} title={t('settings.trafficDefaults')} tone="emerald">
-                <FormRow
-                    icon={<Target className="h-4 w-4 text-emerald-500" />}
-                    label={t('settings.defaultTrafficMode')}
-                    description={t('settings.defaultTrafficModeDesc')}
-                >
-                    <Select
-                        value={settings.defaultTrafficMode}
-                        onChange={(v) => update('defaultTrafficMode', v as 'direct' | 'organic')}
-                        options={[
-                            { value: 'organic' as const, label: t('settings.modeOrganic') },
-                            { value: 'direct' as const, label: t('settings.modeDirect') },
-                        ]}
-                        className="w-36"
-                    />
-                </FormRow>
-
-                <FormRow
-                    icon={<Hash className="h-4 w-4 text-blue-500" />}
-                    label={t('settings.visitsPerLocation')}
-                    description={t('settings.visitsPerLocationDesc')}
-                >
-                    <NumberInput value={settings.defaultVisitsPerLocation} onChange={(v) => update('defaultVisitsPerLocation', v)} min={1} max={100} />
-                </FormRow>
-
-                <FormRow
-                    icon={<Zap className="h-4 w-4 text-amber-500" />}
-                    label={t('settings.actionsPerVisit')}
-                    description={t('settings.actionsPerVisitDesc')}
-                >
-                    <NumberInput value={settings.defaultActionsPerVisit} onChange={(v) => update('defaultActionsPerVisit', v)} min={1} max={100} />
-                </FormRow>
-
+                {/* Timing */}
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.timing')}</div>
                 <div className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="mb-3 flex items-center gap-2">
-                        <Timer className="h-4 w-4 text-amber-500" />
-                        <span className="text-sm font-medium text-[#17171f]">{t('settings.visitDelayRange')}</span>
-                    </div>
-                    <div className="flex items-center gap-3">
-                        <div className="flex-1">
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.minSeconds')}</label>
-                            <input
-                                type="number"
-                                value={settings.trafficDelayMin}
-                                onChange={(e) => update('trafficDelayMin', Math.max(5, parseInt(e.target.value) || 5))}
-                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                                min="5"
-                                title={t('settings.minSeconds')}
-                            />
+                    <div className="grid grid-cols-3 gap-4">
+                        <div>
+                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.minDelay')}</label>
+                            <input type="number" value={settings.delayMin} onChange={(e) => update('delayMin', Math.max(5, parseInt(e.target.value) || 30))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min="5" />
                         </div>
-                        <span className="mt-5 text-[#908a9e]">&mdash;</span>
-                        <div className="flex-1">
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.maxSeconds')}</label>
-                            <input
-                                type="number"
-                                value={settings.trafficDelayMax}
-                                onChange={(e) => update('trafficDelayMax', Math.max(settings.trafficDelayMin + 1, parseInt(e.target.value) || 30))}
-                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                                min={settings.trafficDelayMin + 1}
-                                title={t('settings.maxSeconds')}
-                            />
+                        <div>
+                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.maxDelay')}</label>
+                            <input type="number" value={settings.delayMax} onChange={(e) => update('delayMax', Math.max(settings.delayMin + 1, parseInt(e.target.value) || 60))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min={settings.delayMin + 1} />
+                        </div>
+                        <div>
+                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.maxRetries')}</label>
+                            <input type="number" value={settings.maxRetries} onChange={(e) => update('maxRetries', Math.max(1, Math.min(10, parseInt(e.target.value) || 3)))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min="1" max="10" />
                         </div>
                     </div>
-                    <p className="mt-2 text-xs text-[#908a9e]">
-                        {t('settings.randomDelay').replace('{min}', String(settings.trafficDelayMin)).replace('{max}', String(settings.trafficDelayMax))}
-                    </p>
+                    <p className="mt-2 text-xs text-[#908a9e]">{t('settings.generalTimingInfo').replace('{min}', String(settings.delayMin)).replace('{max}', String(settings.delayMax)).replace('{retries}', String(settings.maxRetries))}</p>
                 </div>
-            </SectionPanel>
 
-            {/* ==================== 5. PROXY ==================== */}
-            <SectionPanel icon={Globe} title={t('settings.proxy')} tone="cyan">
-                {/* FProxy.me API Key */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-[#f9f7fe] p-3.5">
-                    <div className="flex items-center gap-2">
-                        <Key className="h-4 w-4 text-cyan-600" />
-                        <span className="text-sm font-medium text-[#17171f]">FProxy.me API Key</span>
-                        <Badge tone="cyan">Proxy Xoay</Badge>
+                {/* Captcha Solver */}
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.captchaSolver')}</div>
+                <div className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5 space-y-3">
+                    <div className="grid grid-cols-2 gap-3">
+                        <div>
+                            <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.provider')}</label>
+                            <Select
+                                value={(settings as any).captchaSolverProvider || 'none'}
+                                onChange={(v) => update('captchaSolverProvider' as any, v)}
+                                options={[
+                                    { value: 'none', label: 'Off' },
+                                    { value: '2captcha', label: '2Captcha' },
+                                    { value: 'capsolver', label: 'CapSolver' },
+                                ]}
+                                className="w-full"
+                            />
+                        </div>
+                        <div>
+                            <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.apiKey')}</label>
+                            <input type="password" value={(settings as any).captchaSolverApiKey || ''} onChange={(e) => update('captchaSolverApiKey' as any, e.target.value)} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="API key..." disabled={(settings as any).captchaSolverProvider === 'none'} />
+                        </div>
                     </div>
-                    <div className="flex gap-2">
-                        <input
-                            type="password"
-                            value={(settings as any).fproxyApiKey || ''}
-                            onChange={(e) => update('fproxyApiKey' as any, e.target.value)}
-                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-2 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/20"
-                            placeholder="Nhap API key tu fproxy.me..."
-                            title="FProxy API Key"
-                        />
-                        <PrimaryButton
-                            icon={fproxyTesting ? RefreshCw : TestTube2}
-                            onClick={async () => {
-                                const key = (settings as any).fproxyApiKey
-                                if (!key) return
-                                setFproxyTesting(true)
-                                setFproxyResult(null)
-                                try {
-                                    await (window as any).electronAPI.fproxy.setApiKey(key)
-                                    const result = await (window as any).electronAPI.fproxy.test()
-                                    if (result?.success) {
-                                        const runtimeWarnings = [
-                                            !settings.useProxy ? 'bat Use Proxy' : '',
-                                            hasChanges ? 'luu settings' : '',
-                                        ].filter(Boolean)
-                                        const runtimeSuffix = runtimeWarnings.length > 0
-                                            ? ` - Runtime can ${runtimeWarnings.join(' + ')} truoc khi chay campaign`
-                                            : ''
-                                        const suffix = result?.message ? ` - ${result.message}${runtimeSuffix}` : runtimeSuffix
-                                        setFproxyResult({ success: true, text: `Proxy: ${result.proxy} (${result.location || ''})${suffix}` })
-                                    } else {
-                                        setFproxyResult({ success: false, text: result?.message || 'Khong lay duoc proxy' })
-                                    }
-                                } catch (err: any) {
-                                    setFproxyResult({ success: false, text: `Loi: ${err.message}` })
-                                } finally {
-                                    setFproxyTesting(false)
-                                }
-                            }}
-                            disabled={!(settings as any).fproxyApiKey || fproxyTesting}
-                            className={fproxyTesting ? '[&_svg]:animate-spin' : ''}
-                        >
-                            {fproxyTesting ? 'Dang test...' : 'Test'}
-                        </PrimaryButton>
-                    </div>
-                    {fproxyResult && (
-                        <AlertBanner type={fproxyResult.success ? 'success' : 'error'}>
-                            {fproxyResult.text}
-                        </AlertBanner>
+                    {(settings as any).captchaSolverProvider !== 'none' && (
+                        <p className="text-xs text-amber-600">{t('settings.solverWarning').replace('{provider}', (settings as any).captchaSolverProvider)}</p>
                     )}
-                    <p className="text-xs text-[#6f697c]">
-                        Nhap API key tu fproxy.me de su dung proxy xoay tu dong. Khi co API key, app se tu lay proxy moi cho moi luot truy cap.
-                    </p>
                 </div>
 
-                <FormRow
-                    icon={<Globe className="h-4 w-4 text-cyan-500" />}
-                    label={t('settings.useProxy')}
-                    description={t('settings.useProxyDesc')}
-                >
+                {/* Proxy */}
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.proxy')}</div>
+                <FormRow icon={<Globe className="h-4 w-4 text-cyan-500" />} label={t('settings.useProxy')} description={t('settings.useProxyDesc')}>
                     <DSToggle checked={settings.useProxy} onChange={() => update('useProxy', !settings.useProxy)} />
                 </FormRow>
-
+                <FormRow icon={<Key className="h-4 w-4 text-cyan-600" />} label={t('settings.fproxyApiKey')} description={t('settings.fproxyApiKeyDesc')}>
+                    <div className="flex gap-2 w-full max-w-md">
+                        <input type="password" value={(settings as any).fproxyApiKey || ''} onChange={(e) => update('fproxyApiKey' as any, e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="fproxy.me key" />
+                        <PrimaryButton icon={proxyApiTesting ? RefreshCw : TestTube2} onClick={handleTestProxyApi} disabled={!((settings as any).fproxyApiKey || '').trim() || proxyApiTesting} className={proxyApiTesting ? '[&_svg]:animate-spin' : ''}>{t('settings.test')}</PrimaryButton>
+                    </div>
+                </FormRow>
+                {proxyApiStatus !== 'idle' && (
+                    <AlertBanner type={proxyApiStatus === 'success' ? 'success' : 'error'}>
+                        {proxyApiResult}
+                    </AlertBanner>
+                )}
                 {settings.useProxy && (
                     <>
-                        <FormRow
-                            icon={<RotateCw className="h-4 w-4 text-[#8d74e8]" />}
-                            label={t('settings.rotateProxyPerSession')}
-                            description={t('settings.rotateProxyPerSessionDesc')}
-                        >
+                        <FormRow icon={<RotateCw className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.rotateProxyPerSession')} description={t('settings.rotateProxyPerSessionDesc')}>
                             <DSToggle checked={settings.rotateProxyPerSession} onChange={() => update('rotateProxyPerSession', !settings.rotateProxyPerSession)} />
                         </FormRow>
-
-                        <FormRow
-                            icon={<Trash2 className="h-4 w-4 text-rose-500" />}
-                            label={t('settings.autoRemoveDeadProxies')}
-                            description={t('settings.autoRemoveDeadProxiesDesc')}
-                        >
+                        <FormRow icon={<Trash2 className="h-4 w-4 text-rose-500" />} label={t('settings.autoRemoveDeadProxies')} description={t('settings.autoRemoveDeadProxiesDesc')}>
                             <DSToggle checked={settings.autoRemoveDeadProxies} onChange={() => update('autoRemoveDeadProxies', !settings.autoRemoveDeadProxies)} />
                         </FormRow>
                     </>
                 )}
             </SectionPanel>
 
-            {/* ==================== 6. TIMING ==================== */}
-            <SectionPanel icon={Clock} title={t('settings.timing')} tone="violet">
-                <div className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="grid grid-cols-3 gap-4">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.minDelay')}</label>
-                            <input
-                                type="number"
-                                value={settings.delayMin}
-                                onChange={(e) => update('delayMin', Math.max(5, parseInt(e.target.value) || 30))}
-                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                                min="5"
-                                title={t('settings.minDelay')}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.maxDelay')}</label>
-                            <input
-                                type="number"
-                                value={settings.delayMax}
-                                onChange={(e) => update('delayMax', Math.max(settings.delayMin + 1, parseInt(e.target.value) || 60))}
-                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                                min={settings.delayMin + 1}
-                                title={t('settings.maxDelay')}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.maxRetries')}</label>
-                            <input
-                                type="number"
-                                value={settings.maxRetries}
-                                onChange={(e) => update('maxRetries', Math.max(1, Math.min(10, parseInt(e.target.value) || 3)))}
-                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                                min="1"
-                                max="10"
-                                title={t('settings.maxRetries')}
-                            />
-                        </div>
+            {/* 3. AI & REVIEW */}
+            <SectionPanel icon={Bot} title={t('settings.ai')} tone="violet">
+                {/* Groq */}
+                <div className="space-y-2 rounded-[18px] border border-[#ece7f5] bg-[#f9f7fe] p-3.5">
+                    <div className="flex items-center gap-2 text-sm font-medium"><Key className="h-4 w-4 text-[#735bd6]" />{t('settings.groq')}</div>
+                    <div className="flex gap-2">
+                        <input type="password" value={settings.groqApiKey} onChange={(e) => update('groqApiKey', e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="gsk_..." />
+                        <PrimaryButton icon={apiTesting ? RefreshCw : TestTube2} onClick={handleTestApiKey} disabled={!settings.groqApiKey || apiTesting} className={apiTesting ? '[&_svg]:animate-spin' : ''}>{t('settings.test')}</PrimaryButton>
                     </div>
-                    <p className="mt-3 text-xs text-[#908a9e]">
-                        {t('settings.generalTimingInfo')
-                            .replace('{min}', String(settings.delayMin))
-                            .replace('{max}', String(settings.delayMax))
-                            .replace('{retries}', String(settings.maxRetries))}
-                    </p>
-                </div>
-            </SectionPanel>
-
-            {/* ==================== 7. RUNTIME POLICY ==================== */}
-            <SectionPanel icon={Target} title="Runtime Policy" tone="violet">
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="grid grid-cols-2 gap-4">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Captcha Mode</label>
-                            <Select
-                                value={settings.captchaMode}
-                                onChange={(value) => update('captchaMode', value as AppSettings['captchaMode'])}
-                                options={[
-                                    { value: 'hybrid' as const, label: 'Hybrid' },
-                                    { value: 'manual' as const, label: 'Manual only' },
-                                    { value: 'auto_skip' as const, label: 'Auto skip' },
-                                ]}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Log level</label>
-                            <Select
-                                value={settings.logLevel}
-                                onChange={(value) => update('logLevel', value as AppSettings['logLevel'])}
-                                options={[
-                                    { value: 'info' as const, label: 'Info' },
-                                    { value: 'debug' as const, label: 'Debug' },
-                                    { value: 'warn' as const, label: 'Warn' },
-                                    { value: 'error' as const, label: 'Error' },
-                                ]}
-                            />
-                        </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Auto-skip strikes</label>
-                            <NumberInput
-                                value={settings.captchaAutoSkipMaxStrikes}
-                                onChange={(value) => update('captchaAutoSkipMaxStrikes', value)}
-                                min={0}
-                                max={10}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Manual wait (s)</label>
-                            <NumberInput
-                                value={settings.captchaManualWaitSeconds}
-                                onChange={(value) => update('captchaManualWaitSeconds', value)}
-                                min={30}
-                                max={600}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Queue concurrency</label>
-                            <NumberInput
-                                value={settings.queueConcurrency}
-                                onChange={(value) => update('queueConcurrency', value)}
-                                min={1}
-                                max={12}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Queue interval (ms)</label>
-                            <NumberInput
-                                value={settings.queueIntervalMs}
-                                onChange={(value) => update('queueIntervalMs', value)}
-                                min={500}
-                                max={30000}
-                                step={100}
-                            />
-                        </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Network retry max</label>
-                            <NumberInput
-                                value={settings.networkRetryMax}
-                                onChange={(value) => update('networkRetryMax', value)}
-                                min={0}
-                                max={10}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">UI retry max</label>
-                            <NumberInput
-                                value={settings.uiRetryMax}
-                                onChange={(value) => update('uiRetryMax', value)}
-                                min={0}
-                                max={10}
-                            />
-                        </div>
-                    </div>
-
-                    <Divider />
-
-                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Mini-RAG enabled</label>
-                            <DSToggle checked={settings.ragEnabled} onChange={() => update('ragEnabled', !settings.ragEnabled)} />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">RAG write mode</label>
-                            <Select
-                                value={settings.ragWriteMode}
-                                onChange={(value) => update('ragWriteMode', value as AppSettings['ragWriteMode'])}
-                                options={[
-                                    { value: 'risk_only' as const, label: 'Risk only' },
-                                    { value: 'all' as const, label: 'All actions' },
-                                    { value: 'off' as const, label: 'Off' },
-                                ]}
-                            />
-                        </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">RAG Top-K</label>
-                            <NumberInput
-                                value={settings.ragTopK}
-                                onChange={(value) => update('ragTopK', value)}
-                                min={1}
-                                max={12}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">RAG context chars</label>
-                            <NumberInput
-                                value={settings.ragMaxContextChars}
-                                onChange={(value) => update('ragMaxContextChars', value)}
-                                min={200}
-                                max={6000}
-                                step={50}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">RAG budget (ms)</label>
-                            <NumberInput
-                                value={settings.ragLatencyBudgetMs}
-                                onChange={(value) => update('ragLatencyBudgetMs', value)}
-                                min={100}
-                                max={5000}
-                                step={50}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">RAG min score</label>
-                            <input
-                                type="number"
-                                value={settings.ragMinScore}
-                                onChange={(e) => {
-                                    const parsed = parseFloat(e.target.value)
-                                    if (Number.isNaN(parsed)) {
-                                        return
-                                    }
-                                    update('ragMinScore', Math.max(0, Math.min(1, Number(parsed.toFixed(3)))))
-                                }}
-                                min={0}
-                                max={1}
-                                step={0.01}
-                                className="w-20 rounded-[16px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                                title="RAG minimum confidence score"
-                            />
-                        </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">RAG entry TTL (hours)</label>
-                            <NumberInput
-                                value={settings.ragEntryTtlHours}
-                                onChange={(value) => update('ragEntryTtlHours', value)}
-                                min={24}
-                                max={2160}
-                                step={12}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">RAG dedupe window (minutes)</label>
-                            <NumberInput
-                                value={settings.ragDedupeWindowMinutes}
-                                onChange={(value) => update('ragDedupeWindowMinutes', value)}
-                                min={1}
-                                max={10080}
-                                step={5}
-                            />
-                        </div>
-                    </div>
-
-                    <p className="text-xs text-[#6f697c]">
-                        Hybrid mode: tu skip CAPTCHA o strike thap, vuot nguong se chuyen manual gate va tu resume sau khi ban xac minh.
-                    </p>
-                </div>
-
-                {/* CAPTCHA Solver */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="mb-2 flex items-center gap-2">
-                        <Bot className="h-4 w-4 text-emerald-500" />
-                        <span className="text-sm font-medium text-[#17171f]">Auto-Solve CAPTCHA API</span>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4">
-                        <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">Solver Service Provider</label>
-                            <Select
-                                value={(settings as any).captchaSolverProvider || 'none'}
-                                onChange={(value) => update('captchaSolverProvider' as any, value)}
-                                options={[
-                                    { value: 'none' as const, label: 'Off / Do not auto-solve' },
-                                    { value: '2captcha' as const, label: '2Captcha' },
-                                    { value: 'capsolver' as const, label: 'CapSolver' },
-                                    { value: 'local-ai' as const, label: 'Local AI (Free)' },
-                                ]}
-                            />
-                        </div>
-                        <div>
-                            <label className="mb-1.5 flex items-center gap-1.5 text-xs text-[#6f697c]">
-                                <Key className="h-3 w-3" />
-                                API Key
-                            </label>
-                            <input
-                                type="password"
-                                value={(settings as any).captchaSolverApiKey || ''}
-                                onChange={(e) => update('captchaSolverApiKey' as any, e.target.value)}
-                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                                placeholder={(settings as any).captchaSolverProvider === 'none' ? 'Bat provider de nhap key' : 'Nhap API key...'}
-                                disabled={(settings as any).captchaSolverProvider === 'none'}
-                            />
-                        </div>
-                    </div>
-                    {(settings as any).captchaSolverProvider !== 'none' && (
-                        <AlertBanner type="warning">
-                            Luu y: Ban phai nap tien vao tai khoan {(settings as any).captchaSolverProvider === '2captcha' ? '2captcha.com' : 'capsolver.com'} de co the su dung API tu giai CAPTCHA.
+                    {apiStatus !== 'idle' && (
+                        <AlertBanner type={apiStatus === 'valid' ? 'success' : 'error'}>
+                            {apiStatus === 'valid' ? t('settings.testSuccess') : t('settings.testFailed')}
+                            {apiError && <div className="mt-1 text-[11px] opacity-80">{apiError}</div>}
                         </AlertBanner>
                     )}
+                    <div>
+                        <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.groqModel')}</label>
+                        <Select value={settings.groqModel} onChange={(v) => update('groqModel', v)} options={[
+                            { value: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B' },
+                            { value: 'llama-3.1-8b-instant', label: 'Llama 3.1 8B Instant' },
+                            { value: 'mixtral-8x7b-32768', label: 'Mixtral 8x7B' },
+                        ]} className="w-56" />
+                    </div>
+                    <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.openExternal('https://console.groq.com/keys') }} className="text-xs text-[#735bd6] underline">{t('settings.groqLink')}</a>
+                </div>
+
+                {/* Ollama */}
+                <div className="mt-3 space-y-2 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
+                    <div className="flex items-center gap-2 text-sm font-medium"><Database className="h-4 w-4" />{t('settings.ollama')}</div>
+                    <div className="flex gap-2">
+                        <input type="text" value={settings.ollamaUrl} onChange={(e) => update('ollamaUrl', e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="http://localhost:11434" />
+                        <PrimaryButton variant="quiet" icon={ollamaTesting ? RefreshCw : TestTube2} onClick={handleTestOllama} disabled={!settings.ollamaUrl || ollamaTesting} className={ollamaTesting ? '[&_svg]:animate-spin' : ''} />
+                    </div>
+                    {ollamaStatus !== 'idle' && <AlertBanner type={ollamaStatus === 'valid' ? 'success' : 'error'}>{ollamaStatus === 'valid' ? t('settings.testSuccess') : t('settings.testFailed')}</AlertBanner>}
+                    {ollamaModels.length > 0 && (
+                        <div>
+                            <label className="text-xs text-[#6f697c]">{t('settings.ollamaModel')}</label>
+                            <Select value={settings.ollamaModel} onChange={(v) => update('ollamaModel', v)} options={ollamaModels.map(m => ({ value: m, label: m }))} />
+                        </div>
+                    )}
+                </div>
+
+                {/* Review defaults */}
+                <div className="mt-3">
+                    <div className="mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.reviewDefaults')}</div>
+                    <FormRow icon={<Star className="h-4 w-4 text-amber-500" />} label={t('settings.defaultRating')} description={t('settings.defaultRatingDesc')}>
+                        <div className="flex items-center gap-1">
+                            {[1,2,3,4,5].map(s => (
+                                <button key={s} onClick={() => update('defaultRating', s)} className="transition hover:scale-110" title={`${s}`}>
+                                    <Star className={`h-5 w-5 ${s <= settings.defaultRating ? 'fill-amber-400 text-amber-400' : 'text-[#908a9e]'}`} />
+                                </button>
+                            ))}
+                        </div>
+                    </FormRow>
+                    <FormRow icon={<Image className="h-4 w-4 text-emerald-500" />} label={t('settings.includePhotos')} description={t('settings.includePhotosDesc')}>
+                        <DSToggle checked={settings.includePhotos} onChange={() => update('includePhotos', !settings.includePhotos)} />
+                    </FormRow>
+                    <FormRow icon={<Bot className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.autoGenerateReview')} description={t('settings.autoGenerateReviewDesc')}>
+                        <DSToggle checked={settings.autoGenerateReview} onChange={() => update('autoGenerateReview', !settings.autoGenerateReview)} />
+                    </FormRow>
+                    <FormRow icon={<Languages className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.defaultReviewLanguage')} description={t('settings.defaultReviewLanguageDesc')}>
+                        <Select value={settings.defaultReviewLanguage} onChange={(v) => update('defaultReviewLanguage', v as 'vi'|'en')} options={[
+                            { value: 'vi', label: 'Tiếng Việt' },
+                            { value: 'en', label: 'English' },
+                        ]} className="w-36" />
+                    </FormRow>
+                    <FormRow icon={<FileText className="h-4 w-4 text-rose-500" />} label={t('settings.defaultReviewStyle')} description={t('settings.defaultReviewStyleDesc')}>
+                        <Select value={settings.defaultReviewStyle} onChange={(v) => update('defaultReviewStyle', v as any)} options={[
+                            { value: 'casual', label: t('settings.styleCasual') },
+                            { value: 'professional', label: t('settings.styleProfessional') },
+                            { value: 'enthusiastic', label: t('settings.styleEnthusiastic') },
+                        ]} className="w-36" />
+                    </FormRow>
+                    <FormRow icon={<Gauge className="h-4 w-4 text-amber-500" />} label={t('settings.defaultReviewLength')} description={t('settings.defaultReviewLengthDesc')}>
+                        <Select value={settings.defaultReviewLength} onChange={(v) => update('defaultReviewLength', v as any)} options={[
+                            { value: 'short', label: t('settings.lengthShort') },
+                            { value: 'medium', label: t('settings.lengthMedium') },
+                            { value: 'long', label: t('settings.lengthLong') },
+                        ]} className="w-28" />
+                    </FormRow>
                 </div>
             </SectionPanel>
 
-            {/* ==================== 7.5 IN-HOUSE AI ==================== */}
-            <SectionPanel icon={Cpu} title="In-house AI (Local)" tone="cyan">
-                <FormRow
-                    icon={<Power className="h-4 w-4 text-cyan-500" />}
-                    label="Enable In-house AI"
-                    description="Bat AI chay truc tiep tren may (Qwen 0.5B). Khong can API key, hoan toan mien phi."
-                >
-                    <DSToggle checked={(settings as any).hfModelEnabled || false} onChange={() => update('hfModelEnabled' as any, !(settings as any).hfModelEnabled)} />
+            {/* 4. TRAFFIC */}
+            <SectionPanel icon={Car} title={t('settings.trafficDefaults')} tone="emerald">
+                <FormRow icon={<Target className="h-4 w-4 text-emerald-500" />} label={t('settings.defaultTrafficMode')} description={t('settings.defaultTrafficModeDesc')}>
+                    <Select value={settings.defaultTrafficMode} onChange={(v) => update('defaultTrafficMode', v as any)} options={[
+                        { value: 'organic', label: t('settings.trafficModeOrganic') },
+                        { value: 'direct', label: t('settings.trafficModeDirect') },
+                    ]} className="w-44" />
                 </FormRow>
-
-                {(settings as any).hfModelEnabled && (
-                    <>
-                        <FormRow
-                            icon={<Bot className="h-4 w-4 text-cyan-500" />}
-                            label="Text Generation Model"
-                            description="Model mac dinh: Xenova/Qwen1.5-0.5B-Chat (quantized, ~300MB). De trong de dung mac dinh."
-                        >
-                            <TextInput
-                                value={(settings as any).hfTextGenModel || ''}
-                                onChange={(v) => update('hfTextGenModel' as any, v)}
-                                placeholder="Xenova/Qwen1.5-0.5B-Chat"
-                                className="w-56"
-                            />
-                        </FormRow>
-
-                        <FormRow
-                            icon={<Timer className="h-4 w-4 text-cyan-500" />}
-                            label="Auto-Unload Idle (phut)"
-                            description="Tu dong giai phong model khoi RAM sau N phut khong hoat dong. Set 0 de tat."
-                        >
-                            <NumberInput
-                                value={(settings as any).hfAutoUnloadMinutes ?? 5}
-                                onChange={(v) => update('hfAutoUnloadMinutes' as any, v)}
-                                min={0}
-                                max={60}
-                                suffix="min"
-                            />
-                        </FormRow>
-
-                        <FormRow
-                            icon={<MemoryStick className="h-4 w-4 text-cyan-500" />}
-                            label="Max RAM cho AI (MB)"
-                            description="Gioi han bo nho toi da cho local AI. Khuyen nghi: 2048MB cho 8GB RAM, 4096MB cho 16GB+."
-                        >
-                            <NumberInput
-                                value={(settings as any).hfMaxMemoryMB ?? 2048}
-                                onChange={(v) => update('hfMaxMemoryMB' as any, v)}
-                                min={512}
-                                max={8192}
-                                suffix="MB"
-                            />
-                        </FormRow>
-
-                        <AlertBanner type="info">
-                            Khi bat, he thong tu dong dung AI local khi Groq API khong kha dung (offline hoac het key).
-                            Model se duoc tai xuong lan dau tien (~300MB) va cache tai thu muc userData.
-                        </AlertBanner>
-
-                        {/* ---- HF Status Dashboard ---- */}
-                        <HFStatusDashboard />
-                    </>
-                )}
+                <FormRow icon={<Hash className="h-4 w-4 text-blue-500" />} label={t('settings.visitsPerLocation')} description="">
+                    <NumberInput value={settings.defaultVisitsPerLocation} onChange={(v) => update('defaultVisitsPerLocation', v)} min={1} max={100} />
+                </FormRow>
+                <FormRow icon={<Zap className="h-4 w-4 text-amber-500" />} label={t('settings.actionsPerVisit')} description="">
+                    <NumberInput value={settings.defaultActionsPerVisit} onChange={(v) => update('defaultActionsPerVisit', v)} min={1} max={100} />
+                </FormRow>
+                <div className="mt-2 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
+                    <div className="mb-2 text-sm font-medium">{t('settings.visitDelayRange')}</div>
+                    <div className="flex gap-3">
+                        <div className="flex-1">
+                            <div className="text-xs text-[#6f697c] mb-1">{t('settings.minSeconds')}</div>
+                            <input type="number" value={settings.trafficDelayMin} onChange={(e) => update('trafficDelayMin', Math.max(5, parseInt(e.target.value)||5))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1 text-sm text-center" min="5" />
+                        </div>
+                        <div className="flex-1">
+                            <div className="text-xs text-[#6f697c] mb-1">{t('settings.maxSeconds')}</div>
+                            <input type="number" value={settings.trafficDelayMax} onChange={(e) => update('trafficDelayMax', Math.max(settings.trafficDelayMin+1, parseInt(e.target.value)||30))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1 text-sm text-center" min={settings.trafficDelayMin+1} />
+                        </div>
+                    </div>
+                    <p className="mt-2 text-xs text-[#908a9e]">{t('settings.randomDelay').replace('{min}', String(settings.trafficDelayMin)).replace('{max}', String(settings.trafficDelayMax))}</p>
+                </div>
             </SectionPanel>
 
-            {/* ==================== 8. STORAGE ==================== */}
+            {/* 5. DỮ LIỆU & LƯU TRỮ (real IPC) */}
             <SectionPanel icon={Database} title={t('settings.storage')} tone="emerald">
-                <FormRow
-                    icon={<FolderOpen className="h-4 w-4 text-emerald-500" />}
-                    label={t('settings.dataDirectory')}
-                    description={t('settings.dataDirectoryDesc')}
-                >
+                <FormRow icon={<FolderOpen className="h-4 w-4 text-emerald-500" />} label={t('settings.dataDirectory')} description={t('settings.dataDirectoryDesc')}>
                     <div className="flex gap-2">
-                        <TextInput
-                            value={settings.dataDir}
-                            onChange={(v) => update('dataDir', v)}
-                            placeholder={t('settings.dataDirectoryPlaceholder')}
-                            className="w-56"
-                        />
-                        <PrimaryButton
-                            variant="dark"
-                            icon={FolderOpen}
-                            onClick={selectDataDir}
-                            title={t('settings.browseDirectory')}
-                        >
-                            {''}
-                        </PrimaryButton>
+                        <TextInput value={settings.dataDir} onChange={(v) => update('dataDir', v)} placeholder={t('settings.dataDirectoryPlaceholder')} className="w-56" />
+                        <PrimaryButton variant="dark" icon={FolderOpen} onClick={selectDataDir}>{t('settings.browseDirectory')}</PrimaryButton>
                     </div>
                 </FormRow>
-            </SectionPanel>
-
-            {/* ==================== 9. RUNTIME V2 ==================== */}
-            <SectionPanel icon={RefreshCw} title="Runtime V2" tone="cyan">
-                {/* Portable Data Root */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="text-sm font-medium text-[#17171f]">Portable Data Root</div>
-                    <div className="break-all text-xs text-[#5f5a6d]">
-                        {dataRootInfo?.dataRoot || 'N/A'}
+                <div className="mt-3 rounded-[16px] border border-[#e9e4f2] bg-white p-3 space-y-2">
+                    <div className="flex items-center justify-between">
+                        <div className="text-sm font-medium">{t('settings.storageUsage')}</div>
+                        <div className="flex gap-2">
+                            <PrimaryButton variant="quiet" onClick={loadStorageInfo} className="text-xs" icon={RefreshCw}>{t('settings.refresh')}</PrimaryButton>
+                            <PrimaryButton variant="quiet" onClick={() => window.electronAPI.data.openPath?.(storageInfo?.dataRoot)} className="text-xs" icon={FolderOpen}>{t('settings.openFolder')}</PrimaryButton>
+                            <PrimaryButton tone="rose" variant="quiet" onClick={async () => { try { setMaintenanceBusy(true); const r = await window.electronAPI.data.clearCaches?.(); showMsg('success', `${t('settings.clearCachesDone')} (${r?.cleared ?? 0})`); await loadStorageInfo() } catch { showMsg('error', t('settings.saveFailed')) } finally { setMaintenanceBusy(false) } }} disabled={maintenanceBusy} className="text-xs" icon={Trash2}>{t('settings.clearCaches')}</PrimaryButton>
+                        </div>
                     </div>
-                    <div className="text-xs text-[#6f697c]">
-                        Legacy sources: {legacyRoots.filter(item => item.exists).length}
-                    </div>
-                    {legacyRoots.filter(item => item.exists).length > 0 && (
-                        <div className="space-y-1">
-                            {legacyRoots.filter(item => item.exists).map(item => (
-                                <div key={item.path} className="break-all text-xs text-[#6f697c]">
-                                    {item.path} ({item.fileCount} files)
+                    <div className="text-xs break-all text-[#6f697c]">{storageInfo?.dataRoot || 'N/A'}</div>
+                    <div className="text-xs"><span className="text-[#908a9e]">{t('settings.totalSize')}:</span> <span className="font-medium">{formatBytes(storageInfo?.totalSize || 0)}</span></div>
+                    {storageInfo?.items?.length ? (
+                        <div className="space-y-1 text-xs pt-1">
+                            {storageInfo.items.map((it: any, i: number) => (
+                                <div key={i} className="flex justify-between rounded border border-[#f0edf7] bg-[#faf8ff] px-2 py-1">
+                                    <span>{it.label} {it.count ? `(${it.count} ${t('settings.items')})` : ''}</span>
+                                    <span className="font-mono text-[#5f5a6d]">{formatBytes(it.size || 0)} {it.path && <button onClick={() => window.electronAPI.data.openPath?.(it.path)} className="ml-1 text-[#8d74e8]">↗</button>}</span>
                                 </div>
                             ))}
                         </div>
-                    )}
-                    <div className="flex flex-wrap gap-2 pt-1">
-                        <PrimaryButton
-                            variant="quiet"
-                            onClick={loadV2Maintenance}
-                            disabled={maintenanceBusy}
-                            className="text-xs"
-                        >
-                            Refresh
-                        </PrimaryButton>
-                        <PrimaryButton
-                            onClick={handleMigrateLegacy}
-                            disabled={maintenanceBusy || legacyRoots.filter(item => item.exists && item.fileCount > 0).length === 0}
-                            className="text-xs"
-                        >
-                            Migrate Legacy
-                        </PrimaryButton>
-                    </div>
-                </div>
-
-                {/* Mini-RAG Knowledge */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="text-sm font-medium text-[#17171f]">Mini-RAG Knowledge</div>
-                    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                        <div className="text-xs">
-                            <div className="text-[#908a9e]">Enabled</div>
-                            <div className={`font-medium ${ragStats?.enabled ? 'text-emerald-600' : 'text-[#5f5a6d]'}`}>
-                                {ragStats?.enabled ? 'Yes' : 'No'}
-                            </div>
-                        </div>
-                        <div className="text-xs">
-                            <div className="text-[#908a9e]">Entries</div>
-                            <div className="font-medium text-[#17171f]">{ragStats?.totalEntries ?? 0}</div>
-                        </div>
-                        <div className="text-xs">
-                            <div className="text-[#908a9e]">Hit rate</div>
-                            <div className="font-medium text-[#17171f]">{formatPercent(ragStats?.hitRate ?? 0)}</div>
-                        </div>
-                        <div className="text-xs">
-                            <div className="text-[#908a9e]">P95 latency</div>
-                            <div className="font-medium text-[#17171f]">{ragStats?.p95LatencyMs ?? 0} ms</div>
-                        </div>
-                    </div>
-                    <div className="text-xs text-[#6f697c]">
-                        Retrievals: {ragStats?.retrievalCount ?? 0} · Hits: {ragStats?.retrievalHitCount ?? 0} · Avg latency: {ragStats?.avgLatencyMs ?? 0} ms
-                    </div>
-                    <div className="text-xs text-[#6f697c]">
-                        Last retrieval: {ragStats?.lastRetrievalAt ? new Date(ragStats.lastRetrievalAt).toLocaleString() : 'N/A'}
-                    </div>
-                    <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
-                        <input
-                            type="number"
-                            value={ragClearScope.campaignId}
-                            onChange={(e) => setRagClearScope(prev => ({ ...prev, campaignId: e.target.value }))}
-                            placeholder="Campaign ID (optional)"
-                            className="rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-xs text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                            min="1"
-                        />
-                        <input
-                            type="text"
-                            value={ragClearScope.domain}
-                            onChange={(e) => setRagClearScope(prev => ({ ...prev, domain: e.target.value }))}
-                            placeholder="Domain (optional)"
-                            className="rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-xs text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                        />
-                        <input
-                            type="text"
-                            value={ragClearScope.riskType}
-                            onChange={(e) => setRagClearScope(prev => ({ ...prev, riskType: e.target.value }))}
-                            placeholder="Risk type (optional)"
-                            className="rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-xs text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                        />
-                    </div>
-                    <div className="flex flex-wrap gap-2 pt-1">
-                        <PrimaryButton
-                            variant="quiet"
-                            onClick={loadV2Maintenance}
-                            disabled={maintenanceBusy}
-                            className="text-xs"
-                        >
-                            Refresh metrics
-                        </PrimaryButton>
-                        <PrimaryButton
-                            tone="amber"
-                            onClick={handleClearRag}
-                            disabled={maintenanceBusy}
-                            className="text-xs"
-                        >
-                            Clear knowledge
-                        </PrimaryButton>
-                    </div>
-                </div>
-
-                {/* MCP Health */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="text-sm font-medium text-[#17171f]">MCP control-plane health</div>
-                    <div className="text-xs text-[#5f5a6d]">
-                        Overall: <span className={mcpHealth?.healthy ? 'font-semibold text-emerald-600' : 'font-semibold text-amber-600'}>{mcpHealth?.healthy ? 'Healthy' : 'Degraded'}</span>
-                        {mcpHealth?.checkedAt ? ` · Checked: ${new Date(mcpHealth.checkedAt).toLocaleString()}` : ''}
-                    </div>
-                    <div className="space-y-1.5">
-                        {(mcpHealth?.adapters || []).map(adapter => (
-                            <div key={adapter.name} className="rounded-[14px] border border-[#ece7f5] bg-[#f4f1fa] px-2 py-1.5 text-xs text-[#5f5a6d]">
-                                <span className="font-medium text-[#17171f]">{adapter.name}</span>
-                                <span className="text-[#908a9e]"> · enabled: {adapter.enabled ? 'yes' : 'no'}</span>
-                                <span className={`ml-1 ${adapter.healthy ? 'text-emerald-600' : 'text-amber-600'}`}>· {adapter.healthy ? 'healthy' : 'issue'}</span>
-                                {typeof adapter.latencyMs === 'number' ? <span className="text-[#908a9e]"> · {adapter.latencyMs} ms</span> : null}
-                                {adapter.detail ? <div className="mt-0.5 break-words text-[#908a9e]">{adapter.detail}</div> : null}
-                            </div>
-                        ))}
-                        {(!mcpHealth || !mcpHealth.adapters || mcpHealth.adapters.length === 0) && (
-                            <div className="text-xs text-[#6f697c]">No MCP adapter diagnostics yet.</div>
-                        )}
-                    </div>
-                </div>
-
-                {/* Soak Test */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="text-sm font-medium text-[#17171f]">Soak test (8h)</div>
-                    <div className="text-xs text-[#5f5a6d]">
-                        Status: <span className={soakStatus?.running ? 'font-semibold text-emerald-600' : 'text-[#908a9e]'}>{soakStatus?.running ? 'Running' : 'Stopped'}</span>
-                        {soakStatus?.sessionId ? ` · Session: ${soakStatus.sessionId}` : ''}
-                    </div>
-                    <div className="text-xs text-[#6f697c]">
-                        Samples: {soakStatus?.sampleCount ?? 0}
-                        {soakStatus?.lastSnapshotAt ? ` · Last snapshot: ${new Date(soakStatus.lastSnapshotAt).toLocaleString()}` : ''}
-                    </div>
-                    <div className="text-xs text-[#6f697c]">
-                        Start: {soakStatus?.startedAt ? new Date(soakStatus.startedAt).toLocaleString() : 'N/A'}
-                        {soakStatus?.endsAt ? ` · End: ${new Date(soakStatus.endsAt).toLocaleString()}` : ''}
-                    </div>
-                    <div className="break-all text-xs text-[#6f697c]">
-                        Log: {soakStatus?.logPath || 'N/A'}
-                    </div>
-                    <div className="break-all text-xs text-[#6f697c]">
-                        Summary: {soakStatus?.summaryPath || 'N/A'}
-                    </div>
-                    {soakStatus?.stopReason && (
-                        <div className="text-xs text-amber-600">
-                            Last stop reason: {soakStatus.stopReason}
-                        </div>
-                    )}
-                    <div className="flex flex-wrap gap-2 pt-1">
-                        <PrimaryButton
-                            tone="emerald"
-                            onClick={handleStartSoak8h}
-                            disabled={maintenanceBusy || soakStatus?.running}
-                            className="text-xs"
-                        >
-                            Start 8h soak
-                        </PrimaryButton>
-                        <PrimaryButton
-                            tone="rose"
-                            onClick={handleStopSoak}
-                            disabled={maintenanceBusy || !soakStatus?.running}
-                            className="text-xs"
-                        >
-                            Stop soak
-                        </PrimaryButton>
-                        <PrimaryButton
-                            variant="quiet"
-                            onClick={loadV2Maintenance}
-                            disabled={maintenanceBusy}
-                            className="text-xs"
-                        >
-                            Refresh soak
-                        </PrimaryButton>
-                    </div>
-                </div>
-
-                {/* Updater */}
-                <div className="space-y-3 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
-                    <div className="text-sm font-medium text-[#17171f]">Updater</div>
-                    <div className="text-xs text-[#5f5a6d]">
-                        Current: {updaterState?.currentVersion || 'N/A'}
-                        {updaterState?.latestVersion ? ` - Latest: ${updaterState.latestVersion}` : ''}
-                    </div>
-                    <div className="text-xs text-[#6f697c]">
-                        Status: {getUpdaterStatusLabel(updaterState)}
-                        {updaterState?.checkedAt ? ` - Last check: ${new Date(updaterState.checkedAt).toLocaleString()}` : ''}
-                    </div>
-                    {typeof updaterState?.progress === 'number' && updaterState.progress > 0 && (
-                        <div className="space-y-1">
-                            <ProgressBar
-                                value={Math.max(0, Math.min(100, updaterState.progress))}
-                                tone="cyan"
-                                showLabel
-                            />
-                        </div>
-                    )}
-                    {updaterState?.blockedReason && (
-                        <div className="break-words text-xs text-amber-600">{updaterState.blockedReason}</div>
-                    )}
-                    {updaterState?.error && (
-                        <div className="break-words text-xs text-rose-600">{updaterState.error}</div>
-                    )}
-                    <div className="flex flex-wrap gap-2 pt-1">
-                        <PrimaryButton
-                            tone="emerald"
-                            onClick={handleCheckAndDownloadUpdate}
-                            disabled={maintenanceBusy || !updaterState?.enabled || updaterState?.checking || updaterState?.status === 'downloading'}
-                            className="text-xs"
-                        >
-                            Kiem tra & Tai cap nhat
-                        </PrimaryButton>
-                        <PrimaryButton
-                            onClick={handleInstallUpdate}
-                            disabled={maintenanceBusy || !updaterState?.enabled || !updaterState?.downloaded || updaterState?.pendingInstall}
-                            title={updaterState?.pendingInstall ? 'Campaign dang chay, update se cai sau khi ranh' : 'Khoi dong lai de cai dat ban cap nhat'}
-                            className="text-xs"
-                        >
-                            Khoi dong lai de cap nhat
-                        </PrimaryButton>
-                        <PrimaryButton
-                            variant="quiet"
-                            onClick={loadV2Maintenance}
-                            disabled={maintenanceBusy}
-                            className="text-xs"
-                        >
-                            Refresh updater
-                        </PrimaryButton>
-                    </div>
+                    ) : <div className="text-xs text-[#6f697c]">{t('settings.noProfileData')}</div>}
                 </div>
             </SectionPanel>
 
-            {/* ==================== 10. APP & ABOUT ==================== */}
+            {/* 6. GIỚI THIỆU / ABOUT */}
             <SectionPanel icon={Info} title={t('settings.appAbout')} tone="slate">
-                <FormRow
-                    icon={<Zap className="h-4 w-4 text-amber-500" />}
-                    label={t('settings.autoUpdate')}
-                    description={t('settings.autoUpdateDesc')}
-                >
-                    <DSToggle checked={settings.autoUpdate} onChange={() => update('autoUpdate', !settings.autoUpdate)} />
-                </FormRow>
-
-                <div className="flex items-center gap-2 pt-2">
-                    <PrimaryButton
-                        tone="rose"
-                        variant="quiet"
-                        icon={AlertTriangle}
-                        onClick={() => setShowResetConfirm(true)}
-                        title={t('settings.resetToDefaults')}
-                    >
-                        {t('settings.resetToDefaults')}
-                    </PrimaryButton>
+                {/* Update mode + controls (end-to-end via updates IPC + UpdateService) */}
+                <div className="space-y-2 rounded-[16px] border border-[#ece7f5] bg-white p-3.5">
+                    <div className="flex items-center justify-between gap-3">
+                        <div>
+                            <div className="text-sm font-medium">{t('settings.updateMode')}</div>
+                            <div className="text-xs text-[#6f697c]">{t('settings.updateModeDesc')}</div>
+                        </div>
+                        <Select
+                            value={(settings as any).updateMode || 'manual'}
+                            onChange={(v) => update('updateMode' as any, v as 'auto' | 'manual')}
+                            options={[
+                                { value: 'manual', label: t('settings.updateModeManual') },
+                                { value: 'auto', label: t('settings.updateModeAuto') },
+                            ]}
+                            className="w-40"
+                        />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <PrimaryButton onClick={handleCheckUpdate} disabled={checkingUpdate} icon={checkingUpdate ? RefreshCw : Zap} className={checkingUpdate ? '[&_svg]:animate-spin' : ''}>
+                            {t('settings.checkForUpdates')}
+                        </PrimaryButton>
+                        {updateState?.available && (
+                            <PrimaryButton onClick={handleUpdateNow} icon={Zap}>
+                                {t('settings.updateNow')}
+                            </PrimaryButton>
+                        )}
+                        {updateState?.status === 'downloading' && updateState?.progress != null && (
+                            <span className="text-xs text-[#6f697c]"> {Math.round(updateState.progress)}% </span>
+                        )}
+                        {updateState?.status === 'downloaded' && (
+                            <span className="text-xs text-emerald-600">Sẵn sàng cài đặt</span>
+                        )}
+                    </div>
+                    <div className="text-xs text-[#908a9e] pt-1">
+                        {t('settings.version')}: {appVersion}
+                        {updateState?.latestVersion && updateState.latestVersion !== appVersion ? ` → ${updateState.latestVersion}` : ''}
+                        {updateState?.error && <span className="ml-2 text-rose-500">{updateState.error}</span>}
+                    </div>
+                    {updateState?.available && !updateState.downloaded && !updateState.error && (
+                        <div className="text-xs text-amber-600">Có bản mới — bấm "Cập nhật ngay" để tải & cài (manual) hoặc chờ auto.</div>
+                    )}
                 </div>
 
+                <div className="flex items-center gap-2 pt-2">
+                    <PrimaryButton tone="rose" variant="quiet" icon={AlertTriangle} onClick={() => setShowResetConfirm(true)}>{t('settings.resetToDefaults')}</PrimaryButton>
+                </div>
                 {showResetConfirm && (
                     <AlertBanner type="error" title={t('settings.resetToDefaults')}>
-                        <p className="mb-3 text-sm">
-                            {t('settings.resetConfirmMessage')}
-                        </p>
+                        <p className="mb-3 text-sm">{t('settings.resetConfirmMessage')}</p>
                         <div className="flex gap-2">
-                            <PrimaryButton
-                                tone="rose"
-                                onClick={handleReset}
-                                className="text-xs"
-                            >
-                                {t('settings.yesReset')}
-                            </PrimaryButton>
-                            <PrimaryButton
-                                variant="quiet"
-                                onClick={() => setShowResetConfirm(false)}
-                                className="text-xs"
-                            >
-                                {t('common.cancel')}
-                            </PrimaryButton>
+                            <PrimaryButton tone="rose" onClick={handleReset} className="text-xs">{t('settings.yesReset')}</PrimaryButton>
+                            <PrimaryButton variant="quiet" onClick={() => setShowResetConfirm(false)} className="text-xs">{t('common.cancel')}</PrimaryButton>
                         </div>
                     </AlertBanner>
                 )}
+                <div className="pt-3 text-xs text-[#908a9e]">{t('settings.version')}: {appVersion}</div>
             </SectionPanel>
-
-            {/* Version */}
-            <div className="py-4 text-center text-xs text-[#908a9e]">
-                MMO Auto Review v1.0.0
-            </div>
         </PageShell>
     )
 }

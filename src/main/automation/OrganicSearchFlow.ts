@@ -1,6 +1,7 @@
 import { Page } from 'playwright'
 import { HumanBehavior } from './HumanBehavior'
 import { contextualInterruptionResolver } from './ContextualInterruptionResolver'
+import { parseMapIdentity, extractIdentity, identitiesMatch, describeMatch } from './MapIdentity'
 
 // ============================================================
 // Types
@@ -11,6 +12,8 @@ export interface LocationInfo {
     address?: string | null
     placeId?: string | null
     url: string
+    cid?: string | null
+    featureHex?: string | null
 }
 
 export type OrganicAction = 'directions' | 'call' | 'website' | 'share' | 'view_photos' | 'view_reviews' | 'view_menu' | 'save_place' | 'browse_questions' | 'view_nearby' | 'view_street_view' | 'search_interactions'
@@ -228,8 +231,13 @@ export class OrganicSearchFlow {
 
             for (const el of localResults) {
                 const text = await el.textContent().catch(() => '')
-                if (text && this.isMatchingLocation(text, location)) {
-                    this.onStatus(`Tìm thấy map trong Local Pack!`)
+                const href = await el.getAttribute('href').catch(() => '') || ''
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
+                if (idHit || (text && this.isMatchingLocationLegacy(text, location))) {
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map trong Local Pack!`)
 
                     // Try to find the clickable link/title within this element
                     const link = await el.$('a[href*="maps"], a[href*="place"], a[data-cid]')
@@ -241,7 +249,12 @@ export class OrganicSearchFlow {
 
                     await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
                     await HumanBehavior.randomDelay(2000, 4000)
-                    return true
+
+                    // VERIFY after click (now identity-first); back+continue if wrong
+                    if (await HumanBehavior.verifyOnTargetMap(page, location).catch(() => false)) return true
+                    await page.goBack().catch(() => {})
+                    await HumanBehavior.randomDelay(800, 1500)
+                    continue
                 }
             }
 
@@ -250,15 +263,24 @@ export class OrganicSearchFlow {
             for (const card of placeCards) {
                 const text = await card.textContent().catch(() => '')
                 const href = await card.getAttribute('href').catch(() => '')
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
                 if (
-                    (text && this.isMatchingLocation(text, location)) ||
+                    idHit ||
+                    (text && this.isMatchingLocation(text, location, href)) ||
                     (href && location.placeId && href.includes(location.placeId))
                 ) {
-                    this.onStatus(`Tìm thấy map qua place card!`)
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map qua place card!`)
                     await card.click()
                     await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
                     await HumanBehavior.randomDelay(2000, 4000)
-                    return true
+
+                    if (await HumanBehavior.verifyOnTargetMap(page, location).catch(() => false)) return true
+                    await page.goBack().catch(() => {})
+                    await HumanBehavior.randomDelay(800, 1500)
+                    continue
                 }
             }
         } catch (error) {
@@ -279,15 +301,24 @@ export class OrganicSearchFlow {
                 const href = await link.getAttribute('href').catch(() => '')
                 const text = await link.textContent().catch(() => '')
 
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
                 if (
-                    (text && this.isMatchingLocation(text, location)) ||
+                    idHit ||
+                    (text && this.isMatchingLocation(text, location, href)) ||
                     (href && location.placeId && href.includes(location.placeId))
                 ) {
-                    this.onStatus(`Tìm thấy map trong kết quả organic!`)
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map trong kết quả organic!`)
                     await link.click()
                     await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
                     await HumanBehavior.randomDelay(2000, 4000)
-                    return true
+
+                    if (await HumanBehavior.verifyOnTargetMap(page, location).catch(() => false)) return true
+                    await page.goBack().catch(() => {})
+                    await HumanBehavior.randomDelay(800, 1500)
+                    return false
                 }
             }
         } catch (error) {
@@ -309,8 +340,13 @@ export class OrganicSearchFlow {
 
             for (const result of mapResults) {
                 const text = await result.textContent().catch(() => '')
-                if (text && this.isMatchingLocation(text, location)) {
-                    this.onStatus(`Tìm thấy map trong tab Maps!`)
+                const href = await result.getAttribute('href').catch(() => '')
+                const tgtId = extractIdentity(location)
+                const cId = href ? parseMapIdentity(href) : null
+                const idHit = identitiesMatch(tgtId, cId)
+                if (idHit || (text && this.isMatchingLocationLegacy(text, location))) {
+                    if (idHit) this.onStatus(`Tìm thấy map (định danh ${describeMatch(tgtId, cId)})`)
+                    else this.onStatus(`Tìm thấy map trong tab Maps!`)
 
                     const link = await result.$('a')
                     if (link) {
@@ -321,7 +357,11 @@ export class OrganicSearchFlow {
 
                     await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
                     await HumanBehavior.randomDelay(2000, 4000)
-                    return true
+
+                    if (await HumanBehavior.verifyOnTargetMap(page, location).catch(() => false)) return true
+                    await page.goBack().catch(() => {})
+                    await HumanBehavior.randomDelay(800, 1500)
+                    return false
                 }
             }
         } catch (error) {
@@ -973,54 +1013,44 @@ export class OrganicSearchFlow {
     }
 
     /**
-     * Check if text content matches the target location
-     * Uses fuzzy matching on business name and address
+     * Strict match: prefer strong identifiers (placeId / CID in href/attr), else high-confidence name + address.
+     * No loose partial substring match.
      */
-    private isMatchingLocation(text: string, location: LocationInfo): boolean {
-        const normalizedText = this.normalize(text)
-        const normalizedName = this.normalize(location.name)
+    private isMatchingLocation(text: string, location: LocationInfo, href?: string | null): boolean {
+        const nText = HumanBehavior.normalizeName(text)
+        const nName = HumanBehavior.normalizeName(location.name)
+        if (!nName) return false
 
-        // Check business name match (primary)
-        if (normalizedText.includes(normalizedName)) {
-            return true
+        // 1) Strong ID: placeId in href/attr or data-cid
+        if (location.placeId) {
+            const pid = location.placeId
+            if (href && (href.includes(pid) || href.includes(encodeURIComponent(pid)))) return true
+            if (text && text.includes(pid)) return true
         }
 
-        // Check address match (secondary)
-        if (location.address) {
-            const normalizedAddress = this.normalize(location.address)
-            // Match if significant parts of the address appear
-            const addressParts = normalizedAddress.split(/[,\s]+/).filter(p => p.length > 3)
-            const matchCount = addressParts.filter(part => normalizedText.includes(part)).length
-            if (matchCount >= Math.ceil(addressParts.length * 0.5)) {
-                // Also check if at least part of the business name matches
-                const nameParts = normalizedName.split(/\s+/).filter(p => p.length > 2)
-                const nameMatchCount = nameParts.filter(part => normalizedText.includes(part)).length
-                if (nameMatchCount >= Math.ceil(nameParts.length * 0.5)) {
-                    return true
-                }
-            }
+        // 2) Strict name + address corroboration
+        if (nText === nName || nText.includes(nName)) {
+            if (!location.address) return true
+            const nAddr = HumanBehavior.normalizeName(location.address)
+            const addrParts = nAddr.split(/[,\s]+/).filter(p => p.length > 3)
+            if (addrParts.filter(p => nText.includes(p)).length >= Math.max(1, Math.ceil(addrParts.length * 0.4))) return true
         }
-
-        // Check placeId in any href attributes we might have captured
-        if (location.placeId && normalizedText.includes(this.normalize(location.placeId))) {
-            return true
+        const nameWords = nName.split(/\s+/).filter(p => p.length > 1)
+        const textSet = new Set(nText.split(/\s+/))
+        const nameHits = nameWords.filter(w => textSet.has(w)).length
+        const nameScore = nameWords.length ? nameHits / nameWords.length : 0
+        if (nameScore >= 0.85) {
+            if (!location.address) return true
+            const nAddr = HumanBehavior.normalizeName(location.address)
+            const addrParts = nAddr.split(/[,\s]+/).filter(p => p.length > 3)
+            if (addrParts.filter(p => nText.includes(p)).length >= Math.ceil(addrParts.length * 0.4)) return true
         }
-
         return false
     }
 
-    /**
-     * Normalize text for comparison: lowercase, remove diacritics, extra spaces
-     */
-    private normalize(text: string): string {
-        return text
-            .toLowerCase()
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
-            .replace(/đ/g, 'd')
-            .replace(/Đ/g, 'D')
-            .replace(/\s+/g, ' ')
-            .trim()
+    // 2-arg legacy for old call sites
+    private isMatchingLocationLegacy(text: string, location: LocationInfo): boolean {
+        return this.isMatchingLocation(text, location)
     }
 
     /**

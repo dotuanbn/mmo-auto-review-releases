@@ -39,10 +39,10 @@ export class AgenticLoginHandler {
             await this.delay(2000, 3000)
 
             while (steps < MAX_STEPS) {
-                const currentUrl = page.url()
-                if (currentUrl.includes('myaccount.google.com') || 
-                    (currentUrl.includes('google.com') && !currentUrl.includes('ServiceLogin') && !currentUrl.includes('signin') && !currentUrl.includes('v3/signin'))) {
-                    this.log(`T${threadId}: Login successful. URL: ${currentUrl}`)
+                // Use strict isGoogleLoggedIn (SAPISID+SID cookies) instead of loose URL (prevents false positive on challenges/intermediates).
+                const logged = await browserService.isGoogleLoggedIn(undefined, page.context()).catch(() => false)
+                if (logged) {
+                    this.log(`T${threadId}: Login successful (cookie confirmed)`)
                     return { success: true }
                 }
 

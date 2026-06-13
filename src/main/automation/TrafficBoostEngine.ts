@@ -16,6 +16,8 @@ import PQueue from 'p-queue'
 import { OrganicSearchFlow } from './OrganicSearchFlow'
 import { AgenticSearchHandler } from './AgenticSearchHandler'
 import { WebSeoFlow } from './WebSeoFlow'
+import { MapSearchFlow } from './MapSearchFlow'
+import { extractIdentity, identitiesMatch, parseMapIdentity } from './MapIdentity'
 import { agenticTrafficHandler } from './AgenticTrafficHandler'
 import { autonomousMapAgent } from './AutonomousMapAgent'
 import { applyStealth, DEFAULT_STEALTH_LEVEL } from './StealthPatcher'
@@ -57,6 +59,7 @@ export type SEOAction =
 
 export interface TrafficBoostStatus {
     isRunning: boolean
+    isPaused?: boolean
     campaignId: number | null
     campaignName: string
     activeThreads: number
@@ -1020,6 +1023,7 @@ export class TrafficBoostEngine {
     private readonly maxActionsPerVisitCap = 100
     private running = false
     private shouldStop = false
+    private paused = false
     private currentCampaignId: number | null = null
     private currentCampaignName = ''
     private activeContexts: Map<number, string> = new Map() // contextId -> profilePath
@@ -1056,6 +1060,13 @@ export class TrafficBoostEngine {
         return () => this.actionListeners.delete(listener)
     }
 
+    // Safe await point for pause: workers poll here between visits (keeps progress, no reset)
+    private async waitWhilePaused(): Promise<void> {
+        while (this.paused && !this.shouldStop) {
+            await new Promise(resolve => setTimeout(resolve, 250))
+        }
+    }
+
     // ============================================================
     // Profile Management - Each account gets a unique Chrome profile
     // ============================================================
@@ -1068,8 +1079,17 @@ export class TrafficBoostEngine {
     private ensureAccountProfile(account: any): string {
         const db = getDatabase()
         const userDataPath = app.getPath('userData')
-        const profilesDir = join(userDataPath, 'traffic_profiles')
 
+        // Prefer reuse of existing profilePath (set by login/ProfileService/manual) when dir exists.
+        // This ensures campaign uses the SAME persistent profile dir as the logged-in session (launchPersistent loads cookies/state auto).
+        // Only fallback to traffic_profiles/ for legacy accounts without a prior profilePath (then addCookies fallback applies).
+        if (account.profilePath && existsSync(account.profilePath)) {
+            // Optional self-heal only if obviously stale (non-current userData) but exists check already passed above? keep as-is for this machine.
+            console.log(`[TrafficBoost] Reusing account profile for ${account.email}: ${account.profilePath}`)
+            return account.profilePath
+        }
+
+        const profilesDir = join(userDataPath, 'traffic_profiles')
         if (!existsSync(profilesDir)) {
             mkdirSync(profilesDir, { recursive: true })
         }
@@ -1081,7 +1101,7 @@ export class TrafficBoostEngine {
             mkdirSync(profilePath, { recursive: true })
         }
 
-        // Self-heal: If the database contains an old absolute path from another Windows user, update it
+        // Self-heal only for this fallback path (legacy case)
         if (account.profilePath !== profilePath) {
             try {
                 db.update(schema.accounts)
@@ -1300,6 +1320,7 @@ export class TrafficBoostEngine {
     private buildStatus(overrides: Partial<TrafficBoostStatus> = {}): TrafficBoostStatus {
         return {
             isRunning: this.running,
+            isPaused: this.paused,
             campaignId: this.currentCampaignId ?? null,
             campaignName: this.currentCampaignName,
             activeThreads: this.threadDetails.filter(t => t.status === 'visiting').length,
@@ -2224,6 +2245,22 @@ export class TrafficBoostEngine {
         const campaign = db.select().from(schema.trafficCampaigns).where(eq(schema.trafficCampaigns.id, campaignId)).get()
         if (!campaign) throw new Error('Campaign not found')
 
+        // In-process resume: unpause without full re-init (counters already loaded from DB on prior start)
+        if (this.running && this.currentCampaignId === campaignId) {
+            if (this.paused) {
+                this.paused = false
+                if (fproxyService.getApiKey() && fproxyService.isAutoRotateActive() === false) {
+                    fproxyService.resumeAutoRotate()
+                }
+                const db = getDatabase()
+                db.update(schema.trafficCampaigns).set({ status: 'running' }).where(eq(schema.trafficCampaigns.id, campaignId)).run()
+                this.sendStatus(this.buildStatus({ message: 'Resumed from pause' }))
+                return
+            }
+            console.log('[TrafficBoost] Already running')
+            return
+        }
+
         this.running = true
         let terminalMessage = 'Traffic boost stopped'
 
@@ -2347,10 +2384,13 @@ export class TrafficBoostEngine {
             throw new Error('No locations configured')
         }
 
-        // Get accounts
-        const accounts = accountIds.length > 0
-            ? db.select().from(schema.accounts).all().filter(a => accountIds.includes(a.id))
-            : [null] // null = anonymous browsing (no account)
+        // Get accounts (use only the campaign-selected IDs; defensively drop banned/suspended so we don't waste visits on dead accounts)
+        let accounts: any[] = []
+        if (accountIds.length > 0) {
+            const all = db.select().from(schema.accounts).all()
+            accounts = all.filter(a => accountIds.includes(a.id) && a.status !== 'banned' && a.status !== 'suspended')
+        }
+        if (accounts.length === 0) accounts = [null] // anonymous / no usable account
 
         // Get locations
         const allLocations = db.select().from(schema.locations).all().filter(l => locationIds.includes(l.id))
@@ -2370,6 +2410,7 @@ export class TrafficBoostEngine {
         this._completedVisits = campaign.completedVisits || 0
         this._failedVisits = campaign.failedVisits || 0
         this._currentRound = campaign.currentRound || 0
+        this.paused = false
 
         // Initialize thread details
         this.threadDetails = Array.from({ length: safeThreadCount }, (_, i) => ({
@@ -2392,6 +2433,7 @@ export class TrafficBoostEngine {
 
         // MAIN LOOP: keep feeding all remaining visit tasks until target attempts are reached
         while (!this.shouldStop && (completedVisits + failedVisits) < totalVisits) {
+                await this.waitWhilePaused()
                 currentRound++
                 this._currentRound = currentRound
 
@@ -2467,6 +2509,7 @@ export class TrafficBoostEngine {
                             const maxIdlePollsBeforeDone = 20
                             let idlePollCount = 0
                             while (!this.shouldStop) {
+                                await this.waitWhilePaused()
                                 const myIdx = taskIndex++
                                 if (myIdx >= visitTasks.length) {
                                     taskIndex = visitTasks.length
@@ -2482,6 +2525,7 @@ export class TrafficBoostEngine {
                                 idlePollCount = 0
 
                                 const task = visitTasks[myIdx]
+                                await this.waitWhilePaused()
                                 if (task.round > currentRound) {
                                     currentRound = task.round
                                     this._currentRound = currentRound
@@ -2620,10 +2664,13 @@ export class TrafficBoostEngine {
                                     // Ignore page monitor teardown errors.
                                 }
 
-                                // CLEAN-SLATE: Skip session save — ephemeral context is in-memory only.
-                                // No cookies, cache, or state is persisted between visits.
-                                // This ensures Google sees a completely new user each time.
-                                console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Clean-slate mode — session not saved (ephemeral context)`)
+                                // For ephemeral (no profilePath): skip save (in-memory only, clean-slate per visit).
+                                // For profilePath: persistent launchPersistentContext already writes live state to disk; we still close here (final stop may snapshot).
+                                if (profilePath) {
+                                    console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Persistent profile — close context (state lives in ${profilePath})`)
+                                } else {
+                                    console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Clean-slate mode — session not saved (ephemeral context)`)
+                                }
 
                                 try {
                                     await browserService.closeContext(contextId)
@@ -2638,10 +2685,13 @@ export class TrafficBoostEngine {
 
                             try {
                                 await this.runWithTimeout(async () => {
-                                    // CLEAN-SLATE: Traffic visits use ephemeral (in-memory) contexts.
-                                    // No persistent profile needed — zero disk I/O, zero SSD wear.
-                                    // Each visit gets a brand-new browser state (cookies, localStorage, cache).
-                                    profilePath = undefined
+                                    // Retrieve and self-heal task.account.profilePath (via ensureAccountProfile which computes, mkdirs, DB-updates if stale).
+                                    // Pass healed path into config; branch to createContext (persistent profile) vs createEphemeralContext (anonymous).
+                                    if (task.account) {
+                                        profilePath = this.ensureAccountProfile(task.account)
+                                    } else {
+                                        profilePath = undefined
+                                    }
 
                                     // Create browser context with account's profile + proxy
                                     // Try FProxy API first, then static proxies
@@ -2726,10 +2776,11 @@ export class TrafficBoostEngine {
                                     }
                                 }
 
-                                // EPHEMERAL CONFIG: No profilePath → 100% in-memory browser context
+                                // Config: pass profilePath (when present) so create* decides persistent vs ephemeral.
                                 const config: BrowserConfig = {
                                     headless: globalSettings.headless ?? false,
                                     proxy: proxyConfig,
+                                    ...(profilePath ? { profilePath } : {}),
                                 }
 
                                 // Update thread detail with proxy info
@@ -2738,11 +2789,15 @@ export class TrafficBoostEngine {
                                     proxyInfo: proxyInfoStr,
                                 }
 
-                                // Use ephemeral context: in-memory, zero disk I/O, fresh fingerprint per visit
+                                // Call createContext (if profilePath healed for account) else createEphemeralContext. Matches BrowserConfig.profilePath contract.
                                 contextId = await pRetry(
                                     async () => {
                                         try {
-                                            return await browserService.createEphemeralContext(config)
+                                            if (profilePath) {
+                                                return await browserService.createContext(config)
+                                            } else {
+                                                return await browserService.createEphemeralContext(config)
+                                            }
                                         } catch (error) {
                                             if (this.isBrowserContextClosedError(error)) {
                                                 this.threadDetails[threadIdx].currentAction = 'Browser disconnected - recreating context'
@@ -2813,6 +2868,58 @@ export class TrafficBoostEngine {
                                     if (watchdogTriggered) {
                                         throw new Error('VISIT_ABORTED_BY_WATCHDOG')
                                     }
+
+                                    // Restore session for selected account: prefer persistent profilePath (reused in ensure -> launchPersistent auto-loads prior login state).
+                                    // Fallback: use saved cookies blob (from login ctx.cookies) via addCookies for legacy/compat cases.
+                                    // Parse robust + BC (old string may be array or {cookies:[]}), filter valid shape, light normalize for google addCookies compat. Never log values.
+                                    if (task.account?.cookies) {
+                                        try {
+                                            const ctx = browserService.getContext(contextId!)
+                                            if (ctx) {
+                                                let ckRaw: any = []
+                                                try { ckRaw = JSON.parse(task.account.cookies || '[]') } catch {}
+                                                let ck: any[] = Array.isArray(ckRaw) ? ckRaw : (ckRaw && Array.isArray(ckRaw.cookies) ? ckRaw.cookies : [])
+                                                // Required by Playwright addCookies + filter garbage/expired; normalize sameSite/secure for cross-domain google
+                                                ck = ck.filter((c: any) => c && typeof c.name === 'string' && typeof c.value === 'string' && typeof c.domain === 'string' && typeof c.path === 'string')
+                                                    .map((c: any) => {
+                                                        let domain = c.domain
+                                                        if (domain && /google\.com$/i.test(domain) && !domain.startsWith('.')) domain = '.' + domain.replace(/^www\./i, '')
+                                                        const sameSite = (c.sameSite === 'None' || c.sameSite === 'Lax' || c.sameSite === 'Strict') ? c.sameSite : 'Lax'
+                                                        const secure = sameSite === 'None' ? true : (c.secure !== false)
+                                                        return { ...c, domain, sameSite, secure }
+                                                    })
+                                                if (ck.length > 0) {
+                                                    await ctx.addCookies(ck).catch((e: any) => { console.log(`[TrafficBoost] addCookies warn (non-fatal, ${ck.length} cookies) for account:`, e?.message?.slice(0, 120)) })
+                                                    this.recordAction(actionsPerformed, {
+                                                        action: 'account_session_restored',
+                                                        success: true,
+                                                        detail: task.account.email || String(task.account.id),
+                                                        threadId: threadIdx,
+                                                        timestamp: new Date().toISOString(),
+                                                    }, actionContext)
+                                                }
+                                            }
+                                        } catch { /* non-fatal: fall back to anonymous for this visit */ }
+                                    }
+
+                                    // VERIFY after profile/cookies load: if account was chosen (active) but still not detected logged-in, WARN clearly + record (audit visible to user).
+                                    // Do not block; run visit anon but reason is explicit so user knows to re-login or check profile. Reuses BrowserService.isGoogleLoggedIn (cookie-primary).
+                                    if (task.account) {
+                                        try {
+                                            const logged = await browserService.isGoogleLoggedIn(contextId!).catch(() => false)
+                                            if (!logged) {
+                                                console.warn(`[TrafficBoost] WARNING: Selected account ${task.account.email} (status active/cookies present) but isGoogleLoggedIn=false after context. Running visit ANONYMOUS. Re-login the account or verify profilePath.`)
+                                                this.recordAction(actionsPerformed, {
+                                                    action: 'account_session_verify_failed',
+                                                    success: false,
+                                                    detail: `${task.account.email || task.account.id} (ran anonymous)`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                            }
+                                        } catch { /* never break visit */ }
+                                    }
+
                                     stopPageMonitor = this.startThreadPageMonitor(threadIdx, page)
                                     await this.cleanupExtraTabsForThread(page, threadIdx, 'visit_start')
 
@@ -2841,8 +2948,8 @@ export class TrafficBoostEngine {
                                     }
 
                                     // Navigate to location - branch by traffic mode
-                                    if (campaign.trafficMode === 'organic' || campaign.trafficMode === 'web_seo') {
-                                        // ORGANIC OR WEB_SEO MODE
+                                    if (campaign.trafficMode === 'organic' || campaign.trafficMode === 'web_seo' || campaign.trafficMode === 'map_search') {
+                                        // ORGANIC / MAP_SEARCH / WEB_SEO MODE (keyword per-location round-robin)
                                         let searchKeywords: string[] = [task.location.name]
                                         if ((task.location as any).searchKeywords) {
                                             try {
@@ -2874,7 +2981,7 @@ export class TrafficBoostEngine {
                                             failedVisits,
                                             message: avoidGoogleSearchForThread
                                                 ? `Thread ${threadIdx + 1}: CAPTCHA cooldown active, skipping Google search for this visit`
-                                                : `Thread ${threadIdx + 1}: ${campaign.trafficMode === 'organic' ? 'Organic' : 'Web SEO'} search "${keyword}"`,
+                                                : `Thread ${threadIdx + 1}: ${campaign.trafficMode === 'organic' ? 'Organic' : campaign.trafficMode === 'map_search' ? 'SEO Map' : 'Web SEO'} search "${keyword}"`,
                                         }))
                                         if (avoidGoogleSearchForThread) {
                                             this.recordAction(actionsPerformed, {
@@ -2889,6 +2996,14 @@ export class TrafficBoostEngine {
 
                                         if (avoidGoogleSearchForThread && campaign.trafficMode === 'organic') {
                                             this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct map navigation'
+                                            await page.goto(task.location.url, {
+                                                waitUntil: 'commit',
+                                                timeout: 20000,
+                                            })
+                                            await HumanBehavior.randomDelay(1200, 2600)
+                                        } else if (avoidGoogleSearchForThread && campaign.trafficMode === 'map_search') {
+                                            // map_search cooldown: direct map URL (per spec, avoid Google search UI)
+                                            this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct map navigation (map_search)'
                                             await page.goto(task.location.url, {
                                                 waitUntil: 'commit',
                                                 timeout: 20000,
@@ -2960,6 +3075,49 @@ export class TrafficBoostEngine {
                                                 await HumanBehavior.randomDelay(1000, 3000)
                                             }
                                             // After organic discovery flow, we're on the map page -> continue to SEO actions below
+                                        } else if (campaign.trafficMode === 'map_search') {
+                                            // MAP_SEARCH MODE: open maps.google.com/maps, type keyword (round-robin), scroll feed max 15 cards, match by name/placeId, click to detail.
+                                            // On not found within limit -> fallback to direct URL. Then common path runs autonomous KPI agent (since !== 'web_seo').
+                                            const mapSearchFlow = new MapSearchFlow((status: string) => {
+                                                this.threadDetails[threadIdx].currentAction = status
+                                                this.sendStatus(this.buildStatus({
+                                                    campaignName: campaign.name,
+                                                    currentRound,
+                                                    completedVisits,
+                                                    totalVisits,
+                                                    failedVisits,
+                                                }))
+                                            })
+
+                                            const mapSearchResult = await mapSearchFlow.execute(page, keyword, {
+                                                name: task.location.name,
+                                                address: task.location.address,
+                                                placeId: task.location.placeId,
+                                                url: task.location.url,
+                                            }, !!task.account, (campaign.maxMapScroll ?? undefined))
+
+                                            // Log discovery actions with prefix
+                                            for (const a of mapSearchResult.actionsPerformed) {
+                                                this.recordAction(actionsPerformed, {
+                                                    action: `map_search_discovery:${a.action}`,
+                                                    success: a.success,
+                                                    source: 'map_search',
+                                                    detail: `Map search discovery: ${a.action}`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                            }
+
+                                            if (!mapSearchResult.foundMap) {
+                                                this.threadDetails[threadIdx].currentAction = 'Fallback: Direct navigation (map_search)'
+                                                console.log(`[TrafficBoost] MapSearchFlow did not find "${task.location.name}" within limit for "${keyword}", falling back to direct URL`)
+                                                await page.goto(task.location.url, {
+                                                    waitUntil: 'commit',
+                                                    timeout: 20000
+                                                })
+                                                await HumanBehavior.randomDelay(1000, 3000)
+                                            }
+                                            // On success or fallback we are on map page -> fall through to common consent/login/stabilize + autonomous KPI
                                         } else {
                                             // WEB SEO MODE
                                             let targetDomain = task.location.url
@@ -3056,6 +3214,43 @@ export class TrafficBoostEngine {
                                             actionContext,
                                             !!task.account
                                         )
+
+                                        // Direct mode: verify target identity (strong ID priority) before any KPI/boost actions.
+                                        // Per requirement: only run tăng chỉ số after confirmed; one safe re-goto fallback then proceed (bounded, no loop).
+                                        try {
+                                            const vLoc = {
+                                                name: task.location?.name || '',
+                                                placeId: task.location?.placeId,
+                                                address: task.location?.address,
+                                                url: task.location?.url || '',
+                                                cid: (task.location as any)?.cid,
+                                                featureHex: (task.location as any)?.featureHex,
+                                            }
+                                            let verified = await HumanBehavior.verifyOnTargetMap(page, vLoc as any).catch(() => false)
+                                            if (!verified) {
+                                                this.recordAction(actionsPerformed, {
+                                                    action: 'direct_target_verify_fallback',
+                                                    success: true,
+                                                    source: 'runtime',
+                                                    detail: `Re-nav to location.url after verify fail (${page.url()})`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                                await page.goto(task.location.url, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {})
+                                                await HumanBehavior.randomDelay(1200, 2800)
+                                                verified = await HumanBehavior.verifyOnTargetMap(page, vLoc as any).catch(() => false)
+                                            }
+                                            if (verified) {
+                                                this.recordAction(actionsPerformed, {
+                                                    action: 'direct_target_verified',
+                                                    success: true,
+                                                    source: 'map_identity',
+                                                    detail: `Target confirmed before boost`,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }, actionContext)
+                                            }
+                                        } catch { /* defensive: never block direct path */ }
                                     }
                                     await this.cleanupExtraTabsForThread(page, threadIdx, 'after_navigation')
                                     await this.handleGoogleLoginIfNeeded(
@@ -3449,6 +3644,7 @@ export class TrafficBoostEngine {
                                     message: `Thread ${threadIdx + 1}: Visit finished, starting next task immediately`,
                                 }))
                             }
+                            await this.waitWhilePaused()
                                 }).catch((queueError) => {
                                     console.error(`[TrafficBoost] Thread ${threadIdx + 1}: queue task crashed`, queueError)
                                 })
@@ -3552,6 +3748,7 @@ export class TrafficBoostEngine {
 
     async stopCampaign(): Promise<void> {
         this.shouldStop = true
+        this.paused = false
         this.running = false
         if (this.currentCampaignId) {
             const db = getDatabase()
@@ -3568,6 +3765,7 @@ export class TrafficBoostEngine {
         this.threadContextIds.clear()
         this.threadDetails = []
         this.currentQueueDepth = 0
+        fproxyService.stopAutoRotate()
         // Broadcast stopped status to UI
         this.sendStatus(this.buildStatus({
             isRunning: false,
@@ -3576,16 +3774,23 @@ export class TrafficBoostEngine {
     }
 
     async pauseCampaign(): Promise<void> {
-        this.shouldStop = true
-        this.running = false
+        // Do NOT set shouldStop (would terminate); use paused flag for freeze at safe points between visits.
+        // Close browser contexts to save resources (per spec: keep full progress/counts/indices in memory+DB).
+        // Persist counters so resume (or app reopen + resume) continues exactly: visits, round, keyword/account order via logs+DB.
+        this.paused = true
+        // keep running=true so monitor treats as active (paused) control session
         if (this.currentCampaignId) {
             const db = getDatabase()
             db.update(schema.trafficCampaigns)
-                .set({ status: 'paused' })
+                .set({
+                    status: 'paused',
+                    completedVisits: this._completedVisits,
+                    failedVisits: this._failedVisits,
+                    currentRound: this._currentRound,
+                })
                 .where(eq(schema.trafficCampaigns.id, this.currentCampaignId))
                 .run()
         }
-        // Immediately close all active browser contexts
         for (const contextId of Array.from(this.activeContexts.keys())) {
             browserService.closeContext(contextId).catch(err => console.error('[TrafficBoost] Error closing context on pause:', err))
         }
@@ -3593,10 +3798,38 @@ export class TrafficBoostEngine {
         this.threadContextIds.clear()
         this.threadDetails = []
         this.currentQueueDepth = 0
-        // Broadcast paused status to UI
+        // Proxy rotation: freeze remaining (app-controlled) so pause time not counted toward next rotate
+        fproxyService.pauseAutoRotate()
+        // Broadcast: isRunning remains true, consumers use isPaused for UI state (Resume button etc)
         this.sendStatus(this.buildStatus({
-            isRunning: false,
             message: '⏸ Campaign paused',
+        }))
+    }
+
+    async resumeCampaign(): Promise<void> {
+        // If engine not currently controlling (e.g. app was closed while paused), recover the paused campaign from DB and start (it will load persisted counters/round/logs-skip for exact resume point)
+        if (!this.running || !this.currentCampaignId) {
+            const db = getDatabase()
+            const pausedCamp = db.select().from(schema.trafficCampaigns)
+                .where(eq(schema.trafficCampaigns.status, 'paused')).get()
+            if (pausedCamp) {
+                // startCampaign will load _completed/_currentRound from row, rebuild remaining tasks, run
+                await this.startCampaign(pausedCamp.id).catch(e => console.error('[TrafficBoost] resume start error', e))
+            }
+            return
+        }
+        this.paused = false
+        if (this.currentCampaignId) {
+            const db = getDatabase()
+            db.update(schema.trafficCampaigns)
+                .set({ status: 'running' })
+                .where(eq(schema.trafficCampaigns.id, this.currentCampaignId))
+                .run()
+        }
+        // Proxy: resume with freeze-remaining restore + refresh-if-expired (provider safeguard)
+        fproxyService.resumeAutoRotate()
+        this.sendStatus(this.buildStatus({
+            message: '▶ Campaign resumed',
         }))
     }
 

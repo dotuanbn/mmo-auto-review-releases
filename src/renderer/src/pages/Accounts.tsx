@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { useAccountStore, useProxyStore } from '../stores'
 import {
     UserPlus,
@@ -8,7 +9,6 @@ import {
     MoreVertical,
     Edit,
     LogIn,
-    Eye,
     CheckCircle,
     XCircle,
     Loader2,
@@ -80,7 +80,7 @@ function AccountsTab() {
     const {
         accounts, stats, loading, error,
         fetchAccounts, fetchStats, addAccount, deleteAccount, updateAccount,
-        importAccounts, testLogin, loginVisible, checkAllPending
+        importAccounts, testLogin, checkLiveDie, checkAllPending
     } = useAccountStore()
     const [selectedIds, setSelectedIds] = useState<Set<number | string>>(new Set())
     const [showAddModal, setShowAddModal] = useState(false)
@@ -88,12 +88,20 @@ function AccountsTab() {
     const [showEditModal, setShowEditModal] = useState(false)
     const [editingAccount, setEditingAccount] = useState<any>(null)
     const [searchQuery, setSearchQuery] = useState('')
-    const [newAccount, setNewAccount] = useState({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', loginType: 'auto' as 'auto' | 'manual' })
+    const [newAccount, setNewAccount] = useState({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' as 'auto' | 'manual' })
     const [importText, setImportText] = useState('')
     const [openDropdown, setOpenDropdown] = useState<number | null>(null)
+    const [anchorRect, setAnchorRect] = useState<{ top: number; bottom: number; left: number; right: number } | null>(null)
     const [loginStates, setLoginStates] = useState<Record<number, { status: LoginStatus; message?: string }>>({})
     const [checkingAll, setCheckingAll] = useState(false)
-    const dropdownRef = useRef<HTMLDivElement | null>(null)
+    const menuRef = useRef<HTMLDivElement | null>(null)
+
+    // Normalize short email (no @) -> @gmail.com before save/login. Applied for add + import.
+    const normalizeEmail = (email: string): string => {
+        const t = (email || '').trim()
+        if (!t) return t
+        return t.includes('@') ? t : `${t}@gmail.com`
+    }
 
     useEffect(() => {
         fetchAccounts()
@@ -102,13 +110,34 @@ function AccountsTab() {
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
-            if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+            if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
                 setOpenDropdown(null)
+                setAnchorRect(null)
             }
         }
         document.addEventListener('mousedown', handleClickOutside)
         return () => document.removeEventListener('mousedown', handleClickOutside)
     }, [])
+
+    // Close portal menu on scroll/resize (capture to hit nested scrollers) or Esc. Position is viewport-fixed so stale rects on scroll are avoided by close.
+    useEffect(() => {
+        if (openDropdown === null) return
+        const close = () => {
+            setOpenDropdown(null)
+            setAnchorRect(null)
+        }
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') close()
+        }
+        window.addEventListener('scroll', close, true)
+        window.addEventListener('resize', close)
+        document.addEventListener('keydown', onKey)
+        return () => {
+            window.removeEventListener('scroll', close, true)
+            window.removeEventListener('resize', close)
+            document.removeEventListener('keydown', onKey)
+        }
+    }, [openDropdown])
 
     const filteredAccounts = accounts.filter(acc =>
         acc.email.toLowerCase().includes(searchQuery.toLowerCase())
@@ -116,23 +145,110 @@ function AccountsTab() {
 
     const handleAddAccount = async () => {
         if (!newAccount.email || !newAccount.password) return
-        await addAccount(newAccount)
-        setNewAccount({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', loginType: 'auto' })
+        const payload = { ...newAccount, email: normalizeEmail(newAccount.email) }
+        const created: any = await addAccount(payload as any)
+        setNewAccount({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' })
         setShowAddModal(false)
+
+        // Post-add auto-trigger per loginType (reuses existing testLogin / openManualLogin flows + loginStates UI)
+        // Non-blocking: modal closed, list refreshed inside addAccount; bg login updates status + temp loginStates.
+        if (created && created.id) {
+            const id: number = created.id
+            const lt: 'auto' | 'manual' = created.loginType || 'auto'
+            if (lt === 'auto') {
+                setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Đang đăng nhập...' } }))
+                try {
+                    const result = await testLogin(id)
+                    setLoginStates(prev => ({
+                        ...prev,
+                        [id]: { status: result?.success ? 'success' : 'failed', message: result?.message }
+                    }))
+                    setTimeout(() => {
+                        setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                    }, 5000)
+                } catch {
+                    setLoginStates(prev => ({ ...prev, [id]: { status: 'failed', message: 'Lỗi auto login' } }))
+                    setTimeout(() => {
+                        setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                    }, 5000)
+                }
+            } else {
+                setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Dang mo browser...' } }))
+                try {
+                    const result = await window.electronAPI.accounts.openManualLogin(id)
+                    if (result.success) {
+                        setLoginStates(prev => ({
+                            ...prev,
+                            [id]: { status: 'logging_in', message: 'Browser da mo - hay dang nhap!' }
+                        }))
+                        // Watch for bg detect (poll + isGoogleLoggedIn + close in main): refetch until status=active (from store), flip loginStates success so pill shows 'active' immediately.
+                        const watchForActive = async (attempts = 0) => {
+                            if (attempts > 120) return // ~6min safety
+                            try {
+                                await fetchAccounts()
+                                const list = (useAccountStore as any).getState ? (useAccountStore as any).getState().accounts : accounts
+                                const acc = (list || []).find((a: any) => a && a.id === id)
+                                if (acc && acc.status === 'active') {
+                                    setLoginStates(prev => ({ ...prev, [id]: { status: 'success', message: 'Dang nhap thu cong thanh cong!' } }))
+                                    setTimeout(() => {
+                                        setLoginStates(prev => { const n = { ...prev }; delete n[id]; return n })
+                                    }, 4500)
+                                    return
+                                }
+                            } catch {}
+                            setTimeout(() => watchForActive(attempts + 1), 3000)
+                        }
+                        watchForActive(0)
+                    } else {
+                        setLoginStates(prev => ({
+                            ...prev,
+                            [id]: { status: 'failed', message: result.message }
+                        }))
+                        setTimeout(() => {
+                            setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                        }, 5000)
+                    }
+                } catch {
+                    setLoginStates(prev => ({
+                        ...prev,
+                        [id]: { status: 'failed', message: 'Loi mo browser' }
+                    }))
+                    setTimeout(() => {
+                        setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+                    }, 5000)
+                }
+            }
+        }
     }
 
     const handleImport = async () => {
         if (!importText.trim()) return
         const lines = importText.split('\n').filter(l => l.trim())
-        const accountsToImport = lines.map(line => {
-            const parts = line.split(/[:|,;]/).map(p => p.trim())
-            return {
-                email: parts[0] || '',
-                password: parts[1] || '',
-                recoveryEmail: parts[2],
-                recoveryPhone: parts[3],
+        const accountsToImport: any[] = []
+        let hasHeader = false
+        const first = lines[0]?.toLowerCase() || ''
+        if (first.includes('email') && first.includes('pass')) { hasHeader = true }
+
+        for (let i = hasHeader ? 1 : 0; i < lines.length; i++) {
+            const line = lines[i]
+            // Support header-aware or delimited: , ; : | tab ; also allow "email,pass,2fa,login"
+            const parts = line.split(/[:|,;\t]/).map(p => p.trim()).filter(Boolean)
+            if (parts.length < 2) continue
+            const entry: any = {
+                email: normalizeEmail(parts[0]),  // normalize here for import CSV too
+                password: parts[1],
+                recoveryEmail: parts[2] || undefined,
+                twoFactorSecret: parts[3] || undefined,
+                loginType: 'auto' as const,
             }
-        }).filter(a => a.email && a.password)
+            // Detect if 4th/5th looks like login type
+            const last = (parts[4] || parts[3] || '').toLowerCase()
+            if (last === 'manual' || last === 'auto') {
+                entry.loginType = last as 'auto' | 'manual'
+                if (parts[3] && last !== parts[3].toLowerCase()) entry.twoFactorSecret = parts[3]
+            }
+            if (entry.email && entry.password) accountsToImport.push(entry)
+        }
 
         const count = await importAccounts(accountsToImport)
         alert(t('accounts.importSuccess').replace('{count}', String(count)))
@@ -152,7 +268,7 @@ function AccountsTab() {
     const handleEdit = (account: any) => {
         setEditingAccount({ ...account })
         setShowEditModal(true)
-        setOpenDropdown(null)
+        closeDropdown()
     }
 
     const handleSaveEdit = async () => {
@@ -162,6 +278,7 @@ function AccountsTab() {
             password: editingAccount.password,
             recoveryEmail: editingAccount.recoveryEmail,
             recoveryPhone: editingAccount.recoveryPhone,
+            twoFactorSecret: editingAccount.twoFactorSecret,
             loginType: editingAccount.loginType,
             status: editingAccount.status,
         })
@@ -172,11 +289,11 @@ function AccountsTab() {
     const handleDelete = async (id: number) => {
         if (!confirm(t('accounts.deleteConfirm'))) return
         await deleteAccount(id)
-        setOpenDropdown(null)
+        closeDropdown()
     }
 
     const handleTestLogin = async (id: number) => {
-        setOpenDropdown(null)
+        closeDropdown()
         setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in' } }))
         const result = await testLogin(id)
         setLoginStates(prev => ({
@@ -188,21 +305,8 @@ function AccountsTab() {
         }, 5000)
     }
 
-    const handleLoginVisible = async (id: number) => {
-        setOpenDropdown(null)
-        setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: t('accounts.openingBrowser') } }))
-        const result = await loginVisible(id)
-        setLoginStates(prev => ({
-            ...prev,
-            [id]: { status: result.success ? 'success' : 'failed', message: result.message }
-        }))
-        setTimeout(() => {
-            setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
-        }, 5000)
-    }
-
     const handleOpenManualLogin = async (id: number) => {
-        setOpenDropdown(null)
+        closeDropdown()
         setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Dang mo browser...' } }))
         try {
             const result = await window.electronAPI.accounts.openManualLogin(id)
@@ -211,6 +315,24 @@ function AccountsTab() {
                     ...prev,
                     [id]: { status: 'logging_in', message: 'Browser da mo - hay dang nhap!' }
                 }))
+                // Watch for bg detect (dropdown manual open path)
+                const watchForActive = async (attempts = 0) => {
+                    if (attempts > 120) return
+                    try {
+                        await fetchAccounts()
+                        const list = (useAccountStore as any).getState ? (useAccountStore as any).getState().accounts : accounts
+                        const acc = (list || []).find((a: any) => a && a.id === id)
+                        if (acc && acc.status === 'active') {
+                            setLoginStates(prev => ({ ...prev, [id]: { status: 'success', message: 'Dang nhap thu cong thanh cong!' } }))
+                            setTimeout(() => {
+                                setLoginStates(prev => { const n = { ...prev }; delete n[id]; return n })
+                            }, 4500)
+                            return
+                        }
+                    } catch {}
+                    setTimeout(() => watchForActive(attempts + 1), 3000)
+                }
+                watchForActive(0)
             } else {
                 setLoginStates(prev => ({
                     ...prev,
@@ -229,6 +351,20 @@ function AccountsTab() {
                 setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
             }, 5000)
         }
+    }
+
+    const handleCheck = async (id: number) => {
+        closeDropdown()
+        setLoginStates(prev => ({ ...prev, [id]: { status: 'logging_in', message: 'Dang kiem tra...' } }))
+        const result = await checkLiveDie(id)
+        const ok = (result as any)?.alive
+        setLoginStates(prev => ({
+            ...prev,
+            [id]: { status: ok ? 'success' : 'failed', message: ok ? 'Live' : ((result as any)?.error || 'Die') }
+        }))
+        setTimeout(() => {
+            setLoginStates(prev => { const next = { ...prev }; delete next[id]; return next })
+        }, 4500)
     }
 
     const handleCheckAll = async () => {
@@ -259,6 +395,35 @@ function AccountsTab() {
             case 'failed': return <XCircle className="h-4 w-4 text-rose-500" />
             default: return null
         }
+    }
+
+    // Portal menu position calc: right-aligned by default (right edge to button right), switch to left if near viewport right edge.
+    // Flip above (bung lên) if near bottom of viewport. Uses fixed + viewport rects to escape all overflow-hidden containers (DataTable, AppShell etc).
+    const getMenuPosition = (rect: { top: number; bottom: number; left: number; right: number }) => {
+        const MENU_W = 208
+        const MENU_H_EST = 260
+        const GAP = 4
+        const PAD = 8
+        const vw = window.innerWidth
+        const vh = window.innerHeight
+
+        let left = rect.right - MENU_W   // right-aligned
+        let top = rect.bottom + GAP
+
+        if (left + MENU_W > vw - PAD) {
+            left = Math.max(PAD, rect.left)  // left-align fallback near right edge
+        }
+        if (top + MENU_H_EST > vh - PAD) {
+            top = Math.max(PAD, rect.top - MENU_H_EST - GAP)  // open upwards near bottom
+        }
+        if (top < PAD) top = rect.bottom + GAP
+        if (left < PAD) left = PAD
+        return { top, left }
+    }
+
+    const closeDropdown = () => {
+        setOpenDropdown(null)
+        setAnchorRect(null)
     }
 
     const columns = [
@@ -298,11 +463,17 @@ function AccountsTab() {
         {
             key: 'lastUsed',
             header: t('accounts.lastUsed'),
-            render: (account: any) => (
-                <span className="text-sm text-[#908a9e]">
-                    {account.lastUsed ? new Date(account.lastUsed).toLocaleDateString() : t('accounts.never')}
-                </span>
-            ),
+            render: (account: any) => {
+                const lu = account.lastUsed
+                let txt = t('accounts.never') || 'Chua dung'
+                if (lu) {
+                    try {
+                        const d = new Date(lu)
+                        txt = d.toLocaleDateString('vi-VN') + ' ' + d.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })
+                    } catch { txt = String(lu) }
+                }
+                return <span className="text-sm text-[#908a9e]">{txt}</span>
+            },
         },
         {
             key: 'actions',
@@ -310,44 +481,22 @@ function AccountsTab() {
             width: '60px',
             align: 'center' as const,
             render: (account: any) => (
-                <div className="relative" ref={openDropdown === account.id ? dropdownRef : null}>
-                    <IconButton
-                        icon={MoreVertical}
-                        label={t('accounts.accountActions')}
-                        onClick={(e) => { e.stopPropagation(); setOpenDropdown(openDropdown === account.id ? null : account.id) }}
-                    />
-                    {openDropdown === account.id && (
-                        <div className="absolute right-0 bottom-full mb-1 z-50 w-52 overflow-hidden rounded-[16px] border border-[#e9e4f2] bg-white shadow-[0_20px_48px_rgba(27,24,38,0.18)]">
-                            <button onClick={() => handleEdit(account)}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors">
-                                <Edit className="h-4 w-4" /> {t('accounts.editAccount')}
-                            </button>
-                            <button onClick={() => handleTestLogin(account.id)}
-                                disabled={loginStates[account.id]?.status === 'logging_in'}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors disabled:opacity-50">
-                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-                                {t('accounts.testLogin')}
-                            </button>
-                            <button onClick={() => handleLoginVisible(account.id)}
-                                disabled={loginStates[account.id]?.status === 'logging_in'}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 hover:bg-emerald-50 transition-colors disabled:opacity-50">
-                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
-                                {t('accounts.loginVisible')}
-                            </button>
-                            <button onClick={() => handleOpenManualLogin(account.id)}
-                                disabled={loginStates[account.id]?.status === 'logging_in'}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-amber-600 hover:bg-amber-50 transition-colors disabled:opacity-50">
-                                {loginStates[account.id]?.status === 'logging_in' ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-                                Dang nhap thu cong
-                            </button>
-                            <Divider />
-                            <button onClick={() => handleDelete(account.id)}
-                                className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 hover:bg-rose-50 transition-colors">
-                                <Trash2 className="h-4 w-4" /> {t('accounts.deleteAccount')}
-                            </button>
-                        </div>
-                    )}
-                </div>
+                <IconButton
+                    icon={MoreVertical}
+                    label={t('accounts.accountActions')}
+                    onClick={(e) => {
+                        e.stopPropagation()
+                        const id = account.id
+                        if (openDropdown === id) {
+                            closeDropdown()
+                            return
+                        }
+                        const btn = e.currentTarget as HTMLElement
+                        const r = btn.getBoundingClientRect()
+                        setOpenDropdown(id)
+                        setAnchorRect({ top: r.top, bottom: r.bottom, left: r.left, right: r.right })
+                    }}
+                />
             ),
         },
     ]
@@ -430,13 +579,17 @@ function AccountsTab() {
                         <TextInput value={newAccount.recoveryEmail} onChange={(v) => setNewAccount({ ...newAccount, recoveryEmail: v })} placeholder="recovery@gmail.com" />
                     </div>
                     <div>
+                        <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.twoFactorSecret', 'Mã 2FA (TOTP secret)')} ({t('common.optional')})</label>
+                        <TextInput value={newAccount.twoFactorSecret} onChange={(v) => setNewAccount({ ...newAccount, twoFactorSecret: v })} placeholder="JBSWY3DPEHPK3PXP" />
+                    </div>
+                    <div>
                         <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.loginType', 'Loai dang nhap')}</label>
                         <Select
                             value={newAccount.loginType}
                             onChange={(v) => setNewAccount({ ...newAccount, loginType: v as 'auto' | 'manual' })}
                             options={[
-                                { value: 'auto', label: 'Tu dong (AI)' },
-                                { value: 'manual', label: 'Thu cong' },
+                                { value: 'auto', label: 'Tu dong (AI - tu go + TOTP)' },
+                                { value: 'manual', label: 'Thu cong (mo browser cho user)' },
                             ]}
                         />
                     </div>
@@ -466,13 +619,17 @@ function AccountsTab() {
                             <TextInput value={editingAccount.password} onChange={(v) => setEditingAccount({ ...editingAccount, password: v })} type="password" />
                         </div>
                         <div>
+                            <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.twoFactorSecret', 'Mã 2FA (TOTP secret)')} ({t('common.optional')})</label>
+                            <TextInput value={editingAccount.twoFactorSecret || ''} onChange={(v) => setEditingAccount({ ...editingAccount, twoFactorSecret: v })} />
+                        </div>
+                        <div>
                             <label className="mb-1 block text-sm font-medium text-[#5f5a6d]">{t('accounts.loginType', 'Loai dang nhap')}</label>
                             <Select
                                 value={editingAccount.loginType || 'auto'}
                                 onChange={(v) => setEditingAccount({ ...editingAccount, loginType: v })}
                                 options={[
-                                    { value: 'auto', label: 'Tu dong (AI)' },
-                                    { value: 'manual', label: 'Thu cong' },
+                                    { value: 'auto', label: 'Tu dong (AI - tu go + TOTP)' },
+                                    { value: 'manual', label: 'Thu cong (mo browser cho user)' },
                                 ]}
                             />
                         </div>
@@ -509,16 +666,70 @@ function AccountsTab() {
             >
                 <div className="space-y-4">
                     <p className="text-sm text-[#908a9e]">
-                        {t('accounts.importFormat')} <code className="rounded bg-[#f4f1fa] px-1.5 py-0.5 text-xs font-medium text-[#735bd6]">{t('accounts.importFormatCode')}</code> {t('accounts.importFormatSuffix')}
+                        {t('accounts.importFormat')} <code className="rounded bg-[#f4f1fa] px-1.5 py-0.5 text-xs font-medium text-[#735bd6]">email,password,2fa_secret,login_type</code> {t('accounts.importFormatSuffix')}
+                        <br />Hỗ trợ header (email,password,2fa,login_type), dấu phân cách :,; | tab. 2fa_secret = TOTP secret (base32). login_type=auto|manual.
                     </p>
                     <textarea
                         value={importText}
                         onChange={(e) => setImportText(e.target.value)}
                         className="h-48 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 py-3 font-mono text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
-                        placeholder={"email1@gmail.com:password1\nemail2@gmail.com:password2"}
+                        placeholder={"email1@gmail.com:password1:2faSECRETBASE32:auto\nemail2@gmail.com,password2,,manual\nemail,password,2FASECRET"}
                     />
                 </div>
             </Modal>
+
+            {/* Portal dropdown menu (fixed to body) - escapes DataTable overflow-hidden + AppShell scroll containers.
+                 Position computed from trigger rect; right-aligned + upward flip near edges. */}
+            {openDropdown !== null && anchorRect && createPortal(
+                <div
+                    ref={menuRef}
+                    style={{
+                        position: 'fixed',
+                        ...getMenuPosition(anchorRect),
+                        zIndex: 99999,
+                    } as React.CSSProperties}
+                    className="w-52 overflow-hidden rounded-[16px] border border-[#e9e4f2] bg-white shadow-[0_20px_48px_rgba(27,24,38,0.18)]"
+                    onClick={(e) => e.stopPropagation()}
+                >
+                    {(() => {
+                        const account = accounts.find((a: any) => a.id === openDropdown)
+                        if (!account) return null
+                        const isLogging = loginStates[account.id]?.status === 'logging_in'
+                        return (
+                            <>
+                                <button onClick={() => handleEdit(account)}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors">
+                                    <Edit className="h-4 w-4" /> {t('accounts.editAccount')}
+                                </button>
+                                <button onClick={() => handleTestLogin(account.id)}
+                                    disabled={isLogging}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors disabled:opacity-50">
+                                    {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+                                    {account.loginType === 'manual' ? 'Thu cong (dung manual)' : t('accounts.testLogin')}
+                                </button>
+                                <button onClick={() => handleOpenManualLogin(account.id)}
+                                    disabled={isLogging}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-amber-600 hover:bg-amber-50 transition-colors disabled:opacity-50">
+                                    {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+                                    {t('accounts.manualLogin', 'Dang nhap thu cong')}
+                                </button>
+                                <button onClick={() => handleCheck(account.id)}
+                                    disabled={isLogging}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 hover:bg-emerald-50 transition-colors disabled:opacity-50">
+                                    {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                                    {t('accounts.checkAccount', 'Kiem tra')}
+                                </button>
+                                <Divider />
+                                <button onClick={() => handleDelete(account.id)}
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 hover:bg-rose-50 transition-colors">
+                                    <Trash2 className="h-4 w-4" /> {t('accounts.deleteAccount')}
+                                </button>
+                            </>
+                        )
+                    })()}
+                </div>,
+                document.body
+            )}
         </>
     )
 }

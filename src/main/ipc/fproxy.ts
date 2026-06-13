@@ -20,7 +20,7 @@ export function registerFProxyHandlers() {
         return fproxyService.getProxyInfo()
     })
 
-    // Test proxy connection
+    // Test proxy connection (runtime proxy via browser)
     ipcMain.handle('fproxy:test', async () => {
         const proxy = await fproxyService.getProxyForBrowser()
         if (!proxy) return { success: false, message: 'No API key or proxy unavailable' }
@@ -65,5 +65,10 @@ export function registerFProxyHandlers() {
                 await browserService.closeContext(contextId).catch(() => { /* ignore */ })
             }
         }
+    })
+
+    // Test proxy API config itself (Settings): call API endpoint, parse, + live connect test via returned proxy (~10s)
+    ipcMain.handle('fproxy:testApi', async () => {
+        return fproxyService.testApiConnection()
     })
 }

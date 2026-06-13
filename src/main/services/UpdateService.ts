@@ -69,8 +69,9 @@ class UpdateService {
             error: undefined,
         }
 
-        autoUpdater.autoDownload = false
-        autoUpdater.autoInstallOnAppQuit = false
+        const isAutoMode = this.getUpdateMode() === 'auto'
+        autoUpdater.autoDownload = isAutoMode
+        autoUpdater.autoInstallOnAppQuit = isAutoMode
 
         autoUpdater.on('checking-for-update', () => {
             this.state = {
@@ -98,6 +99,10 @@ class UpdateService {
                 checkedAt: new Date().toISOString(),
             }
             this.broadcast()
+            // AUTO: immediately download in background. MANUAL: only notify (user clicks "Cập nhật ngay")
+            if (this.getUpdateMode() === 'auto') {
+                this.downloadUpdate().catch(() => {})
+            }
         })
 
         autoUpdater.on('update-not-available', (info) => {
@@ -180,6 +185,11 @@ class UpdateService {
             }
         }
 
+        // Re-apply current mode flags (user may have flipped updateMode in Settings without restart)
+        const isAuto = this.getUpdateMode() === 'auto'
+        autoUpdater.autoDownload = isAuto
+        autoUpdater.autoInstallOnAppQuit = isAuto
+
         try {
             await autoUpdater.checkForUpdates()
         } catch (error: any) {
@@ -207,6 +217,11 @@ class UpdateService {
                 error: 'No available update to download',
             }
         }
+
+        // Re-apply mode (manual path uses explicit download)
+        const isAuto = this.getUpdateMode() === 'auto'
+        autoUpdater.autoDownload = isAuto
+        autoUpdater.autoInstallOnAppQuit = isAuto
 
         try {
             this.state = {
@@ -309,6 +324,15 @@ class UpdateService {
         return { enabled: true }
     }
 
+    private getUpdateMode(): 'auto' | 'manual' {
+        try {
+            const s = loadSettings()
+            return (s.updateMode === 'auto' ? 'auto' : 'manual')
+        } catch {
+            return 'manual'
+        }
+    }
+
     private isAnyCampaignRunning(): boolean {
         try {
             if (trafficBoostEngine.isRunning()) {
@@ -364,8 +388,9 @@ class UpdateService {
     }
 
     private scheduleStartupAutoCheck(): void {
-        const settings = loadSettings()
-        if (settings.autoUpdate === false) {
+        // Only auto-check + (auto DL if mode allows) on startup when updateMode='auto'. Manual: user must click "Kiểm tra cập nhật"
+        const mode = this.getUpdateMode()
+        if (mode !== 'auto') {
             return
         }
 

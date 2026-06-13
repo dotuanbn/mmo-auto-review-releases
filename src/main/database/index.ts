@@ -234,6 +234,7 @@ function createTables() {
       name TEXT NOT NULL,
       traffic_mode TEXT NOT NULL DEFAULT 'direct',
       search_keywords TEXT,
+      max_map_scroll INTEGER NOT NULL DEFAULT 15,
       account_ids TEXT NOT NULL,
       location_ids TEXT NOT NULL,
       threads_count INTEGER NOT NULL DEFAULT 1,
@@ -280,6 +281,8 @@ function createTables() {
       place_id TEXT,
       address TEXT,
       url TEXT NOT NULL,
+      cid TEXT,
+      feature_hex TEXT,
       phone TEXT,
       website TEXT,
       category TEXT,
@@ -488,6 +491,10 @@ function runMigrations() {
       console.log('Migration: Adding ai_auto_control to traffic_campaigns table')
       sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN ai_auto_control INTEGER NOT NULL DEFAULT 0")
     }
+    if (!tcInfo.some((col: any) => col.name === 'max_map_scroll')) {
+      console.log('Migration: Adding max_map_scroll to traffic_campaigns table')
+      sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN max_map_scroll INTEGER NOT NULL DEFAULT 15")
+    }
 
     // Agent knowledge table migration + indexes
     sqlite.exec(`
@@ -572,6 +579,17 @@ function runMigrations() {
     if (!locInfoMigrate.some((col: any) => col.name === 'website')) {
       console.log('Migration: Adding website to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN website TEXT')
+    }
+
+    // Strong map identity columns for target verification (placeId already existed; add cid + feature_hex)
+    const locInfo2 = sqlite.prepare("PRAGMA table_info(locations)").all() as any[]
+    if (!locInfo2.some((col: any) => col.name === 'cid')) {
+      console.log('Migration: Adding cid to locations table')
+      sqlite.exec('ALTER TABLE locations ADD COLUMN cid TEXT')
+    }
+    if (!locInfo2.some((col: any) => col.name === 'feature_hex')) {
+      console.log('Migration: Adding feature_hex to locations table')
+      sqlite.exec('ALTER TABLE locations ADD COLUMN feature_hex TEXT')
     }
 
     console.log('Database migrations completed')

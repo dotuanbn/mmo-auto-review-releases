@@ -220,7 +220,27 @@ export class BrowserService {
         return profilesPath
     }
 
+    private cleanChromeLockFiles(profilePath: string): void {
+        if (!existsSync(profilePath)) return
+        // Stale singleton/lock files from crashed Chrome or prior launch cause "context closed" immediately on next launchPersistentContext
+        const lockNames = ['SingletonLock', 'SingletonCookie', 'LOCK', 'LOCK~', 'LOCK.bak']
+        for (const name of lockNames) {
+            const p = join(profilePath, name)
+            try {
+                if (existsSync(p)) {
+                    rmSync(p, { force: true })
+                    logProxy(`[BrowserService] Removed stale Chrome lock: ${name}`)
+                }
+            } catch {
+                // Locked by live Chrome or permission — ignore, launch will surface real conflict if any
+            }
+        }
+    }
+
     private prepareProfileDirectory(profilePath: string, cleanProfileOnStart: boolean): string {
+        // Always attempt stale lock recovery first (critical for account profile reuse after crash/other Chrome)
+        this.cleanChromeLockFiles(profilePath)
+
         if (cleanProfileOnStart && existsSync(profilePath)) {
             rmSync(profilePath, { recursive: true, force: true })
         }
@@ -507,6 +527,50 @@ export class BrowserService {
             trackedPageCount: this.pages.size,
             totalTabCount,
             timestamp: new Date().toISOString(),
+        }
+    }
+
+    // Reliable Google login detection (STRICT): true ONLY if BOTH strong auth cookie groups present.
+    // - SAPISID group: 'SAPISID' OR '__Secure-1PSAPISID' (API auth, only after real sign-in)
+    // - SID group: 'SID' OR '__Secure-1PSID' (main session)
+    // Cookies must be on .google.com domain AND have non-empty value.
+    // HSID/SSID/APISID/NID/CONSENT or single group alone are NOT sufficient (appear early/mid-flow).
+    // Used by manual/auto login, challenge loops, TrafficBoost verify, checkLiveDie.
+    // Never logs cookie values. Concise confirm log only.
+    private hasStrongGoogleAuthCookies(cookies: any[]): boolean {
+        if (!Array.isArray(cookies) || cookies.length === 0) return false
+        const gCookies = cookies.filter((c: any) =>
+            c &&
+            typeof c.domain === 'string' &&
+            (c.domain === '.google.com' || c.domain.endsWith('.google.com') || c.domain.includes('google.com')) &&
+            c.value && String(c.value).trim().length > 0
+        )
+        if (gCookies.length === 0) return false
+        const names = new Set(gCookies.map((c: any) => c.name))
+        const hasSapisid = names.has('SAPISID') || names.has('__Secure-1PSAPISID')
+        const hasSid = names.has('SID') || names.has('__Secure-1PSID')
+        return hasSapisid && hasSid
+    }
+
+    async isGoogleLoggedIn(contextId?: number, context?: BrowserContext): Promise<boolean> {
+        try {
+            let ctx = context
+            if (!ctx && typeof contextId === 'number') {
+                ctx = this.contexts.get(contextId)
+            }
+            if (!ctx) return false
+
+            const ck = await ctx.cookies().catch(() => [])
+            if (this.hasStrongGoogleAuthCookies(ck)) {
+                console.log('[BrowserService] login confirmed (SAPISID+SID present)')
+                return true
+            }
+
+            // No light URL/avatar supplement: isGoogleLoggedIn returns true ONLY on the strict cookie AND above.
+            // (myaccount URL is secondary signal only in callers; still gated by this cookie check.)
+            return false
+        } catch {
+            return false
         }
     }
 

@@ -60,6 +60,7 @@ const DEFAULT_SETTINGS: Record<string, any> = {
 
     // App
     autoUpdate: true,
+    updateMode: 'manual', // 'auto' | 'manual' - manual default for safety (user explicit control over download/install)
 
     // Runtime Policy V2
     captchaMode: 'hybrid',

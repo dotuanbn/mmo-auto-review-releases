@@ -33,6 +33,7 @@ export class CampaignService {
         delayMin?: number
         delayMax?: number
         maxReviewsPerAccountPerDay?: number
+        maxMapScroll?: number // traffic-only; accepted for interface completeness (ignored for review campaigns)
     }): Promise<Campaign> {
         const db = getDatabase()
         const result = db.insert(schema.campaigns).values({
@@ -56,7 +57,7 @@ export class CampaignService {
     }
 
     // Update campaign
-    async update(id: number, data: Partial<Campaign>): Promise<Campaign | undefined> {
+    async update(id: number, data: Partial<Campaign> & { maxMapScroll?: number }): Promise<Campaign | undefined> {
         const db = getDatabase()
         const result = db.update(schema.campaigns)
             .set(data)

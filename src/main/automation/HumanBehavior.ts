@@ -1,4 +1,5 @@
 import { Page, BrowserContext } from 'playwright'
+import { parseMapIdentity, extractIdentity, identitiesMatch, describeMatch } from './MapIdentity'
 import { moveCursor, clickCursor } from './BrowserCursorOverlay'
 
 /**
@@ -381,6 +382,93 @@ export class HumanBehavior {
             Math.floor(readingTimeMs - variation),
             Math.floor(readingTimeMs + variation)
         )
+    }
+
+    /**
+     * Shared name normalization for strict location matching (Vietnamese diacritics safe).
+     * Uses NFD + unicode Diacritic property (covers most accents), with đ/Đ fallback.
+     */
+    static normalizeName(value?: string | null): string {
+        if (!value) return ''
+        return value
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/đ/g, 'd')
+            .replace(/Đ/g, 'D')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim()
+    }
+
+    /**
+     * Verify that the current page is the target map/place detail (post-click / post-goto guard).
+     * Priority: strong identity (placeId / featureHex / cid) via MapIdentity.
+     * Only fall back to normalized name+address match when TARGET has no strong identifier at all.
+     * Logs concise match reason on success.
+     */
+    static async verifyOnTargetMap(page: import('playwright').Page, location: { name: string; placeId?: string | null; address?: string | null; url: string; cid?: string | null; featureHex?: string | null }): Promise<boolean> {
+        try {
+            const currentUrl = page.url() || ''
+            const tgt = extractIdentity(location)
+            const landed = parseMapIdentity(currentUrl)
+
+            if (identitiesMatch(tgt, landed)) {
+                const how = describeMatch(tgt, landed)
+                // concise log only
+                console.log(`[MapIdentity] verify matched by ${how}`)
+                return true
+            }
+
+            const targetHasStrong = !!(tgt.placeId || tgt.featureHex || tgt.cid)
+
+            // If target has any strong ID, require ID match (no name fallback)
+            if (targetHasStrong) {
+                return false
+            }
+
+            // Target has NO strong IDs: fall back to existing strong name match (reuse normalizeName)
+            const titleSelectors = [
+                'h1.DUwDvf', 'h1', '[role="heading"][aria-level="1"]',
+                'button[jsaction*="pane.place"] h1', '[data-attrid="title"] .DUwDvf',
+                '.x3AX1-Lfntke-haAclf', '.lMbq3e'
+            ]
+            for (const sel of titleSelectors) {
+                const el = await page.$(sel).catch(() => null)
+                if (el) {
+                    const txt = await el.textContent().catch(() => '')
+                    if (txt) {
+                        const nTxt = this.normalizeName(txt)
+                        const nName = this.normalizeName(location.name)
+                        if (nName && (nTxt === nName || nTxt.includes(nName) || this.highWordOverlap(nTxt, nName))) {
+                            console.log('[MapIdentity] verify matched by name (no target ID)')
+                            return true
+                        }
+                    }
+                }
+            }
+            if (currentUrl.includes('/maps/place/') || currentUrl.includes('!1s')) {
+                const body = await page.textContent('body').catch(() => '')
+                const nBody = this.normalizeName(body || '')
+                const nName = this.normalizeName(location.name)
+                if (nName && nBody.includes(nName)) {
+                    console.log('[MapIdentity] verify matched by name-body (no target ID)')
+                    return true
+                }
+            }
+        } catch { /* non-fatal */ }
+        return false
+    }
+
+    /**
+     * High word overlap helper (internal for verify/normalize users)
+     */
+    private static highWordOverlap(a: string, b: string): boolean {
+        const aw = a.split(' ').filter(w => w.length > 1)
+        const bw = b.split(' ').filter(w => w.length > 1)
+        if (!bw.length) return false
+        const setA = new Set(aw)
+        const hit = bw.filter(w => setA.has(w)).length
+        return hit / bw.length >= 0.8
     }
 }
 

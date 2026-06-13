@@ -74,6 +74,14 @@ export interface FullAccountImport {
 }
 
 export class AccountService {
+    // Normalize short email like "user123" -> "user123@gmail.com" before persist (single source for add + import)
+    private normalizeEmail(email: string | null | undefined): string | null | undefined {
+        if (!email || typeof email !== 'string') return email
+        const t = email.trim()
+        if (!t) return t
+        return t.includes('@') ? t : `${t}@gmail.com`
+    }
+
     // Heal profile path in case DB was copied from another computer
     private healProfilePath(account: Account): Account {
         if (!account.profilePath) return account
@@ -175,11 +183,12 @@ export class AccountService {
         return result
     }
 
-    // Create new account
+    // Create new account (supports loginType, twoFactorSecret)
     async create(data: NewAccount): Promise<Account> {
         const db = getDatabase()
+        const toInsert = { ...data, email: this.normalizeEmail(data.email) as any }
         const result = db.insert(schema.accounts).values({
-            ...data,
+            ...toInsert,
             createdAt: new Date(),
         }).returning().get()
         return result
@@ -239,6 +248,15 @@ export class AccountService {
             .run()
     }
 
+    // Update lastUsed timestamp (on login success, campaign use, check live)
+    async updateLastUsed(id: number): Promise<void> {
+        const db = getDatabase()
+        db.update(schema.accounts)
+            .set({ lastUsed: new Date() })
+            .where(eq(schema.accounts.id, id))
+            .run()
+    }
+
     // Increment review count
     async incrementReviewCount(id: number): Promise<void> {
         const db = getDatabase()
@@ -263,18 +281,21 @@ export class AccountService {
             .run()
     }
 
-    // Import multiple accounts from CSV data (basic)
-    async importFromCSV(accounts: Array<{ email: string; password: string; recoveryEmail?: string; recoveryPhone?: string }>): Promise<number> {
+    // Import multiple accounts from CSV data (supports 2FA, loginType, recovery)
+    async importFromCSV(accounts: Array<{ email: string; password: string; recoveryEmail?: string; recoveryPhone?: string; twoFactorSecret?: string; loginType?: 'auto' | 'manual' }>): Promise<number> {
         const db = getDatabase()
         let imported = 0
 
         for (const acc of accounts) {
             try {
+                const email = this.normalizeEmail(acc.email) || acc.email
                 db.insert(schema.accounts).values({
-                    email: acc.email,
+                    email,
                     password: acc.password,
-                    recoveryEmail: acc.recoveryEmail,
-                    recoveryPhone: acc.recoveryPhone,
+                    recoveryEmail: acc.recoveryEmail || null,
+                    recoveryPhone: acc.recoveryPhone || null,
+                    twoFactorSecret: acc.twoFactorSecret || null,
+                    loginType: (acc.loginType === 'manual' ? 'manual' : 'auto'),
                     status: 'pending',
                     totalReviews: 0,
                     createdAt: new Date(),
@@ -343,6 +364,10 @@ export class AccountService {
         if (!account) {
             return { alive: false, error: 'Account not found' }
         }
+        if (!account.password || !account.password.trim()) {
+            await this.updateStatus(id, 'pending')
+            return { alive: false, error: 'Thiếu mật khẩu (cập nhật lại tài khoản)' }
+        }
 
         // Update status to checking
         await this.updateStatus(id, 'checking')
@@ -361,14 +386,17 @@ export class AccountService {
             // Create profile if not exists
             const profilePath = account.profilePath || await profileService.createProfile(id, account.email)
 
-            // Attempt login
+            // Attempt login (auto TOTP if secret present)
             const loginResult = await googleAuthHandler.login(
                 account.email,
                 account.password,
                 {
                     headless: true,
                     profilePath,
-                }
+                },
+                account.twoFactorSecret || undefined,
+                account.recoveryEmail || undefined,
+                account.recoveryPhone || undefined
             )
             contextId = loginResult.contextId >= 0 ? loginResult.contextId : null
 
@@ -381,10 +409,21 @@ export class AccountService {
 
             if (loginResult.success) {
                 await this.updateStatus(id, 'active')
+                await this.updateLastUsed(id)
 
-                // Save session if profile exists
+                // Save session (profile state) + cookies JSON to DB column for campaign reuse
                 if (contextId !== null) {
                     await googleAuthHandler.saveSession(contextId, profilePath)
+                    try {
+                        const { browserService } = await import('../automation/BrowserService')
+                        const ctx = browserService.getContext(contextId)
+                        if (ctx) {
+                            const ck = await ctx.cookies().catch(() => [])
+                            if (ck && ck.length > 0) {
+                                await this.saveCookies(id, JSON.stringify(ck))
+                            }
+                        }
+                    } catch {}
                 }
 
                 return { alive: true }
@@ -392,29 +431,32 @@ export class AccountService {
                 // Check for specific error types
                 if (loginResult.error?.includes('2FA') || loginResult.error?.includes('2-Step')) {
                     await this.updateStatus(id, 'pending')
-                    // Try 2FA if secret is available
                     if (account.twoFactorSecret) {
                         const totpCode = this.generateTOTPCode(account.twoFactorSecret)
-                        // TODO: Implement 2FA submission
                         return { alive: false, needs2FA: true, error: '2FA required but not yet implemented' }
                     }
                     return { alive: false, needs2FA: true, error: '2FA required but no secret stored' }
                 }
 
-                // Mark as banned/suspended based on error
-                if (loginResult.error?.includes('banned') || loginResult.error?.includes('suspended')) {
-                    await this.updateStatus(id, 'suspended')
+                // Map correctly: only real Google disabled/suspended -> banned/suspended; auth fail/wrong pass/incomplete -> pending
+                const err = (loginResult.error || '').toLowerCase()
+                if (err.includes('disabled') || err.includes('suspended')) {
+                    await this.updateStatus(id, err.includes('suspended') ? 'suspended' : 'banned')
                 } else {
-                    await this.updateStatus(id, 'banned')
+                    await this.updateStatus(id, 'pending')
                 }
 
                 return { alive: false, error: loginResult.error }
             }
         } catch (error) {
             await this.updateStatus(id, 'pending')
+            const raw = error instanceof Error ? error.message : 'Unknown error'
+            const friendly = /target page, context or browser has been closed|launchPersistentContext/i.test(raw)
+                ? 'Không mở được trình duyệt (profile bị khóa hoặc xung đột Chrome). Đóng Chrome khác, thử lại hoặc reset profile.'
+                : raw
             return {
                 alive: false,
-                error: error instanceof Error ? error.message : 'Unknown error'
+                error: friendly
             }
         } finally {
             if (contextId !== null) {

@@ -262,7 +262,15 @@ export class ReviewAutomationEngine {
 
             // Login if needed
             if (!account.cookies) {
-                const loginResult = await googleAuthHandler.login(account.email, account.password, config)
+                // Forward recovery + 2FA secret so challenge resolver loop can auto-handle selection/kpe/TOTP/phone/prompts
+                const loginResult = await googleAuthHandler.login(
+                    account.email,
+                    account.password,
+                    config,
+                    account.twoFactorSecret || undefined,
+                    account.recoveryEmail || undefined,
+                    account.recoveryPhone || undefined
+                )
                 contextId = loginResult.contextId
 
                 if (!loginResult.success) {

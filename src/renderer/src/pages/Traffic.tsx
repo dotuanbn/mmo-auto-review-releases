@@ -78,6 +78,7 @@ interface Campaign {
     startedAt: string | null
     trafficMode?: string
     searchKeywords?: string | null
+    maxMapScroll?: number
     accounts?: { id: number; email: string }[]
     locations?: { id: number; name: string; url: string }[]
 }
@@ -96,6 +97,7 @@ interface ThreadDetail {
 
 interface LiveStatus {
     isRunning: boolean
+    isPaused?: boolean
     campaignId: number | null
     campaignName: string
     currentRound: number
@@ -214,6 +216,7 @@ interface MonitorActionLog {
 
 interface RuntimeStatusPayload {
     isRunning?: boolean
+    isPaused?: boolean
     campaignId?: number | null
     campaignName?: string
     currentRound?: number
@@ -350,6 +353,7 @@ function normalizeLiveStatus(payload: RuntimeStatusPayload | null | undefined): 
 
     return {
         isRunning: payload?.isRunning === true,
+        isPaused: payload?.isPaused === true,
         campaignId: payload?.campaignId ?? null,
         campaignName: payload?.campaignName || '',
         currentRound: Number(payload?.currentRound || 0),
@@ -641,6 +645,17 @@ export function Traffic() {
         }
     }, [liveStatus?.isRunning, fetchCampaigns])
 
+    // Problem 1: on renderer mount / data load, if active (running/paused) campaign, auto switch to "Giám sát trực tiếp" (monitor tab)
+    // Query via IPC (liveStatus + campaigns list) to restore monitoring view; only on initial to avoid stealing user tab switches.
+    useEffect(() => {
+        if (activeTabRef.current !== 'campaigns') return
+        const hasLiveActive = !!(liveStatus && (liveStatus.isRunning || liveStatus.isPaused))
+        const hasDbActive = campaigns.some(c => c.status === 'running' || c.status === 'paused')
+        if (hasLiveActive || hasDbActive) {
+            setActiveTab('monitor')
+        }
+    }, [liveStatus, campaigns]) // runs after initial fetches; tab ref guards re-entrancy for user actions
+
     // ============================================================
     // Actions
     // ============================================================
@@ -671,6 +686,15 @@ export function Traffic() {
             await api.trafficBoost.pause()
         } catch (err) {
             console.error('Failed to pause campaign:', err)
+        }
+    }
+
+    const handleResumeCampaign = async () => {
+        try {
+            await api.trafficBoost.resume?.()
+            // engine will set running + monitor listeners will update
+        } catch (err) {
+            console.error('Failed to resume campaign:', err)
         }
     }
 
@@ -758,10 +782,11 @@ export function Traffic() {
             />
 
             {/* Tab Content */}
-            {activeTab === 'campaigns' && (
+            {activeTab === 'campaigns' && !showCreateModal && (
                 <CampaignsTab
                     campaigns={campaigns}
                     onStart={handleStartCampaign}
+                    onResume={handleResumeCampaign}
                     onDelete={handleDeleteCampaign}
                     onDeleteMany={handleDeleteCampaigns}
                     onViewReport={handleViewReport}
@@ -779,6 +804,7 @@ export function Traffic() {
                     mcpHealth={mcpHealth}
                     onStop={handleStopCampaign}
                     onPause={handlePauseCampaign}
+                    onResume={handleResumeCampaign}
                     onRefresh={fetchStatus}
                 />
             )}
@@ -813,9 +839,10 @@ export function Traffic() {
 // Campaigns Tab
 // ============================================================
 
-function CampaignsTab({ campaigns, onStart, onDelete, onDeleteMany, onViewReport, onRefresh }: {
+function CampaignsTab({ campaigns, onStart, onResume, onDelete, onDeleteMany, onViewReport, onRefresh }: {
     campaigns: Campaign[]
     onStart: (id: number) => void
+    onResume: () => void
     onDelete: (id: number) => void
     onDeleteMany: (ids: number[]) => Promise<void> | void
     onViewReport: (id: number) => void
@@ -945,12 +972,20 @@ function CampaignsTab({ campaigns, onStart, onDelete, onDeleteMany, onViewReport
                                     {c.trafficMode === 'organic' && (
                                         <StatusPill tone="emerald">Organic</StatusPill>
                                     )}
+                                    {c.trafficMode === 'map_search' && (
+                                        <StatusPill tone="emerald">SEO Map</StatusPill>
+                                    )}
                                     <StatusPill tone={getStatusTone(c.status)}>{c.status}</StatusPill>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     {c.status === 'pending' && (
                                         <PrimaryButton tone="emerald" icon={Play} onClick={() => onStart(c.id)}>
                                             {t('traffic.start')}
+                                        </PrimaryButton>
+                                    )}
+                                    {c.status === 'paused' && (
+                                        <PrimaryButton tone="emerald" icon={Play} onClick={() => onResume()}>
+                                            {t('traffic.resume')}
                                         </PrimaryButton>
                                     )}
                                     <PrimaryButton variant="quiet" icon={BarChart3} onClick={() => onViewReport(c.id)}>
@@ -1054,7 +1089,7 @@ function ThreadCursorPreview({ thread, clickVersion }: {
 // Live Monitor Tab
 // ============================================================
 
-function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, onStop, onPause, onRefresh }: {
+function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, onStop, onPause, onResume, onRefresh }: {
     status: LiveStatus | null
     actionLogs: MonitorActionLog[]
     runtimePolicy: RuntimePolicy | null
@@ -1063,6 +1098,7 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
     mcpHealth: McpHealth | null
     onStop: () => void
     onPause: () => void
+    onResume: () => void
     onRefresh: () => void
 }) {
     const { t } = useI18n()
@@ -1090,9 +1126,9 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
         }
     }, [status?.threads])
 
-    // Poll FProxy info every 5 seconds when campaign is running
+    // Poll FProxy info every 5 seconds when campaign is running or paused (to keep timer display in sync on resume)
     useEffect(() => {
-        if (!status?.isRunning || effectiveMode !== 'fproxy') {
+        if ((!status?.isRunning && !status?.isPaused) || effectiveMode !== 'fproxy') {
             setFproxyInfo(null)
             return
         }
@@ -1144,9 +1180,15 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                         </p>
                     </div>
                     <div className="flex gap-2">
-                        <PrimaryButton tone="amber" variant="quiet" icon={Pause} onClick={onPause}>
-                            {t('traffic.pause')}
-                        </PrimaryButton>
+                        {status?.isPaused ? (
+                            <PrimaryButton tone="emerald" variant="quiet" icon={Play} onClick={onResume}>
+                                {t('traffic.resume')}
+                            </PrimaryButton>
+                        ) : (
+                            <PrimaryButton tone="amber" variant="quiet" icon={Pause} onClick={onPause}>
+                                {t('traffic.pause')}
+                            </PrimaryButton>
+                        )}
                         <PrimaryButton tone="rose" variant="quiet" icon={Square} onClick={onStop}>
                             {t('traffic.stop')}
                         </PrimaryButton>
@@ -1700,9 +1742,11 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
     const [visitsPerLocation, setVisitsPerLocation] = useState(10)
     const [delayMin, setDelayMin] = useState(10)
     const [delayMax, setDelayMax] = useState(30)
-    const [trafficMode, setTrafficMode] = useState<'direct' | 'organic' | 'web_seo'>('direct')
+    const [trafficMode, setTrafficMode] = useState<'direct' | 'organic' | 'web_seo' | 'map_search'>('direct')
     const [locationKeywords, setLocationKeywords] = useState<Record<number, string>>({})
     const [creating, setCreating] = useState(false)
+    // map_search specific: max cards to scroll (UI default 15, min 1; passed only relevant for mode)
+    const [maxMapScroll, setMaxMapScroll] = useState(15)
     // Web SEO specific state
     const [websiteUrl, setWebsiteUrl] = useState('')
     const [webSeoKeyword, setWebSeoKeyword] = useState('')
@@ -1767,10 +1811,11 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     delayMinSeconds: normalizedDelayMin,
                     delayMaxSeconds: normalizedDelayMax,
                     trafficMode,
+                    maxMapScroll,
                 })
             } else {
                 // Direct / Organic mode
-                if (trafficMode === 'organic') {
+                if (trafficMode === 'organic' || trafficMode === 'map_search') {
                     for (const locId of selectedLocations) {
                         const kw = locationKeywords[locId]
                         if (kw && kw.trim()) {
@@ -1790,6 +1835,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     delayMinSeconds: normalizedDelayMin,
                     delayMaxSeconds: normalizedDelayMax,
                     trafficMode,
+                    maxMapScroll,
                 })
             }
         } catch (error: any) {
@@ -1889,13 +1935,26 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                 <Search className="w-4 h-4" />
                                 {t('traffic.webSEO') || 'Web SEO'}
                             </button>
+                            <button
+                                type="button"
+                                onClick={() => setTrafficMode('map_search')}
+                                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-full border transition-all text-sm font-semibold ${trafficMode === 'map_search'
+                                    ? 'bg-[#8d74e8] text-white border-[#8d74e8] shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
+                                    : 'bg-white border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
+                                    }`}
+                            >
+                                <Search className="w-4 h-4" />
+                                {t('traffic.mapSearch') || 'SEO Map'}
+                            </button>
                         </div>
                         <p className="text-xs text-[#908a9e] mt-1">
                             {trafficMode === 'direct'
                                 ? t('traffic.directUrlDesc')
                                 : trafficMode === 'organic'
                                     ? t('traffic.organicSearchDesc')
-                                    : t('traffic.webSEODesc') || 'Tim Google -> Website muc tieu -> Tuong tac'}
+                                    : trafficMode === 'map_search'
+                                        ? (t('traffic.mapSearchDesc') || 'Tìm trực tiếp trên Google Maps → cuộn feed kết quả → vào map (SEO Maps)')
+                                        : t('traffic.webSEODesc') || 'Tim Google -> Website muc tieu -> Tuong tac'}
                         </p>
                     </div>
 
@@ -1984,7 +2043,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
                                 {t('traffic.selectLocations')} ({selectedLocations.length} {t('traffic.selected')})
                             </label>
-                            <div className={`${trafficMode === 'organic' ? 'max-h-60' : 'max-h-32'} overflow-y-auto rounded-[16px] border border-[#e9e4f2] bg-[#f7f7f9] p-2 space-y-1`}>
+                            <div className={`${(trafficMode === 'organic' || trafficMode === 'map_search') ? 'max-h-60' : 'max-h-32'} overflow-y-auto rounded-[16px] border border-[#e9e4f2] bg-[#f7f7f9] p-2 space-y-1`}>
                                 {locations.length === 0 && (
                                     <p className="text-[#908a9e] text-sm p-2">{t('traffic.noLocationsAvailable')}</p>
                                 )}
@@ -1997,12 +2056,23 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                                 onChange={() => {
                                                     toggleLocation(loc.id)
                                                     if (!selectedLocations.includes(loc.id) && loc.searchKeywords) {
+                                                        let kwStr = ''
+                                                        const raw = loc.searchKeywords
                                                         try {
-                                                            const saved = JSON.parse(loc.searchKeywords)
+                                                            const saved = JSON.parse(raw)
                                                             if (Array.isArray(saved) && saved.length > 0) {
-                                                                setLocationKeywords(prev => ({ ...prev, [loc.id]: saved.join('\n') }))
+                                                                kwStr = saved.join(', ')
+                                                            } else if (typeof saved === 'string' && saved.trim()) {
+                                                                kwStr = saved
                                                             }
-                                                        } catch { /* ignore */ }
+                                                        } catch {
+                                                            if (typeof raw === 'string' && raw.trim()) {
+                                                                kwStr = raw
+                                                            }
+                                                        }
+                                                        if (kwStr) {
+                                                            setLocationKeywords(prev => ({ ...prev, [loc.id]: kwStr }))
+                                                        }
                                                     }
                                                 }}
                                                 className="rounded border-[#e9e4f2] text-[#8d74e8] focus:ring-[#8d74e8]"
@@ -2012,7 +2082,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                                 <div className="text-xs text-[#908a9e] truncate max-w-xs">{loc.url}</div>
                                             </div>
                                         </label>
-                                        {trafficMode === 'organic' && selectedLocations.includes(loc.id) && (
+                                        {(trafficMode === 'organic' || trafficMode === 'map_search') && selectedLocations.includes(loc.id) && (
                                             <div className="px-2 pb-2 pl-8">
                                                 <input
                                                     type="text"
@@ -2043,6 +2113,24 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     </button>
                                 </div>
                             )}
+                        </div>
+                    )}
+
+                    {/* map_search specific: max scroll threshold (only for SEO Map mode, near keyword config area) */}
+                    {trafficMode === 'map_search' && (
+                        <div>
+                            <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
+                                {t('traffic.maxMapScroll') || 'Số map tối đa khi cuộn tìm'}
+                            </label>
+                            <input
+                                type="number"
+                                value={maxMapScroll}
+                                onChange={e => setMaxMapScroll(Math.max(1, Math.min(100, parseInt(e.target.value) || 15)))}
+                                min={1}
+                                max={100}
+                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                            />
+                            <p className="text-xs text-[#908a9e] mt-0.5">Tối đa số map cuộn trong feed trước khi fallback URL trực tiếp (mặc định 15).</p>
                         </div>
                     )}
 
