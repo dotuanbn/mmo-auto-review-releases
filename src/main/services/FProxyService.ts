@@ -2,6 +2,7 @@ import * as https from 'https'
 import { appendFileSync } from 'fs'
 import { join } from 'path'
 import { app } from 'electron'
+import { browserService } from '../automation/BrowserService'
 
 // FProxy.me API response format
 export interface FProxyData {
@@ -458,6 +459,101 @@ export class FProxyService {
             nextRotateIn: this.getNextRotateIn(),
             proxyDieAt: this.proxyDieAt,
             autoRotate: !!this.autoRotateInterval,
+        }
+    }
+
+    /**
+     * Test proxy *API config* (not the current runtime proxy):
+     * 1) Call fproxy rotate endpoint (HTTP OK + parse data)
+     * 2) If valid proxy in response, attempt short live connect via that proxy to ipify (confirm LIVE + return real egress IP)
+     * Timeout ~10s total for connect test. Never logs full key (httpGet masks).
+     */
+    async testApiConnection(): Promise<{ success: boolean; message: string; ip?: string; latencyMs?: number; location?: string }> {
+        if (!this.apiKey) {
+            return { success: false, message: 'Chưa cấu hình API key (fproxyApiKey)' }
+        }
+        const start = Date.now()
+        let testProxy: ParsedProxyCred | null = null
+        let apiLocation = ''
+
+        try {
+            // 1) API call + parse (dedicated one-shot, does not force main currentProxy to protect running sessions if possible)
+            const url = `https://sv1.fproxy.me/api/rotate?key=${this.apiKey}`
+            const response: FProxyResponse = await this.httpGet(url)  // logs masked key internally
+
+            if (!response.success || !response.data) {
+                const msg = response.message || 'API trả về không thành công'
+                return { success: false, message: msg.includes('key') ? 'Sai API key hoặc hết hạn' : msg }
+            }
+
+            if (!this.isValidProxyData(response.data)) {
+                return { success: false, message: 'Parse proxy thất bại (dữ liệu API không hợp lệ)' }
+            }
+
+            const parsed = this.parseHttpUserpass(response.data.httpuserpass)!
+            testProxy = parsed
+            apiLocation = response.data.location || ''
+        } catch (err: any) {
+            const m = (err?.message || String(err)).toLowerCase()
+            if (m.includes('timeout')) return { success: false, message: 'Kết nối API timeout' }
+            if (m.includes('invalid json')) return { success: false, message: 'API trả JSON không hợp lệ' }
+            return { success: false, message: 'Không kết nối được API proxy (sai key / mạng / server)' }
+        }
+
+        const apiLatency = Date.now() - start
+        // 2) Live connect test via obtained proxy (ephemeral, ~8-10s budget)
+        let contextId: number | null = null
+        try {
+            contextId = await browserService.createEphemeralContext({
+                headless: true,
+                proxy: {
+                    host: testProxy!.host,
+                    port: testProxy!.port,
+                    username: testProxy!.username,
+                    password: testProxy!.password,
+                    type: 'http',
+                },
+            })
+            const page = browserService.getPage(contextId)
+            if (!page) throw new Error('Không tạo được page để test proxy')
+
+            const connectStart = Date.now()
+            await page.goto('https://api.ipify.org?format=json', {
+                timeout: 10000,
+                waitUntil: 'domcontentloaded',
+            })
+            const bodyText = await page.evaluate(() => (document.body.textContent || '').trim())
+            let egressIp = ''
+            try {
+                const j = JSON.parse(bodyText)
+                egressIp = j.ip || ''
+            } catch {
+                egressIp = bodyText.replace(/[^0-9.]/g, '').slice(0, 15)
+            }
+            const liveLatency = Date.now() - connectStart
+            const total = Date.now() - start
+
+            return {
+                success: true,
+                message: 'API OK + proxy LIVE',
+                ip: egressIp || testProxy!.host,
+                latencyMs: Math.round(total),
+                location: apiLocation,
+            }
+        } catch (err: any) {
+            const m = err instanceof Error ? err.message : String(err)
+            // API succeeded + parsed, but live connect failed (common for bad/expired proxy from pool)
+            return {
+                success: false,
+                message: `API reachable nhưng proxy không live: ${m.split('\n')[0].slice(0, 80)}`,
+                ip: testProxy!.host,
+                latencyMs: apiLatency,
+                location: apiLocation,
+            }
+        } finally {
+            if (contextId !== null) {
+                await browserService.closeContext(contextId).catch(() => {})
+            }
         }
     }
 }

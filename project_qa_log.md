@@ -265,3 +265,11 @@ Last updated: 2026-06-xx
 - Constraints: poll ~10min + pending safe kept; no traffic/map/pause/dropdown impact; no secret logs; <50LOC deltas; defensive catches.
 - typecheck (full): PASS (0). Self-review: strict AND only, all false-positive paths closed, BrowserService source-of-truth, no side effects.
 - Recorded. Short output only.
+
+## 2026-06-xx (Settings: updateMode auto/manual + fproxy API test button)
+- Full E2E added per spec (no breakage to refactored Settings/login/traffic/accounts): updateMode ('manual' default - safety, explicit in DEFAULTS/comments) + UI controls in Giới thiệu (mode select + check/update btns + live status from updates:state + versions/progress). UpdateService: mode drives autoDownload/autoInstall, startup check, 'available'->autoDL only in auto; manual never auto tải/cài (user explicit download+install via check/download/install IPCs).
+- Proxy: "Test" btn next to fproxy key (proxy section) -> fproxy:testApi IPC (FProxyService.testApiConnection): https API call+parse (masked), + ephemeral browser live to ipify (~10s) for IP + success/err. Result via Alert (success: IP+latency, err: short msg like sai key/hết hạn/không live). Spinner. Reuses BrowserService pattern.
+- i18n: added synced keys to BOTH en+vi (updateMode*/checkForUpdates/updateNow/proxyTestApi*). Used existing t() + components only.
+- Files: settings.ts, UpdateService.ts, FProxyService.ts, fproxy.ts, preload/index.ts, Settings.tsx, en.json, vi.json.
+- Verification: `npm run typecheck` PASS (0), `npm run gate:quick` PASS (type+lint 0). No full keys logged, ~10s timeout, strict, no layer mix, defaults safe, prior autoUpdate field untouched for compat.
+- Per SOP/Antigravity + user short-final constraint. Recorded.

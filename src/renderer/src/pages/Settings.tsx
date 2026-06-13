@@ -94,7 +94,8 @@ interface AppSettings {
     dataDir: string
 
     // App
-    autoUpdate: boolean
+    autoUpdate: boolean,
+    updateMode: 'auto' | 'manual'
 
     // Runtime Policy V2
     captchaMode: 'manual' | 'auto_skip' | 'hybrid'
@@ -165,6 +166,7 @@ const DEFAULTS: AppSettings = {
     maxRetries: 3,
     dataDir: '',
     autoUpdate: true,
+    updateMode: 'manual', // default manual for safety: only notify on check; user must click to download+install
 
     // Runtime Policy V2
     captchaMode: 'hybrid',
@@ -211,6 +213,13 @@ export function Settings() {
     const [ollamaTesting, setOllamaTesting] = useState(false)
     const [ollamaStatus, setOllamaStatus] = useState<'idle' | 'valid' | 'invalid'>('idle')
     const [ollamaModels, setOllamaModels] = useState<string[]>([])
+    // Update state (live from main via onState)
+    const [updateState, setUpdateState] = useState<any>(null)
+    const [checkingUpdate, setCheckingUpdate] = useState(false)
+    // Proxy API test (Settings specific: test endpoint + live connect)
+    const [proxyApiTesting, setProxyApiTesting] = useState(false)
+    const [proxyApiStatus, setProxyApiStatus] = useState<'idle' | 'success' | 'error'>('idle')
+    const [proxyApiResult, setProxyApiResult] = useState<string>('')
     const [showResetConfirm, setShowResetConfirm] = useState(false)
     const [hasChanges, setHasChanges] = useState(false)
     const [originalSettings, setOriginalSettings] = useState<AppSettings>({ ...DEFAULTS })
@@ -227,6 +236,24 @@ export function Settings() {
         if (window.electronAPI?.getVersion) {
             window.electronAPI.getVersion().then((v: string) => { if (v) setAppVersion(v) }).catch(() => {})
         }
+    }, [])
+
+    // Live update state + initial fetch (for About / Giới thiệu section)
+    useEffect(() => {
+        let unsub: (() => void) | null = null
+        const loadInitial = async () => {
+            try {
+                if (window.electronAPI?.updates?.getState) {
+                    const st = await window.electronAPI.updates.getState()
+                    if (st) setUpdateState(st)
+                }
+            } catch {}
+        }
+        loadInitial()
+        if (window.electronAPI?.updates?.onState) {
+            unsub = window.electronAPI.updates.onState((st: any) => setUpdateState(st))
+        }
+        return () => { if (unsub) unsub() }
     }, [])
 
     const loadSettings = async () => {
@@ -309,6 +336,59 @@ export function Settings() {
             showMsg('success', t('settings.resetSuccess'))
         } catch (error) {
             showMsg('error', t('settings.resetFailed'))
+        }
+    }
+
+    // Update controls (wired to existing updates:* IPCs + live state)
+    const handleCheckUpdate = async () => {
+        setCheckingUpdate(true)
+        try {
+            const st = await window.electronAPI.updates?.check?.()
+            if (st) setUpdateState(st)
+        } catch (e: any) {
+            setUpdateState((prev: any) => ({ ...(prev || {}), error: e?.message || 'Check failed' }))
+        } finally {
+            setCheckingUpdate(false)
+        }
+    }
+    const handleUpdateNow = async () => {
+        try {
+            let st = updateState
+            if (!st?.downloaded) {
+                st = await window.electronAPI.updates?.download?.()
+                if (st) setUpdateState(st)
+            }
+            if (st?.downloaded || (await window.electronAPI.updates?.getState?.())?.downloaded) {
+                await window.electronAPI.updates?.install?.()
+            }
+        } catch (e: any) {
+            setUpdateState((prev: any) => ({ ...(prev || {}), error: e?.message || 'Update action failed' }))
+        }
+    }
+
+    // Proxy API test (calls fproxy:testApi via main; no full key ever logged/returned to UI)
+    const handleTestProxyApi = async () => {
+        const key = (settings as any).fproxyApiKey
+        if (!key || !key.trim()) return
+        setProxyApiTesting(true)
+        setProxyApiStatus('idle')
+        setProxyApiResult('')
+        try {
+            const res = await window.electronAPI.fproxy?.testApi?.()
+            if (res?.success) {
+                setProxyApiStatus('success')
+                const ipPart = res.ip ? `IP: ${res.ip}` : ''
+                const lat = typeof res.latencyMs === 'number' ? ` • ${res.latencyMs}ms` : ''
+                setProxyApiResult(`${t('settings.testSuccess')} ${ipPart}${lat}${res.location ? ` (${res.location})` : ''}`.trim())
+            } else {
+                setProxyApiStatus('error')
+                setProxyApiResult(res?.message ? t('settings.testFailed') + ': ' + res.message : t('settings.testFailed'))
+            }
+        } catch (e: any) {
+            setProxyApiStatus('error')
+            setProxyApiResult((e?.message || 'Lỗi kết nối').slice(0, 120))
+        } finally {
+            setProxyApiTesting(false)
         }
     }
 
@@ -602,8 +682,14 @@ export function Settings() {
                 <FormRow icon={<Key className="h-4 w-4 text-cyan-600" />} label={t('settings.fproxyApiKey')} description={t('settings.fproxyApiKeyDesc')}>
                     <div className="flex gap-2 w-full max-w-md">
                         <input type="password" value={(settings as any).fproxyApiKey || ''} onChange={(e) => update('fproxyApiKey' as any, e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="fproxy.me key" />
+                        <PrimaryButton icon={proxyApiTesting ? RefreshCw : TestTube2} onClick={handleTestProxyApi} disabled={!((settings as any).fproxyApiKey || '').trim() || proxyApiTesting} className={proxyApiTesting ? '[&_svg]:animate-spin' : ''}>{t('settings.test')}</PrimaryButton>
                     </div>
                 </FormRow>
+                {proxyApiStatus !== 'idle' && (
+                    <AlertBanner type={proxyApiStatus === 'success' ? 'success' : 'error'}>
+                        {proxyApiResult}
+                    </AlertBanner>
+                )}
                 {settings.useProxy && (
                     <>
                         <FormRow icon={<RotateCw className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.rotateProxyPerSession')} description={t('settings.rotateProxyPerSessionDesc')}>
@@ -763,9 +849,49 @@ export function Settings() {
 
             {/* 6. GIỚI THIỆU / ABOUT */}
             <SectionPanel icon={Info} title={t('settings.appAbout')} tone="slate">
-                <FormRow icon={<Zap className="h-4 w-4 text-amber-500" />} label={t('settings.autoUpdate')} description={t('settings.autoUpdateDesc')}>
-                    <DSToggle checked={settings.autoUpdate} onChange={() => update('autoUpdate', !settings.autoUpdate)} />
-                </FormRow>
+                {/* Update mode + controls (end-to-end via updates IPC + UpdateService) */}
+                <div className="space-y-2 rounded-[16px] border border-[#ece7f5] bg-white p-3.5">
+                    <div className="flex items-center justify-between gap-3">
+                        <div>
+                            <div className="text-sm font-medium">{t('settings.updateMode')}</div>
+                            <div className="text-xs text-[#6f697c]">{t('settings.updateModeDesc')}</div>
+                        </div>
+                        <Select
+                            value={(settings as any).updateMode || 'manual'}
+                            onChange={(v) => update('updateMode' as any, v as 'auto' | 'manual')}
+                            options={[
+                                { value: 'manual', label: t('settings.updateModeManual') },
+                                { value: 'auto', label: t('settings.updateModeAuto') },
+                            ]}
+                            className="w-40"
+                        />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <PrimaryButton onClick={handleCheckUpdate} disabled={checkingUpdate} icon={checkingUpdate ? RefreshCw : Zap} className={checkingUpdate ? '[&_svg]:animate-spin' : ''}>
+                            {t('settings.checkForUpdates')}
+                        </PrimaryButton>
+                        {updateState?.available && (
+                            <PrimaryButton onClick={handleUpdateNow} icon={Zap}>
+                                {t('settings.updateNow')}
+                            </PrimaryButton>
+                        )}
+                        {updateState?.status === 'downloading' && updateState?.progress != null && (
+                            <span className="text-xs text-[#6f697c]"> {Math.round(updateState.progress)}% </span>
+                        )}
+                        {updateState?.status === 'downloaded' && (
+                            <span className="text-xs text-emerald-600">Sẵn sàng cài đặt</span>
+                        )}
+                    </div>
+                    <div className="text-xs text-[#908a9e] pt-1">
+                        {t('settings.version')}: {appVersion}
+                        {updateState?.latestVersion && updateState.latestVersion !== appVersion ? ` → ${updateState.latestVersion}` : ''}
+                        {updateState?.error && <span className="ml-2 text-rose-500">{updateState.error}</span>}
+                    </div>
+                    {updateState?.available && !updateState.downloaded && !updateState.error && (
+                        <div className="text-xs text-amber-600">Có bản mới — bấm "Cập nhật ngay" để tải & cài (manual) hoặc chờ auto.</div>
+                    )}
+                </div>
+
                 <div className="flex items-center gap-2 pt-2">
                     <PrimaryButton tone="rose" variant="quiet" icon={AlertTriangle} onClick={() => setShowResetConfirm(true)}>{t('settings.resetToDefaults')}</PrimaryButton>
                 </div>

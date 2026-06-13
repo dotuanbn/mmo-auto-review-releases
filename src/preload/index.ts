@@ -89,6 +89,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getNew: () => ipcRenderer.invoke('fproxy:getNew'),
         getInfo: () => ipcRenderer.invoke('fproxy:getInfo'),
         test: () => ipcRenderer.invoke('fproxy:test'),
+        testApi: () => ipcRenderer.invoke('fproxy:testApi'), // Settings: test proxy API endpoint + live proxy connect
     },
 
     // Locations
@@ -671,6 +672,9 @@ declare global {
                 download: () => Promise<any>
                 install: () => Promise<any>
                 onState: (callback: (state: any) => void) => () => void
+            }
+            fproxy: {
+                testApi: () => Promise<{ success: boolean; message: string; ip?: string; latencyMs?: number; location?: string }>
             }
             reports: {
                 getActionTrace: (payload?: { campaignId?: number; limit?: number }) => Promise<any[]>

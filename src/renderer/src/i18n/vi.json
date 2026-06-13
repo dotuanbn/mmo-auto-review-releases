@@ -634,6 +634,14 @@
     "analytics": "Analytics",
     "analyticsKeyFilePath": "File JSON Service Account",
     "analyticsKeyFilePathDesc": "Bắt buộc cho chế độ thu thập dữ liệu API (GA4/GSC)",
-    "browseFile": "Chọn file"
+    "browseFile": "Chọn file",
+    "updateMode": "Chế độ cập nhật app",
+    "updateModeDesc": "Tự động: tự kiểm tra + tải + cài. Thủ công (mặc định): chỉ thông báo; user bấm Kiểm tra + Cập nhật ngay (an toàn).",
+    "updateModeAuto": "Tự động",
+    "updateModeManual": "Thủ công",
+    "checkForUpdates": "Kiểm tra cập nhật",
+    "updateNow": "Cập nhật ngay",
+    "proxyTestApi": "Kiểm tra API Proxy",
+    "proxyApiTestDesc": "Xác minh endpoint API trả proxy hợp lệ và proxy có live (IP thực)"
   }
 }

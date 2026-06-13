@@ -639,6 +639,14 @@
     "analytics": "Analytics",
     "analyticsKeyFilePath": "Service Account JSON File",
     "analyticsKeyFilePathDesc": "Required for GA4/GSC API data collection mode",
-    "browseFile": "Browse"
+    "browseFile": "Browse",
+    "updateMode": "App Update Mode",
+    "updateModeDesc": "Auto: auto-check + download + install. Manual (default): only notify; user clicks Check + Update now (safe).",
+    "updateModeAuto": "Auto",
+    "updateModeManual": "Manual",
+    "checkForUpdates": "Check for updates",
+    "updateNow": "Update now",
+    "proxyTestApi": "Test Proxy API",
+    "proxyApiTestDesc": "Verify API endpoint returns valid proxy and the proxy is live (egress IP)"
   }
 }
