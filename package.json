@@ -1,6 +1,6 @@
 {
   "name": "mmo-auto-review",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "MMO Auto Review Google Map - Electron App",
   "main": "dist-electron/main/index.js",
   "scripts": {
