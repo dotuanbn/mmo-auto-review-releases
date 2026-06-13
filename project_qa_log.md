@@ -1,5 +1,15 @@
 # Project QA Log
 
+Last updated: 2026-06-xx (release-manager Option1 fix for main branch)
+
+## 2026-06-xx (Release Manager Option 1: fix tag/commit on 'main' not 'master')
+- User: scripts/release-manager.ps1 (called by Release-Manager.bat) Option 1 was doing version bump + commit/tag/push on current WORK branch (master) + --tags. Wrong: GitHub default is 'main', history uses "Merge branch 'master'", tags must land on main HEAD for correct release/CI.
+- Only edited Option 1 git flow (kept bump choice, `npm version ... --no-git-tag-version`, local build optional, Ensure-GitHubAuth fully intact). No other options, no build/CI, no other files.
+- New flow (per spec): RELEASE_BRANCH='main', WORK_BRANCH=current; on WORK: add package.json + chore(release) commit + push WORK; (if != main: fetch + checkout main [clear error stop if dirty] + merge --ff-only/reset to origin/main + merge WORK with msg "Merge branch '..' (release vX.Y.Z)" [on conflict: stop+print manual steps, NO auto-resolve, leave merge state] + push main); tag vX.Y.Z on current (main) HEAD (prompt/force -f if exists) + push (force opt); checkout back WORK if needed; success msg emphasizes "DA PUSH main + TAG ... (tag tren 'main')".
+- Safety: every git op checks $LASTEXITCODE, throws descriptive (no-accent VN added text), stops without hiding state. Special case when already on main (skip merge).
+- Verification: self read full script + context/qa first; manual git branch confirmed master in env; used targeted search_replace; temp parser helper; final `powershell ... Parser::ParseInput` -> PARSE_OK. No other modules impacted.
+- Recorded per Antigravity memory policy + user "TU DOC file va SUA" + short final output constraint. 1 file edited.
+
 Last updated: 2026-06-xx
 
 ## 2026-06-xx (Fix keyword concat bug on reopen form for organic/map_search)
