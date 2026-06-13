@@ -333,6 +333,17 @@ export function registerTrafficHandlers() {
         }
     })
 
+    // Resume campaign (from paused; continues from saved visits/round/keyword/account position via DB logs + counters)
+    ipcMain.handle('trafficBoost:resume', async () => {
+        try {
+            await trafficBoostEngine.resumeCampaign()
+            return { success: true }
+        } catch (error) {
+            console.error('Failed to resume campaign:', error)
+            throw error
+        }
+    })
+
     // Get realtime status
     ipcMain.handle('trafficBoost:getStatus', async () => {
         return trafficBoostEngine.getStatus()

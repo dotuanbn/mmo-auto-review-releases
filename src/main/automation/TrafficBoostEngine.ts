@@ -59,6 +59,7 @@ export type SEOAction =
 
 export interface TrafficBoostStatus {
     isRunning: boolean
+    isPaused?: boolean
     campaignId: number | null
     campaignName: string
     activeThreads: number
@@ -1022,6 +1023,7 @@ export class TrafficBoostEngine {
     private readonly maxActionsPerVisitCap = 100
     private running = false
     private shouldStop = false
+    private paused = false
     private currentCampaignId: number | null = null
     private currentCampaignName = ''
     private activeContexts: Map<number, string> = new Map() // contextId -> profilePath
@@ -1056,6 +1058,13 @@ export class TrafficBoostEngine {
     onAction(listener: (event: RuntimeActionEvent) => void): () => void {
         this.actionListeners.add(listener)
         return () => this.actionListeners.delete(listener)
+    }
+
+    // Safe await point for pause: workers poll here between visits (keeps progress, no reset)
+    private async waitWhilePaused(): Promise<void> {
+        while (this.paused && !this.shouldStop) {
+            await new Promise(resolve => setTimeout(resolve, 250))
+        }
     }
 
     // ============================================================
@@ -1311,6 +1320,7 @@ export class TrafficBoostEngine {
     private buildStatus(overrides: Partial<TrafficBoostStatus> = {}): TrafficBoostStatus {
         return {
             isRunning: this.running,
+            isPaused: this.paused,
             campaignId: this.currentCampaignId ?? null,
             campaignName: this.currentCampaignName,
             activeThreads: this.threadDetails.filter(t => t.status === 'visiting').length,
@@ -2235,6 +2245,22 @@ export class TrafficBoostEngine {
         const campaign = db.select().from(schema.trafficCampaigns).where(eq(schema.trafficCampaigns.id, campaignId)).get()
         if (!campaign) throw new Error('Campaign not found')
 
+        // In-process resume: unpause without full re-init (counters already loaded from DB on prior start)
+        if (this.running && this.currentCampaignId === campaignId) {
+            if (this.paused) {
+                this.paused = false
+                if (fproxyService.getApiKey() && fproxyService.isAutoRotateActive() === false) {
+                    fproxyService.resumeAutoRotate()
+                }
+                const db = getDatabase()
+                db.update(schema.trafficCampaigns).set({ status: 'running' }).where(eq(schema.trafficCampaigns.id, campaignId)).run()
+                this.sendStatus(this.buildStatus({ message: 'Resumed from pause' }))
+                return
+            }
+            console.log('[TrafficBoost] Already running')
+            return
+        }
+
         this.running = true
         let terminalMessage = 'Traffic boost stopped'
 
@@ -2384,6 +2410,7 @@ export class TrafficBoostEngine {
         this._completedVisits = campaign.completedVisits || 0
         this._failedVisits = campaign.failedVisits || 0
         this._currentRound = campaign.currentRound || 0
+        this.paused = false
 
         // Initialize thread details
         this.threadDetails = Array.from({ length: safeThreadCount }, (_, i) => ({
@@ -2406,6 +2433,7 @@ export class TrafficBoostEngine {
 
         // MAIN LOOP: keep feeding all remaining visit tasks until target attempts are reached
         while (!this.shouldStop && (completedVisits + failedVisits) < totalVisits) {
+                await this.waitWhilePaused()
                 currentRound++
                 this._currentRound = currentRound
 
@@ -2481,6 +2509,7 @@ export class TrafficBoostEngine {
                             const maxIdlePollsBeforeDone = 20
                             let idlePollCount = 0
                             while (!this.shouldStop) {
+                                await this.waitWhilePaused()
                                 const myIdx = taskIndex++
                                 if (myIdx >= visitTasks.length) {
                                     taskIndex = visitTasks.length
@@ -2496,6 +2525,7 @@ export class TrafficBoostEngine {
                                 idlePollCount = 0
 
                                 const task = visitTasks[myIdx]
+                                await this.waitWhilePaused()
                                 if (task.round > currentRound) {
                                     currentRound = task.round
                                     this._currentRound = currentRound
@@ -3614,6 +3644,7 @@ export class TrafficBoostEngine {
                                     message: `Thread ${threadIdx + 1}: Visit finished, starting next task immediately`,
                                 }))
                             }
+                            await this.waitWhilePaused()
                                 }).catch((queueError) => {
                                     console.error(`[TrafficBoost] Thread ${threadIdx + 1}: queue task crashed`, queueError)
                                 })
@@ -3717,6 +3748,7 @@ export class TrafficBoostEngine {
 
     async stopCampaign(): Promise<void> {
         this.shouldStop = true
+        this.paused = false
         this.running = false
         if (this.currentCampaignId) {
             const db = getDatabase()
@@ -3733,6 +3765,7 @@ export class TrafficBoostEngine {
         this.threadContextIds.clear()
         this.threadDetails = []
         this.currentQueueDepth = 0
+        fproxyService.stopAutoRotate()
         // Broadcast stopped status to UI
         this.sendStatus(this.buildStatus({
             isRunning: false,
@@ -3741,16 +3774,23 @@ export class TrafficBoostEngine {
     }
 
     async pauseCampaign(): Promise<void> {
-        this.shouldStop = true
-        this.running = false
+        // Do NOT set shouldStop (would terminate); use paused flag for freeze at safe points between visits.
+        // Close browser contexts to save resources (per spec: keep full progress/counts/indices in memory+DB).
+        // Persist counters so resume (or app reopen + resume) continues exactly: visits, round, keyword/account order via logs+DB.
+        this.paused = true
+        // keep running=true so monitor treats as active (paused) control session
         if (this.currentCampaignId) {
             const db = getDatabase()
             db.update(schema.trafficCampaigns)
-                .set({ status: 'paused' })
+                .set({
+                    status: 'paused',
+                    completedVisits: this._completedVisits,
+                    failedVisits: this._failedVisits,
+                    currentRound: this._currentRound,
+                })
                 .where(eq(schema.trafficCampaigns.id, this.currentCampaignId))
                 .run()
         }
-        // Immediately close all active browser contexts
         for (const contextId of Array.from(this.activeContexts.keys())) {
             browserService.closeContext(contextId).catch(err => console.error('[TrafficBoost] Error closing context on pause:', err))
         }
@@ -3758,10 +3798,38 @@ export class TrafficBoostEngine {
         this.threadContextIds.clear()
         this.threadDetails = []
         this.currentQueueDepth = 0
-        // Broadcast paused status to UI
+        // Proxy rotation: freeze remaining (app-controlled) so pause time not counted toward next rotate
+        fproxyService.pauseAutoRotate()
+        // Broadcast: isRunning remains true, consumers use isPaused for UI state (Resume button etc)
         this.sendStatus(this.buildStatus({
-            isRunning: false,
             message: '⏸ Campaign paused',
+        }))
+    }
+
+    async resumeCampaign(): Promise<void> {
+        // If engine not currently controlling (e.g. app was closed while paused), recover the paused campaign from DB and start (it will load persisted counters/round/logs-skip for exact resume point)
+        if (!this.running || !this.currentCampaignId) {
+            const db = getDatabase()
+            const pausedCamp = db.select().from(schema.trafficCampaigns)
+                .where(eq(schema.trafficCampaigns.status, 'paused')).get()
+            if (pausedCamp) {
+                // startCampaign will load _completed/_currentRound from row, rebuild remaining tasks, run
+                await this.startCampaign(pausedCamp.id).catch(e => console.error('[TrafficBoost] resume start error', e))
+            }
+            return
+        }
+        this.paused = false
+        if (this.currentCampaignId) {
+            const db = getDatabase()
+            db.update(schema.trafficCampaigns)
+                .set({ status: 'running' })
+                .where(eq(schema.trafficCampaigns.id, this.currentCampaignId))
+                .run()
+        }
+        // Proxy: resume with freeze-remaining restore + refresh-if-expired (provider safeguard)
+        fproxyService.resumeAutoRotate()
+        this.sendStatus(this.buildStatus({
+            message: '▶ Campaign resumed',
         }))
     }
 

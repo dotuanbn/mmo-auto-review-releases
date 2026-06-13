@@ -226,6 +226,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         start: (id: number) => ipcRenderer.invoke('trafficBoost:start', id),
         stop: () => ipcRenderer.invoke('trafficBoost:stop'),
         pause: () => ipcRenderer.invoke('trafficBoost:pause'),
+        resume: () => ipcRenderer.invoke('trafficBoost:resume'),
         getStatus: () => ipcRenderer.invoke('trafficBoost:getStatus'),
         getReport: (id: number) => ipcRenderer.invoke('trafficBoost:getReport', id),
         getLogs: (campaignId: number) => ipcRenderer.invoke('trafficBoost:getLogs', campaignId),

@@ -392,6 +392,7 @@
     "totalVisitsCalc": "total visits",
     "creating": "Creating...",
     "pause": "Pause",
+    "resume": "Resume",
     "stop": "Stop",
     "start": "Start",
     "deleteConfirm": "Delete this campaign and all its logs?",

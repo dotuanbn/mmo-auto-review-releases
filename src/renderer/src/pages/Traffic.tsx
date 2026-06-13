@@ -97,6 +97,7 @@ interface ThreadDetail {
 
 interface LiveStatus {
     isRunning: boolean
+    isPaused?: boolean
     campaignId: number | null
     campaignName: string
     currentRound: number
@@ -215,6 +216,7 @@ interface MonitorActionLog {
 
 interface RuntimeStatusPayload {
     isRunning?: boolean
+    isPaused?: boolean
     campaignId?: number | null
     campaignName?: string
     currentRound?: number
@@ -351,6 +353,7 @@ function normalizeLiveStatus(payload: RuntimeStatusPayload | null | undefined): 
 
     return {
         isRunning: payload?.isRunning === true,
+        isPaused: payload?.isPaused === true,
         campaignId: payload?.campaignId ?? null,
         campaignName: payload?.campaignName || '',
         currentRound: Number(payload?.currentRound || 0),
@@ -642,6 +645,17 @@ export function Traffic() {
         }
     }, [liveStatus?.isRunning, fetchCampaigns])
 
+    // Problem 1: on renderer mount / data load, if active (running/paused) campaign, auto switch to "Giám sát trực tiếp" (monitor tab)
+    // Query via IPC (liveStatus + campaigns list) to restore monitoring view; only on initial to avoid stealing user tab switches.
+    useEffect(() => {
+        if (activeTabRef.current !== 'campaigns') return
+        const hasLiveActive = !!(liveStatus && (liveStatus.isRunning || liveStatus.isPaused))
+        const hasDbActive = campaigns.some(c => c.status === 'running' || c.status === 'paused')
+        if (hasLiveActive || hasDbActive) {
+            setActiveTab('monitor')
+        }
+    }, [liveStatus, campaigns]) // runs after initial fetches; tab ref guards re-entrancy for user actions
+
     // ============================================================
     // Actions
     // ============================================================
@@ -672,6 +686,15 @@ export function Traffic() {
             await api.trafficBoost.pause()
         } catch (err) {
             console.error('Failed to pause campaign:', err)
+        }
+    }
+
+    const handleResumeCampaign = async () => {
+        try {
+            await api.trafficBoost.resume?.()
+            // engine will set running + monitor listeners will update
+        } catch (err) {
+            console.error('Failed to resume campaign:', err)
         }
     }
 
@@ -763,6 +786,7 @@ export function Traffic() {
                 <CampaignsTab
                     campaigns={campaigns}
                     onStart={handleStartCampaign}
+                    onResume={handleResumeCampaign}
                     onDelete={handleDeleteCampaign}
                     onDeleteMany={handleDeleteCampaigns}
                     onViewReport={handleViewReport}
@@ -780,6 +804,7 @@ export function Traffic() {
                     mcpHealth={mcpHealth}
                     onStop={handleStopCampaign}
                     onPause={handlePauseCampaign}
+                    onResume={handleResumeCampaign}
                     onRefresh={fetchStatus}
                 />
             )}
@@ -814,9 +839,10 @@ export function Traffic() {
 // Campaigns Tab
 // ============================================================
 
-function CampaignsTab({ campaigns, onStart, onDelete, onDeleteMany, onViewReport, onRefresh }: {
+function CampaignsTab({ campaigns, onStart, onResume, onDelete, onDeleteMany, onViewReport, onRefresh }: {
     campaigns: Campaign[]
     onStart: (id: number) => void
+    onResume: () => void
     onDelete: (id: number) => void
     onDeleteMany: (ids: number[]) => Promise<void> | void
     onViewReport: (id: number) => void
@@ -957,6 +983,11 @@ function CampaignsTab({ campaigns, onStart, onDelete, onDeleteMany, onViewReport
                                             {t('traffic.start')}
                                         </PrimaryButton>
                                     )}
+                                    {c.status === 'paused' && (
+                                        <PrimaryButton tone="emerald" icon={Play} onClick={() => onResume()}>
+                                            {t('traffic.resume')}
+                                        </PrimaryButton>
+                                    )}
                                     <PrimaryButton variant="quiet" icon={BarChart3} onClick={() => onViewReport(c.id)}>
                                         {t('traffic.report')}
                                     </PrimaryButton>
@@ -1058,7 +1089,7 @@ function ThreadCursorPreview({ thread, clickVersion }: {
 // Live Monitor Tab
 // ============================================================
 
-function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, onStop, onPause, onRefresh }: {
+function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, onStop, onPause, onResume, onRefresh }: {
     status: LiveStatus | null
     actionLogs: MonitorActionLog[]
     runtimePolicy: RuntimePolicy | null
@@ -1067,6 +1098,7 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
     mcpHealth: McpHealth | null
     onStop: () => void
     onPause: () => void
+    onResume: () => void
     onRefresh: () => void
 }) {
     const { t } = useI18n()
@@ -1094,9 +1126,9 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
         }
     }, [status?.threads])
 
-    // Poll FProxy info every 5 seconds when campaign is running
+    // Poll FProxy info every 5 seconds when campaign is running or paused (to keep timer display in sync on resume)
     useEffect(() => {
-        if (!status?.isRunning || effectiveMode !== 'fproxy') {
+        if ((!status?.isRunning && !status?.isPaused) || effectiveMode !== 'fproxy') {
             setFproxyInfo(null)
             return
         }
@@ -1148,9 +1180,15 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                         </p>
                     </div>
                     <div className="flex gap-2">
-                        <PrimaryButton tone="amber" variant="quiet" icon={Pause} onClick={onPause}>
-                            {t('traffic.pause')}
-                        </PrimaryButton>
+                        {status?.isPaused ? (
+                            <PrimaryButton tone="emerald" variant="quiet" icon={Play} onClick={onResume}>
+                                {t('traffic.resume')}
+                            </PrimaryButton>
+                        ) : (
+                            <PrimaryButton tone="amber" variant="quiet" icon={Pause} onClick={onPause}>
+                                {t('traffic.pause')}
+                            </PrimaryButton>
+                        )}
                         <PrimaryButton tone="rose" variant="quiet" icon={Square} onClick={onStop}>
                             {t('traffic.stop')}
                         </PrimaryButton>

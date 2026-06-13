@@ -231,3 +231,12 @@ Last updated: 2026-06-xx
 - Per SOP/Antigravity + user terse constraint: context/qa first, short plan (profile reuse + verify + BC cookies), only TrafficBoostEngine.ts edits (reuse in ensure, robust restore+verify in per-visit), self-review (no sec leak, no N+1, DI/BrowserService preserved, <50LOC net, try/catch never break, anon safe + visible reason).
 - typecheck:main: PASS; typecheck:renderer: PASS.
 - Recorded. Short output only.
+
+## 2026-06-xx (Traffic campaign control fixes: auto-monitor route + real pause/resume + proxy time sync)
+- Per user 3 issues on Traffic control (Traffic.tsx, App nav, TrafficBoostEngine, FProxy, IPC/preload).
+- Context+qa+full reads of engines/IPC/UI/stores/proxy first (SOP). Short plan per module I/O, no other flows touched.
+- 1: App mount + Traffic load query IPC status+campaigns (running/paused), auto setPage('traffic') + set 'monitor' tab (ref guard). Restore from engine/DB on renderer boot.
+- 2: Engine: added `paused` flag + waitWhilePaused() at visit boundaries (not shouldStop); pause persists counts/round/status+closes pages (keep progress), fproxy pause capture; resume unpauses or DB-recover+start (loads persisted, no reset); UI conditional Resume/ Tiếp tục button + list support; IPC/preload added resume; i18n.
+- 3: FProxy (actual: app interval + provider-synced dieAt/waiting_time): added pauseAutoRotate (capture rem), resumeAutoRotate (restore dieAt for freeze + restart + refresh-if-expired). Engine calls on p/r. Chose freeze-remaining (app-controlled) as rotation scheduled by app timer per real code; provider refresh as guard.
+- typecheck (full `npm run typecheck`): PASS (0 errors). No login/identity/progress break. Persist via existing campaign row + logs. Self-review: small funcs, safe awaits, strict optional, DB sync on p/r, proxy choice documented.
+- Recorded. Short final per request.

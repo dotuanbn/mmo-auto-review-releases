@@ -51,6 +51,7 @@ export class FProxyService {
     private _proxyRotated: boolean = false
     private _lastRotatedAt: number = 0
     private rotationInFlight: Promise<FProxyData | null> | null = null
+    private pausedRemaining: number | null = null
 
     hasConfiguration(): boolean {
         return !!(this.apiKey || this.currentProxy || this.autoRotateInterval)
@@ -70,6 +71,7 @@ export class FProxyService {
         this._lastRotatedAt = 0
         this.proxyDieAt = 0
         this.rotationInFlight = null
+        this.pausedRemaining = null
         logFProxy(`[FProxy] Configuration cleared (${reason})`)
     }
 
@@ -227,6 +229,7 @@ export class FProxyService {
     // Start auto-rotation timer
     startAutoRotate(intervalMs: number = 120_000) {
         this.stopAutoRotate()
+        this.pausedRemaining = null
         this.rotateIntervalMs = intervalMs
         logFProxy(`[FProxy] Starting auto-rotate every ${intervalMs / 1000}s`)
 
@@ -257,6 +260,36 @@ export class FProxyService {
             this.autoRotateInterval = null
             logFProxy(`[FProxy] Auto-rotate stopped`)
         }
+    }
+
+    // Pause rotation timer for campaign pause: capture remaining to freeze cycle (do not consume pause time)
+    pauseAutoRotate() {
+        if (!this.autoRotateInterval) return
+        const rem = this.getNextRotateIn()
+        this.stopAutoRotate()
+        this.pausedRemaining = rem > 0 ? rem : null
+        logFProxy(`[FProxy] Auto-rotate paused, remaining=${this.pausedRemaining}s (freeze for resume)`)
+    }
+
+    // Resume rotation: restore remaining into proxyDieAt so cycle continues from pause point (freeze), restart timer; refresh if expired
+    resumeAutoRotate() {
+        const interval = this.rotateIntervalMs || 120_000
+        if (this.pausedRemaining != null && this.pausedRemaining > 0) {
+            // App-controlled freeze: continue countdown from captured remaining, pause duration not counted in cycle
+            this.proxyDieAt = Date.now() + (this.pausedRemaining * 1000)
+            logFProxy(`[FProxy] Auto-rotate resume: restored remaining=${this.pausedRemaining}s into proxyDieAt (freeze mode)`)
+        }
+        this.pausedRemaining = null
+        if (!this.autoRotateInterval && this.apiKey) {
+            this.startAutoRotate(interval)
+        }
+        // Provider time-based safeguard: if now expired (lease may have lapsed during pause), refresh current endpoint
+        if (this.getNextRotateIn() <= 0) {
+            this.forceRotate().then(() => {
+                logFProxy(`[FProxy] Resume refresh: forced rotate due to expired/zero remaining`)
+            }).catch(() => {})
+        }
+        logFProxy(`[FProxy] Auto-rotate resumed, next in ~${this.getNextRotateIn()}s`)
     }
 
     // Get time until next auto-rotate (seconds) - SERVER-SYNCED using proxyDieAt
