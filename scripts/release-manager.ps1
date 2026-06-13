@@ -76,6 +76,46 @@ function Ensure-GitHubToken {
     }
 }
 
+function Ensure-GitHubAuth {
+    Write-Host 'Kiem tra gh auth status...' -ForegroundColor Yellow
+    & gh auth status 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        try {
+            $user = & gh api user --jq .login 2>$null
+            if ([string]::IsNullOrWhiteSpace($user)) { $user = 'unknown' }
+            Write-Host "GitHub: da dang nhap ($user)" -ForegroundColor Green
+        } catch {
+            Write-Host 'GitHub: da dang nhap' -ForegroundColor Green
+        }
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'CHUA DANG NHAP GitHub (gh auth status khong ok).' -ForegroundColor Yellow
+    Write-Host 'Can dang nhap GitHub 1 lan (de git push qua HTTPS khong can nhap tay).' -ForegroundColor Yellow
+    Write-Host 'Interactive: chon GitHub.com + HTTPS + login qua trinh duyet hoac device code.' -ForegroundColor DarkGray
+    & gh auth login
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Dang nhap GitHub that bai.'
+    }
+
+    Write-Host 'Dang chay gh auth setup-git (de git dung gh lam credential helper)...' -ForegroundColor Yellow
+    & gh auth setup-git
+
+    & gh auth status 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Chua dang nhap GitHub, khong the push.'
+    }
+
+    try {
+        $user = & gh api user --jq .login 2>$null
+        if ([string]::IsNullOrWhiteSpace($user)) { $user = 'unknown' }
+        Write-Host "GitHub: da dang nhap ($user)" -ForegroundColor Green
+    } catch {
+        Write-Host 'GitHub: da dang nhap' -ForegroundColor Green
+    }
+}
+
 function Show-Menu {
     Write-Host 'Vui lòng đưa ra lựa chọn (gõ số):' -ForegroundColor Green
     Write-Host '1) CẬP NHẬT VERSION MỚI + Commit + Tag + Push -> CI build Windows (nsis+portable) + macOS (dmg+zip) + Publish Release' -ForegroundColor Cyan
@@ -139,11 +179,30 @@ function Run-Action {
                 return
             }
 
+            Ensure-GitHubAuth
+
             $branch = git rev-parse --abbrev-ref HEAD
             git add package.json
             & git commit -m "chore(release): v$newVer"
             & git tag "v$newVer"
+
+            Write-Host 'Kiem tra quyen push (gh auth + ls-remote origin)...' -ForegroundColor Yellow
+            & git ls-remote --exit-code origin HEAD 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host 'Loi mang hoac khong co quyen push toi origin.' -ForegroundColor Red
+                Write-Host "Da bump + commit + tao tag local v$newVer. De xoa tag local: git tag -d v$newVer ; git reset --soft HEAD~1 (neu muon undo commit)" -ForegroundColor Yellow
+                throw 'Khong the push. Dang nhap gh roi chay lai Option 1.'
+            }
+
             & git push origin $branch --tags
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host ''
+                Write-Host 'PUSH THAT BAI.' -ForegroundColor Red
+                Write-Host "Da bump version + commit + tag local: v$newVer (branch: $branch)" -ForegroundColor Yellow
+                Write-Host "De xoa tag local (neu can): git tag -d v$newVer" -ForegroundColor Yellow
+                Write-Host 'Sau khi chay "gh auth login" + "gh auth setup-git", chay lai Option 1 (hoac thu: git push origin $branch --tags).' -ForegroundColor Yellow
+                throw "Push that bai sau khi da tao tag local v$newVer."
+            }
 
             Write-Host ''
             Write-Host '============================================================' -ForegroundColor Green
