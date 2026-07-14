@@ -34,6 +34,27 @@ import type {
     CaptchaMetricsResetResult,
     CaptchaMetricsSnapshot,
 } from '../shared/captcha-metrics-contracts'
+import type {
+    PendingReviewIntent,
+    ReviewIntentReconcileResult,
+    ReviewReconcileOutcome,
+} from '../shared/compliance-contracts'
+import type {
+    CreateBackupOptionsInput,
+    CreateBackupResult,
+    PublicBackupInspect,
+    PublicBackupSummary,
+    RestoreBackupOptionsInput,
+    RestoreBackupResult,
+} from '../shared/backup-contracts'
+import type {
+    ComplianceAuditListResult,
+    ComplianceAuditQuery,
+} from '../shared/compliance-audit-contracts'
+import type {
+    TrafficVisitQueueStatsDto,
+    TrafficVisitRecoverResult,
+} from '../shared/traffic-visit-contracts'
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
@@ -278,6 +299,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getReport: (id: number) => ipcRenderer.invoke('trafficBoost:getReport', id),
         getLogs: (campaignId: number) => ipcRenderer.invoke('trafficBoost:getLogs', campaignId),
         getAudit: (campaignId: number) => ipcRenderer.invoke('trafficBoost:getAudit', campaignId),
+        /** Durable per-visit queue counters — channel trafficBoost:getVisitQueueStats. */
+        getVisitQueueStats: (campaignId: number): Promise<TrafficVisitQueueStatsDto> =>
+            ipcRenderer.invoke('trafficBoost:getVisitQueueStats', campaignId),
+        /** Recover expired running visit leases — channel trafficBoost:recoverVisitLeases. */
+        recoverVisitLeases: (campaignId: number): Promise<TrafficVisitRecoverResult> =>
+            ipcRenderer.invoke('trafficBoost:recoverVisitLeases', campaignId),
         // Real-time status updates from main process
         onStatusUpdate: (callback: (status: any) => void) => {
             const handler = (_event: any, status: any) => callback(status)
@@ -322,7 +349,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
             ipcRenderer.invoke('profiles:migrate', payload),
     },
 
-    // Portable data root + migration + storage usage
+    // Portable data root + migration + storage usage + managed backup / audit
     data: {
         getRoot: () => ipcRenderer.invoke('data:getRoot'),
         detectLegacy: () => ipcRenderer.invoke('data:detectLegacy'),
@@ -330,6 +357,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getStorageInfo: () => ipcRenderer.invoke('data:getStorageInfo'),
         openPath: (targetPath: string) => ipcRenderer.invoke('data:openPath', targetPath),
         clearCaches: () => ipcRenderer.invoke('data:clearCaches'),
+        /** Managed backup — channel data:backupCreate (options?). */
+        createBackup: (options?: CreateBackupOptionsInput): Promise<CreateBackupResult> =>
+            ipcRenderer.invoke('data:backupCreate', options),
+        /** Managed backup list — channel data:backupList. */
+        listBackups: (): Promise<PublicBackupSummary[]> =>
+            ipcRenderer.invoke('data:backupList'),
+        /** Inspect one backup package — channel data:backupInspect(backupId). */
+        inspectBackup: (backupId: string): Promise<PublicBackupInspect> =>
+            ipcRenderer.invoke('data:backupInspect', backupId),
+        /** Restore from managed backup — channel data:backupRestore(options). */
+        restoreBackup: (options: RestoreBackupOptionsInput): Promise<RestoreBackupResult> =>
+            ipcRenderer.invoke('data:backupRestore', options),
+        /** Bounded compliance audit history — channel data:getComplianceAudit(query?). */
+        getComplianceAudit: (query?: ComplianceAuditQuery): Promise<ComplianceAuditListResult> =>
+            ipcRenderer.invoke('data:getComplianceAudit', query),
     },
 
     // App updates
@@ -379,11 +421,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
             ipcRenderer.invoke('tiling:isEnabled'),
     },
 
-    // Compliance manual-confirm queue
+    // Compliance manual-confirm queue + durable review_history intent reconcile
     compliance: {
         getPendingReviewSubmissions: () => ipcRenderer.invoke('compliance:getPendingReviewSubmissions'),
         approveReviewSubmission: (requestId: string) => ipcRenderer.invoke('compliance:approveReviewSubmission', requestId),
         rejectReviewSubmission: (requestId: string, reason?: string) => ipcRenderer.invoke('compliance:rejectReviewSubmission', requestId, reason),
+        /** Durable submitting/unconfirmed intents — channel compliance:getPendingReviewIntents. */
+        getPendingReviewIntents: (): Promise<PendingReviewIntent[]> =>
+            ipcRenderer.invoke('compliance:getPendingReviewIntents'),
+        /**
+         * Operator reconcile of one history row —
+         * channel compliance:reconcileReviewIntent(historyId, outcome, note?).
+         */
+        reconcileReviewIntent: (
+            historyId: number,
+            outcome: ReviewReconcileOutcome,
+            note?: string,
+        ): Promise<ReviewIntentReconcileResult> =>
+            ipcRenderer.invoke('compliance:reconcileReviewIntent', historyId, outcome, note),
         onReviewSubmissionPending: (callback: (payload: any) => void) => {
             const handler = (_event: any, payload: any) => callback(payload)
             ipcRenderer.on('compliance:reviewSubmissionPending', handler)
@@ -711,6 +766,8 @@ declare global {
                 getReport: (id: number) => Promise<any>
                 getLogs: (campaignId: number) => Promise<any>
                 getAudit: (campaignId: number) => Promise<any>
+                getVisitQueueStats: (campaignId: number) => Promise<TrafficVisitQueueStatsDto>
+                recoverVisitLeases: (campaignId: number) => Promise<TrafficVisitRecoverResult>
                 onStatusUpdate: (callback: (status: any) => void) => () => void
             }
             runtime: {
@@ -740,6 +797,11 @@ declare global {
                 getStorageInfo: () => Promise<any>
                 openPath: (targetPath: string) => Promise<any>
                 clearCaches: () => Promise<any>
+                createBackup: (options?: CreateBackupOptionsInput) => Promise<CreateBackupResult>
+                listBackups: () => Promise<PublicBackupSummary[]>
+                inspectBackup: (backupId: string) => Promise<PublicBackupInspect>
+                restoreBackup: (options: RestoreBackupOptionsInput) => Promise<RestoreBackupResult>
+                getComplianceAudit: (query?: ComplianceAuditQuery) => Promise<ComplianceAuditListResult>
             }
             updates: {
                 getState: () => Promise<any>
@@ -776,6 +838,12 @@ declare global {
                 getPendingReviewSubmissions: () => Promise<any[]>
                 approveReviewSubmission: (requestId: string) => Promise<{ success: boolean; message: string }>
                 rejectReviewSubmission: (requestId: string, reason?: string) => Promise<{ success: boolean; message: string }>
+                getPendingReviewIntents: () => Promise<PendingReviewIntent[]>
+                reconcileReviewIntent: (
+                    historyId: number,
+                    outcome: ReviewReconcileOutcome,
+                    note?: string,
+                ) => Promise<ReviewIntentReconcileResult>
                 onReviewSubmissionPending: (callback: (payload: any) => void) => () => void
                 onReviewSubmissionResolved: (callback: (payload: any) => void) => () => void
                 onReviewSubmissionQueue: (callback: (payload: any[]) => void) => () => void

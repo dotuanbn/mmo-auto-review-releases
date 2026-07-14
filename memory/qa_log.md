@@ -22,3 +22,9 @@ A: Yes. FingerprintService: NT 11.0->10.0, OS-split WebGL, generateForUserAgent,
 Q: Đã hoàn tất các hạng mục trong captcha_bypass_research.md như thế nào?
 
 A: Đã thêm bounded Google throttle, adaptive delay/session warming, image-grid solver CapSolver/2Captcha fail-closed, verification sau click/token, metrics SQLite v3 + IPC/preload + Settings dashboard, và smoke coverage. Stealth dùng một patch path, UA/Client Hints/WebGL đồng bộ theo OS; không tuyên bố spoof TLS/JA3 vì Chromium/Electron hiện tại không hỗ trợ an toàn nếu không đổi browser/proxy stack. Verification: `gate:quick` pass; 664/664 tests pass; electron-builder NSIS + portable pass; Electron feature smoke 19/19, 0 page errors, 0 console errors tại `output/electron-feature-smoke/2026-07-14T16-08-38-100Z`.
+
+## 2026-07-15 [architecture] [security] [testing] [ui] [deploy]
+
+Q: How were release hardening, durable operations, reconciliation, backup/restore, and compliance audit completed?
+
+A: Added reusable release quality gates; packaged unpacked/NSIS smoke with temp-only data-root override before runtime imports; atomic review-intent reconciliation; durable Traffic visit queue and JobQueue persist rollback; user-facing backup/restore with RESTORE confirmation, checksum/SQLite/symlink guards and pre-restore snapshot; exact-count compliance audit pagination. Verification: `npm run gate:quick` pass; `npm run test:run` pass 845/845; source, win-unpacked, and silent NSIS smoke each pass 23/23 with 0 page/console errors; NSIS and portable builds pass. Live credential-gated Google/proxy/provider flows remain outside deterministic smoke.

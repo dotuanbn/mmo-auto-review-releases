@@ -1,6 +1,8 @@
 import { ipcMain } from 'electron'
 import {
     complianceApproveArgsSchema,
+    complianceGetPendingReviewIntentsArgsSchema,
+    complianceReconcileArgsSchema,
     complianceRejectArgsSchema,
 } from '../../shared/compliance-contracts'
 import {
@@ -8,9 +10,11 @@ import {
     getPendingManualReviewSubmissionRequests,
     rejectManualReviewSubmission,
 } from '../services/ComplianceService'
+import { reviewService } from '../services/ReviewService'
 import { parseIpcArgs, withIpcValidation } from './validate'
 
 export function registerComplianceHandlers(): void {
+    // --- Pre-submit manual approval (in-memory queue) ---
     ipcMain.handle(
         'compliance:getPendingReviewSubmissions',
         withIpcValidation('compliance:getPendingReviewSubmissions', async () => {
@@ -43,6 +47,44 @@ export function registerComplianceHandlers(): void {
                 )
                 // Unknown requestId still reaches service → { success: false, ... }
                 return rejectManualReviewSubmission(parsedId, parsedReason)
+            },
+        ),
+    )
+
+    // --- Durable review_history intent reconciliation (submitting/unconfirmed) ---
+    // Distinct from pre-submit approve/reject above.
+    ipcMain.handle(
+        'compliance:getPendingReviewIntents',
+        withIpcValidation('compliance:getPendingReviewIntents', async () => {
+            parseIpcArgs(
+                'compliance:getPendingReviewIntents',
+                complianceGetPendingReviewIntentsArgsSchema,
+                [],
+            )
+            return reviewService.getPendingReviewIntents()
+        }),
+    )
+
+    ipcMain.handle(
+        'compliance:reconcileReviewIntent',
+        withIpcValidation(
+            'compliance:reconcileReviewIntent',
+            async (
+                _event,
+                historyId: unknown,
+                outcome: unknown,
+                note?: unknown,
+            ) => {
+                const [parsedId, parsedOutcome, parsedNote] = parseIpcArgs(
+                    'compliance:reconcileReviewIntent',
+                    complianceReconcileArgsSchema,
+                    [historyId, outcome, note],
+                )
+                return reviewService.reconcileReviewIntent(
+                    parsedId,
+                    parsedOutcome,
+                    parsedNote,
+                )
             },
         ),
     )

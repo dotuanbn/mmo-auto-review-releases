@@ -10,8 +10,16 @@ permissions:
   contents: write
 
 jobs:
+  # Quality gate must pass before any packaging or release upload.
+  quality:
+    uses: ./.github/workflows/quality.yml
+
   build-win:
+    name: Windows build + packaged smoke + release upload
+    needs: quality
     runs-on: windows-latest
+    timeout-minutes: 90
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,6 +33,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
         env:
+          # Electron smoke uses Playwright's Electron driver, not Chromium browsers
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
 
       - name: Build app (Vite)
@@ -32,17 +41,59 @@ jobs:
         env:
           NODE_OPTIONS: '--max_old_space_size=4096'
 
-      - name: Build Windows (nsis + portable) + Publish to GitHub Release
-        run: npx electron-builder --win --publish always
+      # Publish only after smoke passes (upload step below). Never publish untested artifacts.
+      - name: Build Windows (nsis + portable) — publish never
+        run: npx electron-builder --win --publish never
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
           NODE_OPTIONS: '--max_old_space_size=4096'
 
-      - name: List artifacts (win)
-        run: dir release\* 2>$null || echo "No release dir"
+      - name: List Windows artifacts
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'release') {
+            Get-ChildItem -LiteralPath 'release' -Recurse -File | Select-Object FullName, Length
+          } else {
+            throw 'release/ directory missing after electron-builder'
+          }
+
+      - name: Packaged smoke — win-unpacked
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\packaged-feature-smoke.ps1 -Mode unpacked
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+
+      - name: Packaged smoke — NSIS silent install
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\packaged-feature-smoke.ps1 -Mode nsis
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+
+      # Upload only after both smoke steps succeed (previous steps must pass).
+      - name: Upload Windows artifacts to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: dotuanbn/mmo-auto-review-releases
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            release/MMO-Auto-Review-Setup-*.exe
+            release/MMO-Auto-Review-*.exe
+            release/latest.yml
+            release/*.blockmap
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
 
   build-mac:
+    name: macOS build + release upload
+    needs: quality
     runs-on: macos-latest
+    timeout-minutes: 90
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -63,12 +114,28 @@ jobs:
         env:
           NODE_OPTIONS: '--max_old_space_size=4096'
 
-      - name: Build macOS (dmg + zip x64/arm64) + Publish to GitHub Release
-        run: npx electron-builder --mac --publish always
+      - name: Build macOS (dmg + zip x64/arm64) — publish never
+        run: npx electron-builder --mac --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
-          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
           NODE_OPTIONS: '--max_old_space_size=4096'
 
       - name: List artifacts (mac)
         run: ls -la release/*.dmg release/*.zip release/*.yml 2>/dev/null || echo "List done"
+
+      - name: Upload macOS artifacts to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: dotuanbn/mmo-auto-review-releases
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            release/MMO-Auto-Review-*.dmg
+            release/MMO-Auto-Review-*.zip
+            release/latest-mac.yml
+            release/*.blockmap
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}

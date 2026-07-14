@@ -61,6 +61,20 @@ const BLOCKING_STATUSES: JobStatus[] = ['pending', 'running', 'done', 'failed']
 /** Immutable terminals: history kept; no async overwrite allowed. */
 const IMMUTABLE_TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>(['done', 'cancelled'])
 
+/** Mutable job fields + membership flags snapshotted before persist-bound transitions. */
+interface JobMutationSnapshot {
+    status: JobStatus
+    retryCount: number
+    error: string | undefined
+    result: string | undefined
+    startedAt: string | undefined
+    completedAt: string | undefined
+    inRunning: boolean
+    inHidden: boolean
+    /** Index in accountQueues, or -1 if absent. */
+    queueIndex: number
+}
+
 export function isImmutableTerminalStatus(status: JobStatus): boolean {
     return IMMUTABLE_TERMINAL.has(status)
 }
@@ -228,6 +242,78 @@ class JobQueue {
         }
     }
 
+    /**
+     * Snapshot job fields + running/hidden/queue membership for exact rollback
+     * if persist throws after an in-memory mutation.
+     */
+    private captureMutationState(job: Job): JobMutationSnapshot {
+        const queue = this.accountQueues.get(job.accountId)
+        return {
+            status: job.status,
+            retryCount: job.retryCount,
+            error: job.error,
+            result: job.result,
+            startedAt: job.startedAt,
+            completedAt: job.completedAt,
+            inRunning: this.runningJobs.has(job.id),
+            inHidden: this.hiddenTerminalJobs.has(job.id),
+            queueIndex: queue ? queue.indexOf(job.id) : -1,
+        }
+    }
+
+    /** Restore fields/sets/maps to a prior captureMutationState snapshot. */
+    private restoreMutationState(job: Job, snap: JobMutationSnapshot): void {
+        job.status = snap.status
+        job.retryCount = snap.retryCount
+        job.error = snap.error
+        job.result = snap.result
+        job.startedAt = snap.startedAt
+        job.completedAt = snap.completedAt
+
+        if (snap.inRunning) this.runningJobs.add(job.id)
+        else this.runningJobs.delete(job.id)
+
+        if (snap.inHidden) this.hiddenTerminalJobs.add(job.id)
+        else this.hiddenTerminalJobs.delete(job.id)
+
+        this.restoreQueueMembership(job, snap.queueIndex)
+    }
+
+    private restoreQueueMembership(job: Job, queueIndex: number): void {
+        let queue = this.accountQueues.get(job.accountId)
+        if (!queue) {
+            if (queueIndex < 0) return
+            queue = []
+            this.accountQueues.set(job.accountId, queue)
+        }
+        const currentIdx = queue.indexOf(job.id)
+        if (currentIdx > -1) queue.splice(currentIdx, 1)
+        if (queueIndex >= 0) {
+            queue.splice(Math.min(queueIndex, queue.length), 0, job.id)
+        }
+    }
+
+    /** Undo a brand-new job that was indexed but never successfully persisted. */
+    private unindexNewJob(job: Job): void {
+        this.jobs.delete(job.id)
+        this.runningJobs.delete(job.id)
+        this.hiddenTerminalJobs.delete(job.id)
+        this.removeFromAccountQueue(job)
+    }
+
+    /**
+     * Persist after in-memory mutation; on throw restore snapshot and rethrow
+     * so callers never observe a half-applied transition.
+     */
+    private async persistOrRollback(job: Job, snap: JobMutationSnapshot): Promise<void> {
+        try {
+            await this.persistJob(job)
+        } catch (error) {
+            this.restoreMutationState(job, snap)
+            throw error
+        }
+    }
+
     private async persistJob(job: Job): Promise<void> {
         const db = getDatabase()
         const values: schema.NewJobQueueEntry = {
@@ -357,21 +443,31 @@ class JobQueue {
 
     async addJob(params: Omit<Job, 'id' | 'status' | 'retryCount' | 'createdAt'>): Promise<Job> {
         await this.ensureLoaded()
+        return this.runExclusive(async () => {
+            const job: Job = {
+                id: this.generateJobId(),
+                ...params,
+                status: 'pending',
+                retryCount: 0,
+                maxRetries: params.maxRetries || this.config.maxRetriesPerJob,
+                createdAt: new Date().toISOString(),
+            }
 
-        const job: Job = {
-            id: this.generateJobId(),
-            ...params,
-            status: 'pending',
-            retryCount: 0,
-            maxRetries: params.maxRetries || this.config.maxRetriesPerJob,
-            createdAt: new Date().toISOString(),
-        }
+            this.indexJob(job)
+            try {
+                await this.persistJob(job)
+            } catch (error) {
+                this.unindexNewJob(job)
+                console.error(
+                    `[JobQueue] addJob persist failed for ${job.id}; rolled back memory:`,
+                    error
+                )
+                throw error
+            }
 
-        this.indexJob(job)
-        await this.persistJob(job)
-
-        console.log(`[JobQueue] Added job ${job.id} for account ${job.accountId}`)
-        return job
+            console.log(`[JobQueue] Added job ${job.id} for account ${job.accountId}`)
+            return job
+        })
     }
 
     async addCampaignJobs(
@@ -492,16 +588,13 @@ class JobQueue {
             // Defensive: status may have changed only if exclusivity broken; re-check.
             if (job.status !== 'pending') return null
 
-            const previousStartedAt = job.startedAt
+            const snap = this.captureMutationState(job)
             job.status = 'running'
             job.startedAt = new Date().toISOString()
             this.runningJobs.add(job.id)
             try {
-                await this.persistJob(job)
+                await this.persistOrRollback(job, snap)
             } catch (error) {
-                job.status = 'pending'
-                job.startedAt = previousStartedAt
-                this.runningJobs.delete(job.id)
                 console.error(
                     `[JobQueue] claimNextJob persist failed for ${job.id}; rolled back memory:`,
                     error
@@ -548,10 +641,11 @@ class JobQueue {
                 return { applied: false, status: job.status, reason: `invalid_from_${job.status}` }
             }
 
+            const snap = this.captureMutationState(job)
             job.status = 'running'
             job.startedAt = new Date().toISOString()
             this.runningJobs.add(jobId)
-            await this.persistJob(job)
+            await this.persistOrRollback(job, snap)
             console.log(`[JobQueue] Job ${jobId} started`)
             return { applied: true, status: 'running' }
         })
@@ -584,12 +678,13 @@ class JobQueue {
                 return { applied: false, status: job.status, reason: `invalid_from_${job.status}` }
             }
 
+            const snap = this.captureMutationState(job)
             job.status = 'done'
             job.completedAt = new Date().toISOString()
             job.result = result !== undefined ? JSON.stringify(result) : undefined
             this.runningJobs.delete(jobId)
             this.removeFromAccountQueue(job)
-            await this.persistJob(job)
+            await this.persistOrRollback(job, snap)
             console.log(`[JobQueue] Job ${jobId} completed`)
             return { applied: true, status: 'done' }
         })
@@ -621,6 +716,7 @@ class JobQueue {
                 return { applied: false, status: job.status, reason: `invalid_from_${job.status}` }
             }
 
+            const snap = this.captureMutationState(job)
             job.retryCount++
             job.error = error
             this.runningJobs.delete(jobId)
@@ -636,7 +732,7 @@ class JobQueue {
                 console.log(`[JobQueue] Job ${jobId} failed permanently after ${job.retryCount} retries`)
             }
 
-            await this.persistJob(job)
+            await this.persistOrRollback(job, snap)
             return { applied: true, status: job.status }
         })
     }
@@ -670,12 +766,13 @@ class JobQueue {
                 return { applied: false, status: job.status, reason: `invalid_from_${job.status}` }
             }
 
+            const snap = this.captureMutationState(job)
             job.status = 'failed'
             job.error = error
             job.completedAt = new Date().toISOString()
             this.runningJobs.delete(jobId)
             this.removeFromAccountQueue(job)
-            await this.persistJob(job)
+            await this.persistOrRollback(job, snap)
             console.log(`[JobQueue] Job ${jobId} marked permanently failed (no retry)`)
             return { applied: true, status: 'failed' }
         })
@@ -705,11 +802,12 @@ class JobQueue {
                 return { applied: false, status: job.status, reason: `invalid_from_${job.status}` }
             }
 
+            const snap = this.captureMutationState(job)
             job.status = 'cancelled'
             job.completedAt = new Date().toISOString()
             this.runningJobs.delete(jobId)
             this.removeFromAccountQueue(job)
-            await this.persistJob(job)
+            await this.persistOrRollback(job, snap)
             console.log(`[JobQueue] Job ${jobId} cancelled`)
             return { applied: true, status: 'cancelled' }
         })
@@ -749,6 +847,7 @@ class JobQueue {
                 return false
             }
 
+            const snap = this.captureMutationState(job)
             job.status = 'pending'
             job.retryCount = 0
             job.error = undefined
@@ -757,7 +856,7 @@ class JobQueue {
             this.runningJobs.delete(jobId)
             this.hiddenTerminalJobs.delete(jobId)
             this.indexJob(job)
-            await this.persistJob(job)
+            await this.persistOrRollback(job, snap)
             console.log(`[JobQueue] Job ${jobId} requeued for retry (retryCount reset)`)
             return true
         })

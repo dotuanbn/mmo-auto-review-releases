@@ -1,7 +1,11 @@
 import type {
     ComplianceMutationResult,
     ComplianceResolvedPayload,
+    PendingReviewIntent,
+    PendingReviewIntentStatus,
     PendingReviewSubmission,
+    ReviewIntentReconcileResult,
+    ReviewReconcileOutcome,
 } from './types'
 
 interface ComplianceApi {
@@ -20,6 +24,13 @@ interface ComplianceApi {
     onReviewSubmissionQueue: (
         callback: (payload: unknown) => void
     ) => () => void
+    /** Durable intent reconcile — optional until preload exposes channels. */
+    getPendingReviewIntents?: () => Promise<unknown>
+    reconcileReviewIntent?: (
+        historyId: number,
+        outcome: ReviewReconcileOutcome,
+        note?: string
+    ) => Promise<ReviewIntentReconcileResult>
 }
 
 interface ElectronApiWithCompliance {
@@ -50,6 +61,12 @@ function asOptionalNumber(value: unknown): number | undefined {
         return Number.isFinite(n) ? n : undefined
     }
     return undefined
+}
+
+function asNullableNumber(value: unknown): number | null {
+    if (value === null || value === undefined) return null
+    const n = asOptionalNumber(value)
+    return n === undefined ? null : n
 }
 
 export function normalizePendingSubmission(raw: unknown): PendingReviewSubmission | null {
@@ -108,6 +125,89 @@ export function normalizeResolvedPayload(raw: unknown): ComplianceResolvedPayloa
     }
 }
 
+function asIntentStatus(value: unknown): PendingReviewIntentStatus | null {
+    if (value === 'submitting' || value === 'unconfirmed') return value
+    return null
+}
+
+export function normalizePendingReviewIntent(raw: unknown): PendingReviewIntent | null {
+    const record = asRecord(raw)
+    if (!record) return null
+
+    const historyId = asOptionalNumber(record.historyId)
+    const status = asIntentStatus(record.status)
+    const accountId = asOptionalNumber(record.accountId)
+    const locationId = asOptionalNumber(record.locationId)
+    const rating = asOptionalNumber(record.rating)
+    const createdAt = asString(record.createdAt)
+
+    if (
+        historyId === undefined ||
+        !status ||
+        accountId === undefined ||
+        locationId === undefined ||
+        rating === undefined ||
+        !createdAt
+    ) {
+        return null
+    }
+
+    const errorRaw = record.errorMessage
+    const errorMessage =
+        errorRaw === null || errorRaw === undefined
+            ? null
+            : asString(errorRaw)
+
+    return {
+        historyId,
+        status,
+        accountId,
+        locationId,
+        campaignId: asNullableNumber(record.campaignId),
+        rating,
+        reviewTextPreview: asString(record.reviewTextPreview),
+        errorMessage,
+        createdAt,
+        accountEmail: asOptionalString(record.accountEmail),
+        locationName: asOptionalString(record.locationName),
+        locationUrl: asOptionalString(record.locationUrl),
+    }
+}
+
+export function normalizePendingReviewIntents(raw: unknown): PendingReviewIntent[] {
+    if (!Array.isArray(raw)) return []
+    const items: PendingReviewIntent[] = []
+    for (const entry of raw) {
+        const item = normalizePendingReviewIntent(entry)
+        if (item) items.push(item)
+    }
+    return items
+}
+
+export function normalizeReconcileResult(raw: unknown): ReviewIntentReconcileResult {
+    const record = asRecord(raw)
+    if (!record) {
+        return {
+            success: false,
+            message: 'Invalid reconcile response',
+            historyId: 0,
+        }
+    }
+    const historyId = asOptionalNumber(record.historyId) ?? 0
+    const newStatusRaw = record.newStatus
+    const newStatus =
+        newStatusRaw === 'success' || newStatusRaw === 'failed'
+            ? newStatusRaw
+            : undefined
+    return {
+        success: record.success === true,
+        message: asString(record.message, record.success === true ? 'OK' : 'Reconcile failed'),
+        historyId,
+        previousStatus: asOptionalString(record.previousStatus),
+        newStatus,
+    }
+}
+
 export function getComplianceApi(): ComplianceApi | null {
     if (typeof window === 'undefined') {
         return null
@@ -121,6 +221,14 @@ export function getComplianceApi(): ComplianceApi | null {
         return null
     }
     return api.compliance
+}
+
+/** Returns true when durable reconcile IPC methods are exposed. */
+export function hasReviewIntentApi(api: ComplianceApi | null = getComplianceApi()): boolean {
+    return (
+        typeof api?.getPendingReviewIntents === 'function' &&
+        typeof api?.reconcileReviewIntent === 'function'
+    )
 }
 
 export async function fetchPendingSubmissions(): Promise<PendingReviewSubmission[]> {
@@ -149,6 +257,32 @@ export async function rejectSubmission(
         return { success: false, message: 'compliance API unavailable' }
     }
     return api.rejectReviewSubmission(requestId, reason)
+}
+
+export async function fetchPendingReviewIntents(): Promise<PendingReviewIntent[]> {
+    const api = getComplianceApi()
+    if (!api || typeof api.getPendingReviewIntents !== 'function') {
+        throw new Error('review intent reconcile API unavailable')
+    }
+    const raw = await api.getPendingReviewIntents()
+    return normalizePendingReviewIntents(raw)
+}
+
+export async function reconcileReviewIntent(
+    historyId: number,
+    outcome: ReviewReconcileOutcome,
+    note?: string
+): Promise<ReviewIntentReconcileResult> {
+    const api = getComplianceApi()
+    if (!api || typeof api.reconcileReviewIntent !== 'function') {
+        return {
+            success: false,
+            message: 'review intent reconcile API unavailable',
+            historyId,
+        }
+    }
+    const raw = await api.reconcileReviewIntent(historyId, outcome, note)
+    return normalizeReconcileResult(raw)
 }
 
 export function subscribeComplianceQueue(handlers: {

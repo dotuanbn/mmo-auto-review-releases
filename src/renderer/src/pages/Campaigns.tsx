@@ -56,7 +56,12 @@ import {
     type CampaignCreateFormState,
 } from '../components/campaigns/buildCampaignCreatePayload'
 import { CampaignSchedulerPanel } from '../components/scheduler'
-import { CompliancePendingPanel, useComplianceQueue } from '../components/compliance'
+import {
+    CompliancePendingPanel,
+    ReviewIntentReconcilePanel,
+    useComplianceQueue,
+    useReviewIntentQueue,
+} from '../components/compliance'
 
 interface Campaign {
     id: number
@@ -206,6 +211,16 @@ export function Campaigns() {
         approve: approveCompliance,
         reject: rejectCompliance,
     } = useComplianceQueue()
+    const {
+        intents: pendingReviewIntents,
+        loading: reviewIntentsLoading,
+        refreshing: reviewIntentsRefreshing,
+        error: reviewIntentsError,
+        actingId: reviewIntentActingId,
+        available: reviewIntentsAvailable,
+        refresh: refreshReviewIntents,
+        reconcile: reconcileReviewIntentAction,
+    } = useReviewIntentQueue()
 
     const fetchCampaigns = useCallback(async () => {
         try {
@@ -471,6 +486,14 @@ export function Campaigns() {
         void rejectCompliance(requestId, 'rejected_in_campaign_ui')
     }
 
+    const handleReconcileReviewIntent = (
+        historyId: number,
+        outcome: 'confirmed_success' | 'confirmed_not_posted',
+        note?: string,
+    ) => {
+        void reconcileReviewIntentAction(historyId, outcome, note)
+    }
+
     const getProgress = (completed: number, total: number) => {
         return total > 0 ? Math.round((completed / total) * 100) : 0
     }
@@ -502,8 +525,9 @@ export function Campaigns() {
                         fetchResources()
                         void refreshAutomation()
                         void fetchRecoveryReport()
+                        void refreshReviewIntents()
                     }}
-                    className={loading ? 'animate-spin' : undefined}
+                    className={loading || reviewIntentsRefreshing ? 'animate-spin' : undefined}
                 />
                 <PrimaryButton
                     icon={Plus}
@@ -557,12 +581,24 @@ export function Campaigns() {
                 <AutomationMonitor embedded showControls />
             )}
 
-            {/* Pending Review Submissions (compliance operator panel) */}
+            {/* Pending Review Submissions (pre-submit compliance operator panel) */}
             <CompliancePendingPanel
                 pending={pendingSubmissions}
                 actingId={complianceActingId}
                 onApprove={handleApproveSubmission}
                 onReject={handleRejectSubmission}
+            />
+
+            {/* Durable submitting/unconfirmed intents — manual reconcile (distinct from pre-submit) */}
+            <ReviewIntentReconcilePanel
+                intents={pendingReviewIntents}
+                loading={reviewIntentsLoading}
+                refreshing={reviewIntentsRefreshing}
+                error={reviewIntentsError}
+                actingId={reviewIntentActingId}
+                available={reviewIntentsAvailable}
+                onReconcile={handleReconcileReviewIntent}
+                onRefresh={refreshReviewIntents}
             />
 
             {/* Stats Grid */}

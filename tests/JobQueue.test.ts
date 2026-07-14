@@ -636,6 +636,301 @@ describe('JobQueue — markJobPermanentlyFailed (no retry, terminal)', () => {
     })
 })
 
+describe('JobQueue — persist failure rollback parity', () => {
+    let q: JobQueue
+
+    /** Install a DB mock that throws on the next persist (insert/upsert). */
+    function injectPersistFailure(message = 'persist boom'): void {
+        vi.mocked(getDatabase).mockReturnValue({
+            select: () => ({
+                from: () => ({
+                    all: async () => [],
+                    where: () => ({
+                        get: async () => ({ count: 0 }),
+                        all: async () => [],
+                    }),
+                }),
+            }),
+            insert: () => ({
+                values: () => ({
+                    onConflictDoUpdate: async () => {
+                        throw new Error(message)
+                    },
+                }),
+            }),
+            update: () => ({
+                set: () => ({
+                    where: async () => undefined,
+                }),
+            }),
+            delete: () => ({
+                where: async () => undefined,
+            }),
+        } as never)
+    }
+
+    beforeEach(() => {
+        mockDatabase()
+        q = new JobQueue()
+        q.markLoadedForTests()
+    })
+
+    it('addJob persist throw unindexes job (no half-visible enqueue)', async () => {
+        injectPersistFailure('add persist boom')
+        await expect(q.addJob(baseParams())).rejects.toThrow(/add persist boom/)
+        expect(q.getAllJobs()).toHaveLength(0)
+        expect(q.getRunningCount()).toBe(0)
+        expect(q.getStats(1).pending).toBe(0)
+        expect(q.getBlockingPairKeys(1).size).toBe(0)
+    })
+
+    it('startJob persist throw restores pending + runningJobs + startedAt', async () => {
+        const job = await q.addJob(baseParams())
+        injectPersistFailure('start persist boom')
+        await expect(q.startJob(job.id)).rejects.toThrow(/start persist boom/)
+
+        const after = q.getJob(job.id)
+        expect(after?.status).toBe('pending')
+        expect(after?.startedAt).toBeUndefined()
+        expect(q.getRunningCount(1)).toBe(0)
+        // Still claimable / startable after rollback
+        mockDatabase()
+        const started = await q.startJob(job.id)
+        expect(started.applied).toBe(true)
+        expect(q.getJob(job.id)?.status).toBe('running')
+    })
+
+    it('claimNextJob persist throw restores pending (no duplicate claim residue)', async () => {
+        const job = await q.addJob(baseParams())
+        injectPersistFailure('claim persist boom')
+        await expect(q.claimNextJob(1)).rejects.toThrow(/claim persist boom/)
+
+        expect(q.getJob(job.id)?.status).toBe('pending')
+        expect(q.getJob(job.id)?.startedAt).toBeUndefined()
+        expect(q.getRunningCount(1)).toBe(0)
+
+        mockDatabase()
+        const [a, b] = await Promise.all([q.claimNextJob(1), q.claimNextJob(1)])
+        const claimed = [a, b].filter((j): j is Job => j != null)
+        expect(claimed).toHaveLength(1)
+        expect(claimed[0].id).toBe(job.id)
+        expect(q.getRunningCount(1)).toBe(1)
+    })
+
+    it('completeJob persist throw restores running + queue membership', async () => {
+        const job = await q.addJob(baseParams())
+        await q.startJob(job.id)
+        const startedAt = q.getJob(job.id)?.startedAt
+        injectPersistFailure('complete persist boom')
+        await expect(q.completeJob(job.id, { ok: true })).rejects.toThrow(/complete persist boom/)
+
+        const after = q.getJob(job.id)
+        expect(after?.status).toBe('running')
+        expect(after?.completedAt).toBeUndefined()
+        expect(after?.result).toBeUndefined()
+        expect(after?.startedAt).toBe(startedAt)
+        expect(q.getRunningCount(1)).toBe(1)
+        // Account queue still holds active job
+        expect(await q.getNextJobForAccount(10)).toBeNull() // running, not pending peek
+        expect(q.getStats(1).running).toBe(1)
+        expect(q.getStats(1).done).toBe(0)
+
+        mockDatabase()
+        const done = await q.completeJob(job.id, { ok: true })
+        expect(done.applied).toBe(true)
+        expect(q.getJob(job.id)?.status).toBe('done')
+    })
+
+    it('failJob retry-path persist throw restores running + retryCount', async () => {
+        const job = await q.addJob(baseParams({ maxRetries: 3 }))
+        await q.startJob(job.id)
+        injectPersistFailure('fail retry persist boom')
+        await expect(q.failJob(job.id, 'transient')).rejects.toThrow(/fail retry persist boom/)
+
+        const after = q.getJob(job.id)
+        expect(after?.status).toBe('running')
+        expect(after?.retryCount).toBe(0)
+        expect(after?.error).toBeUndefined()
+        expect(q.getRunningCount(1)).toBe(1)
+
+        mockDatabase()
+        const r = await q.failJob(job.id, 'transient')
+        expect(r.applied).toBe(true)
+        expect(r.status).toBe('pending')
+        expect(q.getJob(job.id)?.retryCount).toBe(1)
+    })
+
+    it('failJob permanent-path persist throw restores running + queue + no terminal', async () => {
+        const job = await q.addJob(baseParams({ maxRetries: 1 }))
+        await q.startJob(job.id)
+        injectPersistFailure('fail permanent persist boom')
+        await expect(q.failJob(job.id, 'hard fail')).rejects.toThrow(/fail permanent persist boom/)
+
+        const after = q.getJob(job.id)
+        expect(after?.status).toBe('running')
+        expect(after?.retryCount).toBe(0)
+        expect(after?.error).toBeUndefined()
+        expect(after?.completedAt).toBeUndefined()
+        expect(q.getRunningCount(1)).toBe(1)
+        expect(q.getStats(1).failed).toBe(0)
+
+        mockDatabase()
+        const r = await q.failJob(job.id, 'hard fail')
+        expect(r.status).toBe('failed')
+        expect(q.getJob(job.id)?.status).toBe('failed')
+    })
+
+    it('markJobPermanentlyFailed persist throw restores prior active state', async () => {
+        const running = await q.addJob(baseParams({ locationId: 1 }))
+        await q.startJob(running.id)
+        injectPersistFailure('perm fail persist boom')
+        await expect(q.markJobPermanentlyFailed(running.id, 'unconfirmed')).rejects.toThrow(
+            /perm fail persist boom/
+        )
+        expect(q.getJob(running.id)?.status).toBe('running')
+        expect(q.getJob(running.id)?.error).toBeUndefined()
+        expect(q.getRunningCount(1)).toBe(1)
+
+        mockDatabase()
+        // Separate account so accountHasRunningReview does not mask eligibility
+        const pending = await q.addJob(baseParams({ locationId: 2, accountId: 11 }))
+        injectPersistFailure('perm fail pending boom')
+        await expect(q.markJobPermanentlyFailed(pending.id, 'policy')).rejects.toThrow(
+            /perm fail pending boom/
+        )
+        expect(q.getJob(pending.id)?.status).toBe('pending')
+        expect(q.getJob(pending.id)?.completedAt).toBeUndefined()
+        expect(q.getJob(pending.id)?.error).toBeUndefined()
+        // Pending job remains eligible after rollback (other account still running)
+        expect((await q.getNextJob(1))?.id).toBe(pending.id)
+    })
+
+    it('cancelJob persist throw restores active status + membership', async () => {
+        const job = await q.addJob(baseParams())
+        await q.startJob(job.id)
+        injectPersistFailure('cancel persist boom')
+        await expect(q.cancelJob(job.id)).rejects.toThrow(/cancel persist boom/)
+
+        expect(q.getJob(job.id)?.status).toBe('running')
+        expect(q.getJob(job.id)?.completedAt).toBeUndefined()
+        expect(q.getRunningCount(1)).toBe(1)
+        expect(q.getStats(1).cancelled).toBe(0)
+
+        mockDatabase()
+        // Terminal owner rules still hold after successful cancel
+        const cancelled = await q.cancelJob(job.id)
+        expect(cancelled.applied).toBe(true)
+        expect((await q.completeJob(job.id)).applied).toBe(false)
+        expect(q.getJob(job.id)?.status).toBe('cancelled')
+    })
+
+    it('retryJob persist throw restores failed terminal + hidden + no requeue', async () => {
+        const job = await q.addJob(baseParams({ maxRetries: 1 }))
+        await q.startJob(job.id)
+        await q.failJob(job.id, 'boom')
+        expect(q.getJob(job.id)?.status).toBe('failed')
+        expect(q.getJob(job.id)?.retryCount).toBe(1)
+        q.clearCompleted(1)
+        expect(q.getStats(1).failed).toBe(0) // hidden
+
+        injectPersistFailure('retry persist boom')
+        await expect(q.retryJob(job.id)).rejects.toThrow(/retry persist boom/)
+
+        const after = q.getJob(job.id)
+        expect(after?.status).toBe('failed')
+        expect(after?.retryCount).toBe(1)
+        expect(after?.error).toBe('boom')
+        expect(after?.completedAt).toBeDefined()
+        // Still hidden from stats; not pending
+        expect(q.getStats(1).failed).toBe(0)
+        expect(q.getStats(1).pending).toBe(0)
+        expect(await q.getNextJob(1)).toBeNull()
+
+        mockDatabase()
+        expect(await q.retryJob(job.id)).toBe(true)
+        expect(q.getJob(job.id)?.status).toBe('pending')
+        expect(q.getJob(job.id)?.retryCount).toBe(0)
+        expect(q.getStats(1).pending).toBe(1)
+    })
+
+    it('clearCompleted is memory-only hide; does not mutate durable job fields', async () => {
+        const job = await q.addJob(baseParams())
+        await q.startJob(job.id)
+        await q.completeJob(job.id)
+        const before = { ...q.getJob(job.id)! }
+        q.clearCompleted(1)
+        const after = q.getJob(job.id)!
+        expect(after.status).toBe(before.status)
+        expect(after.completedAt).toBe(before.completedAt)
+        expect(q.getBlockingPairKeys(1).has('10:100')).toBe(true)
+        // clearAll wipes memory only (no partial maps left)
+        q.clearAll()
+        expect(q.getAllJobs()).toHaveLength(0)
+        expect(q.getRunningCount()).toBe(0)
+        expect(q.getStats().total).toBe(0)
+    })
+
+    it('recovery requeue persist throw aborts load (loaded=false, memory empty)', async () => {
+        const rows = [
+            {
+                id: 'job_running_recovery',
+                campaignId: 9,
+                type: 'review',
+                accountId: 1,
+                locationId: 1,
+                reviewText: null,
+                rating: 5,
+                targetViews: null,
+                priority: 0,
+                status: 'running',
+                retryCount: 0,
+                maxRetries: 3,
+                result: null,
+                error: null,
+                createdAt: '2026-01-01T00:00:00.000Z',
+                startedAt: '2026-01-01T00:00:01.000Z',
+                completedAt: null,
+            },
+        ]
+        vi.mocked(getDatabase).mockReturnValue({
+            select: () => ({
+                from: () => ({
+                    all: async () => rows,
+                }),
+            }),
+            insert: () => ({
+                values: () => ({
+                    onConflictDoUpdate: async () => {
+                        throw new Error('recovery persist boom')
+                    },
+                }),
+            }),
+        } as never)
+
+        const recoveryQ = new JobQueue()
+        await expect(recoveryQ.ensureLoaded()).rejects.toThrow(/recovery persist boom/)
+        expect(recoveryQ.isLoaded()).toBe(false)
+        expect(recoveryQ.getAllJobs()).toHaveLength(0)
+        expect(recoveryQ.getRunningCount()).toBe(0)
+        expect(recoveryQ.getLastRequeuedRunningCount()).toBe(0)
+    })
+
+    it('immutable terminal still blocks after failed complete/cancel persist races', async () => {
+        const job = await q.addJob(baseParams())
+        await q.startJob(job.id)
+        await q.cancelJob(job.id)
+        expect(q.getJob(job.id)?.status).toBe('cancelled')
+
+        injectPersistFailure('should not persist')
+        // complete/fail refused before persist — no throw, status stays cancelled
+        const complete = await q.completeJob(job.id)
+        const fail = await q.failJob(job.id, 'x')
+        expect(complete.applied).toBe(false)
+        expect(fail.applied).toBe(false)
+        expect(q.getJob(job.id)?.status).toBe('cancelled')
+    })
+})
+
 describe('JobQueue — recovery load requeues only running', () => {
     it('loadFromDatabase requeues running → pending; keeps done/cancelled', async () => {
         const rows = [

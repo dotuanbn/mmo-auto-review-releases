@@ -533,6 +533,10 @@ function createTables() {
   // Durable review/automation job queue (fresh DB)
   ensureJobQueueTable()
 
+  // Operations durability: traffic visit queue + compliance audit (fresh DB)
+  ensureTrafficVisitQueueTable()
+  ensureComplianceAuditTable()
+
   console.log('Database tables created successfully')
 
   // Legacy column/table backfills for existing databases (kept intact)
@@ -597,6 +601,83 @@ function ensureJobQueueTable() {
   sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_job_queue_status ON job_queue(status)`)
   sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_job_queue_campaign ON job_queue(campaign_id)`)
   sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_job_queue_account_status ON job_queue(account_id, status)`)
+}
+
+/**
+ * Idempotent CREATE + unique/indexes for traffic_visit_queue (fresh and old DBs).
+ * Parity with migrations/004_operations_durability.ts.
+ */
+function ensureTrafficVisitQueueTable() {
+  if (!sqlite) return
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS traffic_visit_queue (
+      id TEXT PRIMARY KEY NOT NULL,
+      campaign_id INTEGER NOT NULL,
+      visit_index INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      payload TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      worker_id TEXT,
+      claimed_at TEXT,
+      lease_expires_at TEXT,
+      available_at TEXT,
+      last_error TEXT,
+      result TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `)
+  sqlite.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_traffic_visit_campaign_index ON traffic_visit_queue(campaign_id, visit_index)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_traffic_visit_queue_status ON traffic_visit_queue(status)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_traffic_visit_queue_available ON traffic_visit_queue(available_at)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_traffic_visit_queue_lease ON traffic_visit_queue(lease_expires_at)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_traffic_visit_queue_campaign ON traffic_visit_queue(campaign_id)`
+  )
+}
+
+/**
+ * Idempotent CREATE + indexes for compliance_audit (fresh and old DBs).
+ * Append-only audit trail; parity with migrations/004_operations_durability.ts.
+ */
+function ensureComplianceAuditTable() {
+  if (!sqlite) return
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS compliance_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      reason TEXT,
+      metadata TEXT,
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    )
+  `)
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_compliance_audit_created ON compliance_audit(created_at DESC)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_compliance_audit_entity ON compliance_audit(entity_type, entity_id, created_at DESC)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_compliance_audit_action ON compliance_audit(action, created_at DESC)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_compliance_audit_decision ON compliance_audit(decision, created_at DESC)`
+  )
 }
 
 // Run migrations for existing databases.
@@ -829,6 +910,11 @@ function runMigrations(): void {
     // Durable job_queue (idempotent for existing DBs)
     ensureJobQueueTable()
     console.log('Migration: ensured job_queue table')
+
+    // Operations durability tables (idempotent; versioned migration v4 also applies)
+    ensureTrafficVisitQueueTable()
+    ensureComplianceAuditTable()
+    console.log('Migration: ensured traffic_visit_queue + compliance_audit tables')
 
     console.log('Database migrations completed')
   } catch (error) {

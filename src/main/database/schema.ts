@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core'
+import { sqliteTable, text, integer, index, uniqueIndex } from 'drizzle-orm/sqlite-core'
 
 // Projects table - Organize campaigns and traffic tasks
 export const projects = sqliteTable('projects', {
@@ -373,3 +373,88 @@ export const schemaMigrations = sqliteTable('schema_migrations', {
 
 export type SchemaMigration = typeof schemaMigrations.$inferSelect
 export type NewSchemaMigration = typeof schemaMigrations.$inferInsert
+
+/**
+ * Durable Traffic per-visit queue — crash-safe claim/lease/recovery.
+ * Unique (campaignId, visitIndex) is the idempotency key for enqueue.
+ * Lease fields support atomic claim + expired-lease reclaim.
+ */
+export const trafficVisitQueue = sqliteTable(
+    'traffic_visit_queue',
+    {
+        id: text('id').primaryKey(),
+        campaignId: integer('campaign_id').notNull(),
+        visitIndex: integer('visit_index').notNull(),
+        status: text('status', {
+            enum: ['pending', 'retry', 'running', 'done', 'failed', 'cancelled'],
+        })
+            .default('pending')
+            .notNull(),
+        /** JSON blob for visit task params (no secrets). */
+        payload: text('payload'),
+        attemptCount: integer('attempt_count').default(0).notNull(),
+        maxAttempts: integer('max_attempts').default(3).notNull(),
+        workerId: text('worker_id'),
+        claimedAt: text('claimed_at'),
+        leaseExpiresAt: text('lease_expires_at'),
+        /** Not available for claim until this timestamp (backoff / delay). */
+        availableAt: text('available_at'),
+        lastError: text('last_error'),
+        result: text('result'),
+        createdAt: text('created_at')
+            .notNull()
+            .$defaultFn(() => new Date().toISOString()),
+        updatedAt: text('updated_at')
+            .notNull()
+            .$defaultFn(() => new Date().toISOString()),
+    },
+    (table) => ({
+        campaignVisitUnique: uniqueIndex('uq_traffic_visit_campaign_index').on(
+            table.campaignId,
+            table.visitIndex
+        ),
+        statusIdx: index('idx_traffic_visit_queue_status').on(table.status),
+        availableIdx: index('idx_traffic_visit_queue_available').on(table.availableAt),
+        leaseIdx: index('idx_traffic_visit_queue_lease').on(table.leaseExpiresAt),
+        campaignIdx: index('idx_traffic_visit_queue_campaign').on(table.campaignId),
+    })
+)
+
+export type TrafficVisitQueueRow = typeof trafficVisitQueue.$inferSelect
+export type NewTrafficVisitQueueRow = typeof trafficVisitQueue.$inferInsert
+export type TrafficVisitQueueStatus = TrafficVisitQueueRow['status']
+
+/**
+ * Append-only compliance / operator audit trail.
+ * Public queries must sanitize metadata (never store/return secrets).
+ */
+export const complianceAudit = sqliteTable(
+    'compliance_audit',
+    {
+        id: integer('id').primaryKey({ autoIncrement: true }),
+        action: text('action').notNull(),
+        entityType: text('entity_type').notNull(),
+        entityId: text('entity_id').notNull(),
+        actor: text('actor').notNull(),
+        decision: text('decision').notNull(),
+        reason: text('reason'),
+        /** JSON object string; secrets must be stripped before insert. */
+        metadata: text('metadata'),
+        createdAt: integer('created_at', { mode: 'timestamp' })
+            .notNull()
+            .$defaultFn(() => new Date()),
+    },
+    (table) => ({
+        createdIdx: index('idx_compliance_audit_created').on(table.createdAt),
+        entityIdx: index('idx_compliance_audit_entity').on(
+            table.entityType,
+            table.entityId,
+            table.createdAt
+        ),
+        actionIdx: index('idx_compliance_audit_action').on(table.action, table.createdAt),
+        decisionIdx: index('idx_compliance_audit_decision').on(table.decision, table.createdAt),
+    })
+)
+
+export type ComplianceAuditRow = typeof complianceAudit.$inferSelect
+export type NewComplianceAuditRow = typeof complianceAudit.$inferInsert

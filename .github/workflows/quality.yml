@@ -5,8 +5,10 @@ on:
     branches:
       - '**'
   pull_request:
+  # Reusable by tag release / build workflows (must pass before packaging)
+  workflow_call:
 
-# Cancel in-progress runs for the same branch/PR
+# Cancel in-progress runs for the same branch/PR (ignored for workflow_call callers)
 concurrency:
   group: quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true

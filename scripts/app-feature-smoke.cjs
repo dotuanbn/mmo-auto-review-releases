@@ -5,12 +5,41 @@ const electronPath = require('electron')
 
 const cwd = process.cwd()
 const runId = new Date().toISOString().replace(/[:.]/g, '-')
-const outDir = path.join(cwd, 'output', 'electron-feature-smoke', runId)
-const userDataDir = path.join(outDir, 'user-data')
+
+function getArg(name) {
+  const prefix = `--${name}=`
+  const hit = process.argv.find(arg => arg.startsWith(prefix))
+  return hit ? hit.slice(prefix.length) : undefined
+}
+
+/**
+ * Resolve launch target:
+ * - Dev/default: bundled Electron + project root (args: ['.', --user-data-dir])
+ * - Packaged: SMOKE_EXECUTABLE / --executable= points at win-unpacked or installed .exe
+ */
+const packagedExecutable =
+  process.env.SMOKE_EXECUTABLE ||
+  getArg('executable') ||
+  null
+
+const outDir =
+  process.env.SMOKE_OUT_DIR ||
+  getArg('out-dir') ||
+  path.join(cwd, 'output', packagedExecutable ? 'packaged-feature-smoke' : 'electron-feature-smoke', runId)
+
+const userDataDir =
+  process.env.SMOKE_USER_DATA_DIR ||
+  getArg('user-data-dir') ||
+  path.join(outDir, 'user-data')
+
 const imageDir = path.join(outDir, 'images')
 const resultPath = path.join(outDir, 'result.json')
+const executablePath = packagedExecutable
+  ? path.resolve(packagedExecutable)
+  : electronPath
 
 fs.mkdirSync(imageDir, { recursive: true })
+fs.mkdirSync(userDataDir, { recursive: true })
 fs.writeFileSync(
   path.join(imageDir, 'one-pixel.png'),
   Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
@@ -20,11 +49,49 @@ function serializeError(error) {
   return error && error.stack ? error.stack : String(error)
 }
 
+/** Strip ELECTRON_RUN_AS_NODE so Playwright launches a real Electron GUI process. */
+function buildLaunchEnv(isPackaged) {
+  const env = { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'true' }
+  delete env.ELECTRON_RUN_AS_NODE
+  if (isPackaged) {
+    env.MMO_SMOKE_MODE = '1'
+    env.SMOKE_USER_DATA_DIR = userDataDir
+  }
+  return env
+}
+
+function resolveLaunchConfig() {
+  const env = buildLaunchEnv(Boolean(packagedExecutable))
+  if (packagedExecutable) {
+    if (!fs.existsSync(executablePath)) {
+      throw new Error(`Packaged executable not found: ${executablePath}`)
+    }
+    return {
+      executablePath,
+      args: [`--user-data-dir=${userDataDir}`],
+      cwd: path.dirname(executablePath),
+      env,
+      mode: 'packaged',
+    }
+  }
+  return {
+    executablePath,
+    args: ['.', `--user-data-dir=${userDataDir}`],
+    cwd,
+    env,
+    mode: 'dev',
+  }
+}
+
 async function main() {
   let app
+  const launch = resolveLaunchConfig()
   const result = {
     ok: false,
+    mode: launch.mode,
+    executablePath: launch.executablePath,
     outDir,
+    userDataDir,
     passed: 0,
     failed: 0,
     results: [],
@@ -43,10 +110,10 @@ async function main() {
 
   try {
     app = await _electron.launch({
-      executablePath: electronPath,
-      args: ['.', `--user-data-dir=${userDataDir}`],
-      cwd,
-      env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'true' },
+      executablePath: launch.executablePath,
+      args: launch.args,
+      cwd: launch.cwd,
+      env: launch.env,
     })
 
     const page = await app.firstWindow({ timeout: 30_000 })
@@ -64,10 +131,23 @@ async function main() {
       { timeout: 30_000 }
     )
 
-    const apiResults = await page.evaluate(async ({ imageDir }) => {
+    const resolvedUserData = path.resolve(userDataDir)
+    const resolvedOutputRoot = path.resolve(path.join(cwd, 'output'))
+    const requestedIsolatedRestore =
+      resolvedUserData.startsWith(`${resolvedOutputRoot}${path.sep}`) ||
+      resolvedUserData.toLowerCase().includes(`${path.sep}mmo-packaged-smoke${path.sep}`) ||
+      resolvedUserData.toLowerCase().includes(`${path.sep}electron-feature-smoke${path.sep}`) ||
+      resolvedUserData.toLowerCase().includes(`${path.sep}packaged-feature-smoke${path.sep}`)
+
+    const apiResults = await page.evaluate(async ({
+      imageDir,
+      expectedUserDataDir,
+      requestedIsolatedRestore,
+    }) => {
       const api = window.electronAPI
       const results = []
       const ids = {}
+      let allowIsolatedRestore = false
 
       function short(value) {
         try {
@@ -79,6 +159,10 @@ async function main() {
 
       function assert(condition, message) {
         if (!condition) throw new Error(message)
+      }
+
+      function hasFn(obj, name) {
+        return !!(obj && typeof obj[name] === 'function')
       }
 
       async function step(name, fn, options = {}) {
@@ -104,6 +188,14 @@ async function main() {
         await api.reportRendererEvent({ level: 'info', message: 'feature smoke ping' })
         assert(/^\d+\.\d+\.\d+/.test(version), `bad version ${version}`)
         assert(paths && paths.userData, 'missing paths.userData')
+        const normalizePath = value => String(value).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+        allowIsolatedRestore =
+          requestedIsolatedRestore &&
+          normalizePath(paths.userData) === normalizePath(expectedUserDataDir)
+        assert(
+          !requestedIsolatedRestore || allowIsolatedRestore,
+          `app userData is not isolated: expected ${expectedUserDataDir}, got ${paths.userData}`
+        )
         return { version, userData: paths.userData }
       })
 
@@ -112,7 +204,7 @@ async function main() {
         const toggledHeadless = before.headless !== true
         await api.settings.set('headless', toggledHeadless)
         assert(await api.settings.get('headless') === toggledHeadless, 'settings.set/get mismatch')
-        await api.settings.saveAll({ ...before, headless: before.headless === true })
+        await api.settings.saveAll({ headless: before.headless === true })
         assert(await api.settings.get('headless') === (before.headless === true), 'settings.saveAll mismatch')
         return await api.settings.getAll()
       })
@@ -277,8 +369,17 @@ async function main() {
         await api.trafficBoost.getStatus()
         await api.trafficBoost.getReport(campaign.id)
         await api.trafficBoost.getLogs(campaign.id)
-        if (api.trafficBoost.getAudit) {
+        if (hasFn(api.trafficBoost, 'getAudit')) {
           await api.trafficBoost.getAudit(campaign.id)
+        }
+        // Durable visit-queue stats / recover — only when preload exposes them
+        if (hasFn(api.trafficBoost, 'getVisitQueueStats')) {
+          const queueStats = await api.trafficBoost.getVisitQueueStats(campaign.id)
+          assert(queueStats && typeof queueStats === 'object', 'traffic visit queue stats missing')
+        }
+        if (hasFn(api.trafficBoost, 'recoverVisitLeases')) {
+          const recovered = await api.trafficBoost.recoverVisitLeases(campaign.id)
+          assert(recovered !== undefined, 'traffic visit lease recover returned undefined')
         }
         return campaign
       })
@@ -340,6 +441,77 @@ async function main() {
         await api.tiling.isEnabled()
         await api.compliance.getPendingReviewSubmissions()
         return { ok: true }
+      })
+
+      // Manual reconciliation list (submitting/unconfirmed durable intents)
+      await step('reconciliation.list', async () => {
+        assert(api.compliance, 'compliance API missing')
+        assert(hasFn(api.compliance, 'getPendingReviewIntents'), 'compliance.getPendingReviewIntents missing')
+        const intents = await api.compliance.getPendingReviewIntents()
+        assert(Array.isArray(intents), 'pending review intents must be an array')
+        return { count: intents.length }
+      })
+
+      // Compliance audit history (bounded page) — optional until main IPC is wired
+      await step('compliance.audit', async () => {
+        assert(api.data, 'data API missing')
+        assert(hasFn(api.data, 'getComplianceAudit'), 'data.getComplianceAudit missing')
+        const page = await api.data.getComplianceAudit({ limit: 10, page: 1 })
+        assert(page && typeof page === 'object', 'compliance audit page missing')
+        const items = Array.isArray(page.items) ? page.items : (Array.isArray(page.events) ? page.events : null)
+        assert(items !== null, 'compliance audit items/events missing')
+        return { total: page.total ?? items.length, count: items.length }
+      }, { optional: true })
+
+      // Backup list / create / inspect (managed backups under isolated userData)
+      await step('backup.list-create-inspect', async () => {
+        assert(api.data, 'data API missing')
+        assert(hasFn(api.data, 'listBackups'), 'data.listBackups missing')
+        assert(hasFn(api.data, 'createBackup'), 'data.createBackup missing')
+        assert(hasFn(api.data, 'inspectBackup'), 'data.inspectBackup missing')
+
+        const before = await api.data.listBackups()
+        assert(Array.isArray(before), 'backup list must be an array')
+
+        const created = await api.data.createBackup({
+          includeProfiles: false,
+          label: `smoke-backup-${Date.now()}`,
+        })
+        assert(created && created.success === true, created?.message || 'backup create failed')
+        assert(typeof created.backupId === 'string' && created.backupId.length > 0, 'backupId missing')
+        ids.backupId = created.backupId
+
+        const listed = await api.data.listBackups()
+        assert(listed.some(item => (item.backupId || item.id) === created.backupId), 'created backup not listed')
+
+        const inspected = await api.data.inspectBackup(created.backupId)
+        assert(inspected && typeof inspected === 'object', 'backup inspect returned empty')
+        const inspectId = inspected.backupId || inspected.id
+        assert(inspectId === created.backupId, 'backup inspect id mismatch')
+        return { backupId: created.backupId, listed: listed.length, valid: inspected.valid !== false }
+      })
+
+      // Restore is destructive — only against isolated smoke userData, never real profiles
+      await step('backup.restore-isolated', async () => {
+        assert(allowIsolatedRestore, 'restore refused: userData is not an isolated smoke path')
+        assert(api.data && hasFn(api.data, 'restoreBackup'), 'data.restoreBackup missing')
+        assert(ids.backupId, 'no backupId from create step')
+        const restored = await api.data.restoreBackup({
+          backupId: ids.backupId,
+          confirmation: 'RESTORE',
+          includeProfiles: false,
+        })
+        assert(restored && restored.success === true, restored?.message || 'backup restore failed')
+        const restoredAccounts = await api.accounts.getAll()
+        assert(
+          restoredAccounts.some(account => account.id === ids.accountId),
+          'backup restore lost the smoke account'
+        )
+        return {
+          backupId: ids.backupId,
+          restartRequired: !!restored.restartRequired,
+          preRestoreBackupId: restored.preRestoreBackupId || null,
+        }
       })
 
       await step('proxies-fproxy.local', async () => {
@@ -441,7 +613,11 @@ async function main() {
       })
 
       return results
-    }, { imageDir })
+    }, {
+      imageDir,
+      expectedUserDataDir: userDataDir,
+      requestedIsolatedRestore,
+    })
 
     result.results = apiResults
     result.failed = apiResults.filter(item => !item.ok && !item.optional).length
@@ -456,7 +632,10 @@ async function main() {
 
     console.log(JSON.stringify({
       ok: result.ok,
+      mode: result.mode,
+      executablePath: result.executablePath,
       outDir,
+      userDataDir,
       passed: result.passed,
       failed: result.failed,
       failedSteps: result.results.filter(item => !item.ok && !item.optional).map(item => ({ name: item.name, error: item.error })),
@@ -470,14 +649,23 @@ async function main() {
   } catch (error) {
     result.failed += 1
     result.error = serializeError(error)
+    fs.mkdirSync(outDir, { recursive: true })
     fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf8')
-    console.error(JSON.stringify({ ok: false, outDir, error: String(error) }, null, 2))
+    console.error(JSON.stringify({ ok: false, mode: result.mode, outDir, error: String(error) }, null, 2))
     process.exitCode = 1
   } finally {
     if (app) {
       await app.close().catch(() => {})
     }
   }
+
+  // Strict exit: never soft-succeed after a recorded failure.
+  if (process.exitCode && process.exitCode !== 0) {
+    process.exit(process.exitCode)
+  }
 }
 
-main()
+main().catch(error => {
+  console.error(JSON.stringify({ ok: false, error: serializeError(error) }, null, 2))
+  process.exit(1)
+})

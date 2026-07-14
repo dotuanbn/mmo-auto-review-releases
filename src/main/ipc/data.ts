@@ -1,15 +1,40 @@
 import { ipcMain, shell, app } from 'electron'
 import { dataRootService } from '../services/DataRootService'
 import { profileService } from '../services/ProfileService'
+import { backupRestoreService } from '../services/BackupRestoreService'
 import { existsSync, readdirSync, statSync, mkdirSync, rmSync } from 'fs'
 import { join } from 'path'
+import {
+    backupIdSchema,
+    createBackupOptionsSchema,
+    restoreBackupOptionsSchema,
+} from '../../shared/backup-contracts'
+import { complianceAuditQuerySchema } from '../../shared/compliance-audit-contracts'
+import { complianceAuditService } from '../services/ComplianceAuditService'
 import {
     assertOptionalPathWithinRoots,
     assertPathWithinRoots,
     getDataOpenAllowedRoots,
     getLegacyMigrateAllowedRoots,
+    parseIpcPayload,
     withIpcValidation,
 } from './validate'
+
+/** Roots allowed for backup package path resolution (managed-backups only + userData). */
+function getBackupAllowedRoots(): string[] {
+    const dataRoot = dataRootService.getDataRoot()
+    return [
+        dataRoot,
+        join(dataRoot, 'managed-backups'),
+        backupRestoreService.getManagedBackupsRoot(),
+    ]
+}
+
+/** Resolve backupId → absolute dir and enforce managed-backups containment. */
+function resolveValidatedBackupDir(channel: string, backupId: string): string {
+    const dir = backupRestoreService.resolveBackupDir(backupId)
+    return assertPathWithinRoots(channel, dir, getBackupAllowedRoots())
+}
 
 function safeGetDirSize(dir: string): number {
     if (!existsSync(dir)) return 0
@@ -236,4 +261,82 @@ export function registerDataHandlers() {
 
         return { success: true, cleared }
     }))
+
+    // -----------------------------------------------------------------------
+    // Managed backup / restore (path-validated; public DTOs only)
+    // -----------------------------------------------------------------------
+
+    ipcMain.handle(
+        'data:backupCreate',
+        withIpcValidation('data:backupCreate', async (_event, options?: unknown) => {
+            const parsed =
+                options === undefined || options === null
+                    ? {}
+                    : parseIpcPayload(
+                          'data:backupCreate',
+                          createBackupOptionsSchema,
+                          options,
+                      )
+            assertPathWithinRoots(
+                'data:backupCreate',
+                backupRestoreService.getManagedBackupsRoot(),
+                getBackupAllowedRoots(),
+            )
+            return backupRestoreService.createBackup(parsed)
+        }),
+    )
+
+    ipcMain.handle(
+        'data:backupList',
+        withIpcValidation('data:backupList', async () => {
+            assertPathWithinRoots(
+                'data:backupList',
+                backupRestoreService.getManagedBackupsRoot(),
+                getBackupAllowedRoots(),
+            )
+            return backupRestoreService.listBackups()
+        }),
+    )
+
+    ipcMain.handle(
+        'data:backupInspect',
+        withIpcValidation('data:backupInspect', async (_event, backupId?: unknown) => {
+            const id = parseIpcPayload('data:backupInspect', backupIdSchema, backupId)
+            resolveValidatedBackupDir('data:backupInspect', id)
+            return backupRestoreService.inspectBackup(id)
+        }),
+    )
+
+    ipcMain.handle(
+        'data:backupRestore',
+        withIpcValidation('data:backupRestore', async (_event, options?: unknown) => {
+            // Canonical shared schema: backupId + confirmation RESTORE + optional includeProfiles
+            const parsed = parseIpcPayload(
+                'data:backupRestore',
+                restoreBackupOptionsSchema,
+                options,
+            )
+            resolveValidatedBackupDir('data:backupRestore', parsed.backupId)
+            return backupRestoreService.restoreBackup(parsed)
+        }),
+    )
+
+    // -----------------------------------------------------------------------
+    // Compliance audit history (strict query; public DTOs only)
+    // -----------------------------------------------------------------------
+
+    ipcMain.handle(
+        'data:getComplianceAudit',
+        withIpcValidation('data:getComplianceAudit', async (_event, query?: unknown) => {
+            const parsed =
+                query === undefined || query === null
+                    ? {}
+                    : parseIpcPayload(
+                          'data:getComplianceAudit',
+                          complianceAuditQuerySchema,
+                          query,
+                      )
+            return complianceAuditService.listEvents(parsed)
+        }),
+    )
 }

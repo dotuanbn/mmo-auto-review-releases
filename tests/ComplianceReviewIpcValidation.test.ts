@@ -4,12 +4,18 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+    COMPLIANCE_RECONCILE_NOTE_MAX,
     COMPLIANCE_REJECT_REASON_MAX,
     COMPLIANCE_REQUEST_ID_MAX,
     complianceApproveArgsSchema,
+    complianceGetPendingReviewIntentsArgsSchema,
+    complianceHistoryIdSchema,
+    complianceReconcileArgsSchema,
+    complianceReconcileNoteSchema,
     complianceRejectArgsSchema,
     complianceRejectReasonSchema,
     complianceRequestIdSchema,
+    reviewReconcileOutcomeSchema,
 } from '../src/shared/compliance-contracts'
 import {
     REVIEW_HISTORY_LIMIT_MAX,
@@ -93,6 +99,85 @@ describe('compliance approve/reject arg tuples', () => {
             'manual-submit-1-ok',
             'x'.repeat(COMPLIANCE_REJECT_REASON_MAX + 1),
         ])
+    })
+})
+
+// ---------------------------------------------------------------------------
+// Compliance — durable review intent reconciliation
+// ---------------------------------------------------------------------------
+
+describe('reviewReconcileOutcomeSchema', () => {
+    it('accepts confirmed_success and confirmed_not_posted only', () => {
+        expectOk(reviewReconcileOutcomeSchema, 'confirmed_success')
+        expectOk(reviewReconcileOutcomeSchema, 'confirmed_not_posted')
+        expectFail(reviewReconcileOutcomeSchema, 'success')
+        expectFail(reviewReconcileOutcomeSchema, 'failed')
+        expectFail(reviewReconcileOutcomeSchema, 'approve')
+        expectFail(reviewReconcileOutcomeSchema, '')
+        expectFail(reviewReconcileOutcomeSchema, null)
+    })
+})
+
+describe('complianceHistoryIdSchema', () => {
+    it('accepts positive integer history ids', () => {
+        expectOk(complianceHistoryIdSchema, 1)
+        expectOk(complianceHistoryIdSchema, 99)
+    })
+
+    it('rejects non-positive or non-int ids', () => {
+        expectFail(complianceHistoryIdSchema, 0)
+        expectFail(complianceHistoryIdSchema, -1)
+        expectFail(complianceHistoryIdSchema, 1.5)
+        expectFail(complianceHistoryIdSchema, '1')
+        expectFail(complianceHistoryIdSchema, null)
+        expectFail(complianceHistoryIdSchema, undefined)
+    })
+})
+
+describe('complianceReconcileNoteSchema', () => {
+    it('accepts bounded notes including empty', () => {
+        expectOk(complianceReconcileNoteSchema, 'seen on Google Maps')
+        expectOk(complianceReconcileNoteSchema, '')
+        expectOk(complianceReconcileNoteSchema, 'x'.repeat(COMPLIANCE_RECONCILE_NOTE_MAX))
+    })
+
+    it('rejects oversized or non-string notes', () => {
+        expectFail(complianceReconcileNoteSchema, 'x'.repeat(COMPLIANCE_RECONCILE_NOTE_MAX + 1))
+        expectFail(complianceReconcileNoteSchema, 42)
+        expectFail(complianceReconcileNoteSchema, { text: 'nope' })
+    })
+})
+
+describe('compliance reconcile arg tuples', () => {
+    it('getPendingReviewIntents accepts empty args only', () => {
+        expectOk(complianceGetPendingReviewIntentsArgsSchema, [])
+        expectFail(complianceGetPendingReviewIntentsArgsSchema, [1])
+        expectFail(complianceGetPendingReviewIntentsArgsSchema, ['x'])
+    })
+
+    it('reconcile requires historyId + outcome; note optional', () => {
+        expectOk(complianceReconcileArgsSchema, [1, 'confirmed_success'])
+        expectOk(complianceReconcileArgsSchema, [2, 'confirmed_not_posted'])
+        expectOk(complianceReconcileArgsSchema, [3, 'confirmed_success', undefined])
+        expectOk(complianceReconcileArgsSchema, [4, 'confirmed_not_posted', 'checked Maps'])
+        expectOk(complianceReconcileArgsSchema, [5, 'confirmed_success', ''])
+        expectOk(complianceReconcileArgsSchema, [
+            6,
+            'confirmed_not_posted',
+            '  trimmed note  ',
+        ])
+        expectFail(complianceReconcileArgsSchema, [])
+        expectFail(complianceReconcileArgsSchema, [1])
+        expectFail(complianceReconcileArgsSchema, [0, 'confirmed_success'])
+        expectFail(complianceReconcileArgsSchema, [1, 'success'])
+        expectFail(complianceReconcileArgsSchema, [1, 'confirmed_success', null])
+        expectFail(complianceReconcileArgsSchema, [1, 'confirmed_success', 123])
+        expectFail(complianceReconcileArgsSchema, [
+            1,
+            'confirmed_success',
+            'x'.repeat(COMPLIANCE_RECONCILE_NOTE_MAX + 1),
+        ])
+        expectFail(complianceReconcileArgsSchema, [1, 'confirmed_success', 'ok', 'extra'])
     })
 })
 

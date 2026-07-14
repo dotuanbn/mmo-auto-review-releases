@@ -2,10 +2,13 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { join } from 'path'
 import { appendFileSync, existsSync, mkdirSync } from 'fs'
 import { dataRootService } from './services/DataRootService'
-import { soakTestService } from './services/SoakTestService'
-import { automationController } from './automation/AutomationController'
-import { trafficBoostEngine } from './automation/TrafficBoostEngine'
-import { schedulerService } from './services/SchedulerService'
+
+type RuntimeServices = {
+    soakTestService: typeof import('./services/SoakTestService')['soakTestService']
+    automationController: typeof import('./automation/AutomationController')['automationController']
+    trafficBoostEngine: typeof import('./automation/TrafficBoostEngine')['trafficBoostEngine']
+    schedulerService: typeof import('./services/SchedulerService')['schedulerService']
+}
 
 // Keep renderer stable when the app regains focus on Windows.
 // Browser fidelity is handled by the launched Chrome contexts, not by this window.
@@ -19,6 +22,7 @@ let closeDatabaseRef: (() => void) | null = null
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 let rendererRecoveryAttempts = 0
 let lastMainWindowBlurAt = 0
+let runtimeServices: RuntimeServices | null = null
 
 function openExternalUrl(url: string): Promise<void> {
     const parsed = new URL(url)
@@ -89,7 +93,10 @@ function reloadRenderer(reason: string): void {
 }
 
 function hasActiveAutomationWindowWork(): boolean {
-    return automationController.isRunning() || trafficBoostEngine.isRunning()
+    return Boolean(
+        runtimeServices?.automationController.isRunning() ||
+        runtimeServices?.trafficBoostEngine.isRunning(),
+    )
 }
 
 function createWindow(): void {
@@ -183,11 +190,11 @@ function createWindow(): void {
 
     mainWindow.on('closed', () => {
         mainWindow = null
-        schedulerService.setMainWindow(null)
+        runtimeServices?.schedulerService.setMainWindow(null)
     })
 
     // Keep scheduler notifications bound to the live BrowserWindow.
-    schedulerService.setMainWindow(mainWindow)
+    runtimeServices?.schedulerService.setMainWindow(mainWindow)
 }
 
 // Initialize app
@@ -208,6 +215,24 @@ app.whenReady().then(async () => {
         logBootstrap('Initializing database...')
         initDatabase()
         logBootstrap('Database initialized successfully')
+
+        const [soakModule, automationModule, trafficModule, schedulerModule] = await Promise.all([
+            import('./services/SoakTestService'),
+            import('./automation/AutomationController'),
+            import('./automation/TrafficBoostEngine'),
+            import('./services/SchedulerService'),
+        ])
+        runtimeServices = {
+            soakTestService: soakModule.soakTestService,
+            automationController: automationModule.automationController,
+            trafficBoostEngine: trafficModule.trafficBoostEngine,
+            schedulerService: schedulerModule.schedulerService,
+        }
+        const {
+            soakTestService,
+            automationController,
+            schedulerService,
+        } = runtimeServices
 
         // Durable review queue crash recovery (job_queue load + zombie campaign reconcile)
         // Does not auto-start browsers; resume is deterministic via AutomationController.
@@ -275,7 +300,7 @@ if (!gotSingleInstanceLock) {
             focusMainWindow()
             return
         }
-        createWindow()
+        if (runtimeServices) createWindow()
     })
 }
 
@@ -293,13 +318,13 @@ process.on('uncaughtException', (error) => {
 
 app.on('window-all-closed', () => {
     try {
-        soakTestService.stop('app_shutdown')
+        runtimeServices?.soakTestService.stop('app_shutdown')
     } catch (error) {
         logBootstrap('Failed to stop soak test during shutdown', error)
     }
 
     try {
-        schedulerService.stop()
+        runtimeServices?.schedulerService.stop()
     } catch (error) {
         logBootstrap('Failed to stop scheduler during shutdown', error)
     }
@@ -316,7 +341,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+    if (runtimeServices && BrowserWindow.getAllWindows().length === 0) {
         createWindow()
     }
 })

@@ -41,6 +41,16 @@ import {
     parseWebSeoKeywords,
 } from '../../shared/web-seo-contracts'
 import { CaptchaDetector } from '../../shared/captcha/CaptchaDetector'
+import {
+    DEFAULT_TRAFFIC_VISIT_LEASE_MS,
+    isTrafficVisitFreshTransition,
+    parseTrafficVisitPayload,
+    type TrafficVisitPayload,
+} from '../../shared/traffic-visit-contracts'
+import {
+    buildTrafficVisitSeedItems,
+    trafficVisitQueue,
+} from './TrafficVisitQueue'
 
 // ============================================================
 // Types
@@ -2704,14 +2714,39 @@ export class TrafficBoostEngine {
             .where(eq(schema.trafficCampaigns.id, campaignId))
             .run()
 
-        // Initialize class-level tracking fields
+        // Durable per-visit queue: idempotent seed + lease recovery before workers claim
+        const campaignRequestedActions = this.normalizeDesiredActions(campaign.actionsPerVisit)
+        const seedAccountIds: Array<number | null> = accounts.map((a) =>
+            a && typeof a.id === 'number' ? a.id : null,
+        )
+        await trafficVisitQueue.ensureLoaded()
+        await trafficVisitQueue.seedCampaign(
+            campaignId,
+            buildTrafficVisitSeedItems({
+                locations: allLocations.map((l) => ({ id: l.id })),
+                accountIds: seedAccountIds,
+                visitsPerLocation: campaign.visitsPerLocation,
+                requestedActions: campaignRequestedActions,
+            }),
+        )
+        await trafficVisitQueue.recoverExpiredLeases(campaignId)
+        const durableCounters = trafficVisitQueue.getCampaignCounters(campaignId)
+
+        // Initialize class-level tracking fields (counters derived from durable queue)
         this.currentCampaignName = campaign.name
         this._totalVisits = totalVisits
         this._totalRounds = campaign.visitsPerLocation
-        this._completedVisits = campaign.completedVisits || 0
-        this._failedVisits = campaign.failedVisits || 0
+        this._completedVisits = durableCounters.done
+        this._failedVisits = durableCounters.failed
         this._currentRound = campaign.currentRound || 0
         this.paused = false
+        db.update(schema.trafficCampaigns)
+            .set({
+                completedVisits: durableCounters.done,
+                failedVisits: durableCounters.failed,
+            })
+            .where(eq(schema.trafficCampaigns.id, campaignId))
+            .run()
 
         // Initialize thread details
         this.threadDetails = Array.from({ length: safeThreadCount }, (_, i) => ({
@@ -2732,69 +2767,69 @@ export class TrafficBoostEngine {
         let failedVisits = this._failedVisits
         let currentRound = this._currentRound
 
-        // MAIN LOOP: keep feeding all remaining visit tasks until target attempts are reached
-        while (!this.shouldStop && (completedVisits + failedVisits) < totalVisits) {
+        // MAIN LOOP: durable claim until no remaining work (done/failed/cancelled cover target)
+        interface VisitTask {
+            durableVisitId: string
+            account: (typeof accounts)[number] | null
+            location: (typeof allLocations)[number]
+            round: number
+            requestedActions: number
+            watchdogRetryCount: number
+            proxyRetryCount: number
+            forceDirectConnection: boolean
+        }
+        const locationById = new Map(allLocations.map((l) => [l.id, l]))
+        const accountById = new Map(
+            accounts
+                .filter((a): a is NonNullable<typeof a> => a != null && typeof a.id === 'number')
+                .map((a) => [a.id as number, a]),
+        )
+
+        const resolveVisitTask = (
+            durableId: string,
+            payload: TrafficVisitPayload,
+        ): VisitTask | null => {
+            const location = locationById.get(payload.locationId)
+            if (!location) return null
+            const account =
+                payload.accountId != null ? (accountById.get(payload.accountId) ?? null) : null
+            return {
+                durableVisitId: durableId,
+                account,
+                location,
+                round: payload.round,
+                requestedActions: payload.requestedActions ?? campaignRequestedActions,
+                watchdogRetryCount: payload.watchdogRetryCount ?? 0,
+                proxyRetryCount: payload.proxyRetryCount ?? 0,
+                forceDirectConnection: payload.forceDirectConnection === true,
+            }
+        }
+
+        while (!this.shouldStop) {
                 await this.waitWhilePaused()
-                currentRound++
+                await trafficVisitQueue.recoverExpiredLeases(campaignId)
+                const waveCounters = trafficVisitQueue.getCampaignCounters(campaignId)
+                completedVisits = waveCounters.done
+                failedVisits = waveCounters.failed
+                this._completedVisits = completedVisits
+                this._failedVisits = failedVisits
+                if (waveCounters.remaining === 0) break
+
+                currentRound = Math.max(currentRound, 1)
                 this._currentRound = currentRound
-
-                console.log(`[TrafficBoost] Round ${currentRound} starting...`)
-
+                console.log(`[TrafficBoost] Durable visit wave (remaining=${waveCounters.remaining})...`)
                 this.sendStatus(this.buildStatus({
-                    message: `Round ${currentRound}: Preparing visits...`,
+                    message: `Queue wave: ${waveCounters.remaining} visit(s) remaining...`,
                 }))
+                this.currentQueueDepth = waveCounters.remaining
 
-                // Build task queue: each account visits each location
-                interface VisitTask {
-                    account: any | null
-                    location: any
-                    round: number
-                    requestedActions: number
-                    watchdogRetryCount: number
-                    proxyRetryCount: number
-                    forceDirectConnection: boolean
-                }
-                const visitTasks: VisitTask[] = []
-                const campaignRequestedActions = this.normalizeDesiredActions(campaign.actionsPerVisit)
-                const existingLogs = db.select().from(schema.trafficLogs)
-                    .where(eq(schema.trafficLogs.campaignId, campaignId))
-                    .all()
-                const visitsByLocation = new Map<number, number>()
-                for (const logEntry of existingLogs) {
-                    visitsByLocation.set(logEntry.locationId, (visitsByLocation.get(logEntry.locationId) || 0) + 1)
-                }
-                const accountPool = accounts.length > 0 ? accounts : [null]
-                for (let roundCursor = 1; roundCursor <= campaign.visitsPerLocation; roundCursor++) {
-                    for (let locationIdx = 0; locationIdx < allLocations.length; locationIdx++) {
-                        const location = allLocations[locationIdx]
-                        const existingVisitsForLocation = visitsByLocation.get(location.id) || 0
-                        if (existingVisitsForLocation >= roundCursor) {
-                            continue
-                        }
-                        const account = accountPool[(roundCursor + locationIdx - 1) % accountPool.length]
-                        visitTasks.push({
-                            account,
-                            location,
-                            round: roundCursor,
-                            requestedActions: campaignRequestedActions,
-                            watchdogRetryCount: 0,
-                            proxyRetryCount: 0,
-                            forceDirectConnection: false,
-                        })
-                    }
-                }
-
-                if (visitTasks.length === 0) break // All locations have enough visits
-                this.currentQueueDepth = visitTasks.length
-
-                // Keep campaign workers fully utilized: when one visit finishes, hand off immediately.
+                // Keep campaign workers fully utilized via atomic durable claims.
                 const queueConcurrency = safeThreadCount
                 const visitQueue = new PQueue({
                     concurrency: queueConcurrency,
                     carryoverConcurrencyCount: true,
                 })
                 const threadPromises: Promise<void>[] = []
-                let taskIndex = 0
 
                 for (let t = 0; t < safeThreadCount; t++) {
                     const threadIdx = t
@@ -2811,11 +2846,16 @@ export class TrafficBoostEngine {
                             let idlePollCount = 0
                             while (!this.shouldStop) {
                                 await this.waitWhilePaused()
-                                const myIdx = taskIndex++
-                                if (myIdx >= visitTasks.length) {
-                                    taskIndex = visitTasks.length
-                                    this.currentQueueDepth = Math.max(0, visitQueue.size + visitQueue.pending)
-                                    const hasInFlight = visitQueue.size > 0 || visitQueue.pending > 0
+                                const claimed = await trafficVisitQueue.claimNextVisit(
+                                    campaignId,
+                                    `thread-${threadIdx}`,
+                                    DEFAULT_TRAFFIC_VISIT_LEASE_MS,
+                                )
+                                if (!claimed) {
+                                    const depth = trafficVisitQueue.getCampaignCounters(campaignId)
+                                    this.currentQueueDepth = Math.max(0, depth.remaining)
+                                    const hasInFlight =
+                                        depth.running > 0 || visitQueue.size > 0 || visitQueue.pending > 0
                                     if (hasInFlight || idlePollCount < maxIdlePollsBeforeDone) {
                                         idlePollCount += 1
                                         await new Promise(resolve => setTimeout(resolve, idlePollDelayMs))
@@ -2825,7 +2865,24 @@ export class TrafficBoostEngine {
                                 }
                                 idlePollCount = 0
 
-                                const task = visitTasks[myIdx]
+                                const payload = parseTrafficVisitPayload(claimed.payload)
+                                if (!payload) {
+                                    await trafficVisitQueue.failVisit(
+                                        claimed.id,
+                                        'invalid_visit_payload',
+                                        { permanent: true },
+                                    )
+                                    continue
+                                }
+                                const task = resolveVisitTask(claimed.id, payload)
+                                if (!task) {
+                                    await trafficVisitQueue.failVisit(
+                                        claimed.id,
+                                        'visit_location_missing',
+                                        { permanent: true },
+                                    )
+                                    continue
+                                }
                                 await this.waitWhilePaused()
                                 if (task.round > currentRound) {
                                     currentRound = task.round
@@ -2834,10 +2891,8 @@ export class TrafficBoostEngine {
                                 await visitQueue.add(async () => {
                                 const releaseAccountLock = await this.acquireCampaignAccountLock(task.account)
                                 try {
-                                this.currentQueueDepth = Math.max(
-                                    0,
-                                    (visitTasks.length - taskIndex) + visitQueue.size + visitQueue.pending
-                                )
+                                const depthNow = trafficVisitQueue.getCampaignCounters(campaignId)
+                                this.currentQueueDepth = Math.max(0, depthNow.remaining)
                                 const accountEmail = task.account?.email || 'Anonymous'
                                 const locationName = task.location.name
                                 const actionContext = {
@@ -2895,7 +2950,17 @@ export class TrafficBoostEngine {
                                 )
                                 
                                 if (this.shouldStop || availableMs <= 0) {
-                                    return // Exit this visit task
+                                    // Do not leave a claimed running visit orphaned:
+                                    // stop path cancels non-terminal; proxy wait abort requeues immediately.
+                                    if (this.shouldStop) {
+                                        return
+                                    }
+                                    await trafficVisitQueue.failVisit(
+                                        task.durableVisitId,
+                                        'proxy_wait_unavailable',
+                                        { immediateRetry: true },
+                                    )
+                                    return
                                 }
                                 console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Proxy ready! Starting visit with ${Math.round(availableMs / 1000)}s available`)
                             } else if (proxyEnabled && fproxyService.getApiKey() && fproxyService.isAutoRotateActive()) {
@@ -3886,33 +3951,48 @@ export class TrafficBoostEngine {
                                         ? `Quality=${visitQualityScore}/100 (web_seo numeric; discovery=${webSeoOutcome.discoverySource}; countable=${visitCountable})`
                                         : `Quality=${visitQualityScore}/100 (duration=${duration}s, actions=${successfulSeoActions})${visitQualityScore < 40 ? ' ⚠️ LOW QUALITY - Google may not count this visit' : ' ✅ Good quality'}`
 
-                                    db.insert(schema.trafficLogs).values({
-                                        campaignId,
-                                        accountId: task.account?.id || null,
-                                        locationId: task.location.id,
-                                        actions: JSON.stringify([
-                                            ...actionsPerformed,
-                                            {
-                                                action: 'visit_quality_assessment',
-                                                success: visitCountable,
-                                                source: campaign.trafficMode === 'web_seo' ? 'web_seo' : 'runtime',
-                                                detail: qualityDetail,
-                                                threadId: threadIdx,
-                                                timestamp: new Date().toISOString(),
-                                            }
-                                        ]),
-                                        duration,
-                                        round: task.round,
-                                        status: 'success',
-                                        discoverySource: visitDiscoverySource,
-                                        qualityScore: visitQualityScore,
-                                        countable: visitCountable,
-                                        targetHost: visitTargetHost,
-                                        createdAt: new Date(),
-                                    }).run()
-
-                                    completedVisits++
+                                    // Durable complete first — only emit traffic_logs on fresh applied transition
+                                    // (blocks double log on already_done / cancelled race).
+                                    const completeResult = await trafficVisitQueue.completeVisit(
+                                        task.durableVisitId,
+                                        {
+                                            success: true,
+                                            duration,
+                                            qualityScore: visitQualityScore,
+                                            countable: visitCountable,
+                                        },
+                                    )
+                                    if (isTrafficVisitFreshTransition(completeResult)) {
+                                        db.insert(schema.trafficLogs).values({
+                                            campaignId,
+                                            accountId: task.account?.id || null,
+                                            locationId: task.location.id,
+                                            actions: JSON.stringify([
+                                                ...actionsPerformed,
+                                                {
+                                                    action: 'visit_quality_assessment',
+                                                    success: visitCountable,
+                                                    source: campaign.trafficMode === 'web_seo' ? 'web_seo' : 'runtime',
+                                                    detail: qualityDetail,
+                                                    threadId: threadIdx,
+                                                    timestamp: new Date().toISOString(),
+                                                }
+                                            ]),
+                                            duration,
+                                            round: task.round,
+                                            status: 'success',
+                                            discoverySource: visitDiscoverySource,
+                                            qualityScore: visitQualityScore,
+                                            countable: visitCountable,
+                                            targetHost: visitTargetHost,
+                                            createdAt: new Date(),
+                                        }).run()
+                                    }
+                                    const afterDone = trafficVisitQueue.getCampaignCounters(campaignId)
+                                    completedVisits = afterDone.done
+                                    failedVisits = afterDone.failed
                                     this._completedVisits = completedVisits
+                                    this._failedVisits = failedVisits
 
                                 } finally {
                                     await recycleVisitContext(watchdogTriggered ? 'watchdog_timeout' : 'visit_end')
@@ -3967,10 +4047,12 @@ export class TrafficBoostEngine {
                                     && !this.shouldStop
 
                                 if (canRetryWithoutProxy) {
-                                    visitTasks.push({
-                                        ...task,
-                                        forceDirectConnection: true,
-                                        proxyRetryCount: (task.proxyRetryCount ?? 0) + 1,
+                                    await trafficVisitQueue.failVisit(task.durableVisitId, errMsg, {
+                                        immediateRetry: true,
+                                        mergePayload: {
+                                            forceDirectConnection: true,
+                                            proxyRetryCount: (task.proxyRetryCount ?? 0) + 1,
+                                        },
                                     })
                                     this.recordAction(actionsPerformed, {
                                         action: 'proxy_error_retry_direct_requeued',
@@ -3986,10 +4068,12 @@ export class TrafficBoostEngine {
                                     const requeueActions = campaignUseFixedActionCount
                                         ? this.normalizeDesiredActions(task.requestedActions)
                                         : Math.max(1, Math.floor(this.normalizeDesiredActions(task.requestedActions) * 0.65))
-                                    visitTasks.push({
-                                        ...task,
-                                        requestedActions: requeueActions,
-                                        watchdogRetryCount: (task.watchdogRetryCount ?? 0) + 1,
+                                    await trafficVisitQueue.failVisit(task.durableVisitId, errMsg, {
+                                        immediateRetry: true,
+                                        mergePayload: {
+                                            requestedActions: requeueActions,
+                                            watchdogRetryCount: (task.watchdogRetryCount ?? 0) + 1,
+                                        },
                                     })
                                     this.recordAction(actionsPerformed, {
                                         action: 'visit_watchdog_retry_requeued',
@@ -4006,24 +4090,36 @@ export class TrafficBoostEngine {
                                 } else {
                                     const duration = Math.round((Date.now() - visitStart) / 1000)
                                     const failedSeoOutcome = webSeoVisitState.outcome
-
-                                    db.insert(schema.trafficLogs).values({
-                                        campaignId,
-                                        accountId: task.account?.id || null,
-                                        locationId: task.location.id,
-                                        actions: JSON.stringify(actionsPerformed),
-                                        duration,
-                                        round: task.round,
-                                        status: 'failed',
-                                        errorMessage: errMsg,
-                                        discoverySource: failedSeoOutcome?.discoverySource ?? null,
-                                        qualityScore: failedSeoOutcome?.qualityScore ?? 0,
-                                        countable: false,
-                                        targetHost: failedSeoOutcome?.targetHost ?? null,
-                                        createdAt: new Date(),
-                                    }).run()
-
-                                    failedVisits++
+                                    const failResult = await trafficVisitQueue.failVisit(
+                                        task.durableVisitId,
+                                        errMsg,
+                                    )
+                                    // Only emit traffic_logs failed on first permanent fail
+                                    // (retry / already_failed / blocked must not double-count).
+                                    if (
+                                        failResult.status === 'failed'
+                                        && isTrafficVisitFreshTransition(failResult)
+                                    ) {
+                                        db.insert(schema.trafficLogs).values({
+                                            campaignId,
+                                            accountId: task.account?.id || null,
+                                            locationId: task.location.id,
+                                            actions: JSON.stringify(actionsPerformed),
+                                            duration,
+                                            round: task.round,
+                                            status: 'failed',
+                                            errorMessage: errMsg,
+                                            discoverySource: failedSeoOutcome?.discoverySource ?? null,
+                                            qualityScore: failedSeoOutcome?.qualityScore ?? 0,
+                                            countable: false,
+                                            targetHost: failedSeoOutcome?.targetHost ?? null,
+                                            createdAt: new Date(),
+                                        }).run()
+                                    }
+                                    const afterFail = trafficVisitQueue.getCampaignCounters(campaignId)
+                                    completedVisits = afterFail.done
+                                    failedVisits = afterFail.failed
+                                    this._completedVisits = completedVisits
                                     this._failedVisits = failedVisits
                                 }
                             }
@@ -4059,8 +4155,16 @@ export class TrafficBoostEngine {
                                 }))
                             }
                             await this.waitWhilePaused()
-                                }).catch((queueError: unknown) => {
+                                }).catch(async (queueError: unknown) => {
                                     console.error(`[TrafficBoost] Thread ${threadIdx + 1}: queue task crashed`, sanitizeErrorDetail(queueError))
+                                    try {
+                                        await trafficVisitQueue.failVisit(
+                                            task.durableVisitId,
+                                            sanitizeErrorDetail(queueError),
+                                        )
+                                    } catch {
+                                        // Lease recovery will reclaim if fail is blocked/unavailable
+                                    }
                                 })
                             }
                         } catch (threadError) {
@@ -4084,8 +4188,20 @@ export class TrafficBoostEngine {
                 if (this.shouldStop) break
             }
 
-        // Campaign complete or stopped
-        const finalStatus = (completedVisits + failedVisits) >= totalVisits ? 'completed' : 'stopped'
+        // Campaign complete only when durable queue has no pending/retry/running left.
+        // cancelled/done/failed all count as terminal; never use done+failed alone (misses cancelled).
+        const finalCounters = trafficVisitQueue.getCampaignCounters(campaignId)
+        completedVisits = finalCounters.done
+        failedVisits = finalCounters.failed
+        this._completedVisits = completedVisits
+        this._failedVisits = failedVisits
+        const queueDrained = finalCounters.remaining === 0
+        // Stop always wins; otherwise complete only when no pending/retry/running remain.
+        const finalStatus = this.shouldStop
+            ? 'stopped'
+            : queueDrained
+                ? 'completed'
+                : 'stopped'
         db.update(schema.trafficCampaigns)
             .set({
                 status: finalStatus,
@@ -4167,10 +4283,23 @@ export class TrafficBoostEngine {
         this.paused = false
         this.running = false
         if (this.currentCampaignId) {
+            const campaignId = this.currentCampaignId
+            try {
+                await trafficVisitQueue.cancelCampaignVisits(campaignId)
+                const counters = trafficVisitQueue.getCampaignCounters(campaignId)
+                this._completedVisits = counters.done
+                this._failedVisits = counters.failed
+            } catch (queueError) {
+                console.error('[TrafficBoost] cancelCampaignVisits failed:', queueError)
+            }
             const db = getDatabase()
             db.update(schema.trafficCampaigns)
-                .set({ status: 'stopped' })
-                .where(eq(schema.trafficCampaigns.id, this.currentCampaignId))
+                .set({
+                    status: 'stopped',
+                    completedVisits: this._completedVisits,
+                    failedVisits: this._failedVisits,
+                })
+                .where(eq(schema.trafficCampaigns.id, campaignId))
                 .run()
         }
         // Immediately close all active browser contexts
@@ -4196,6 +4325,16 @@ export class TrafficBoostEngine {
         this.paused = true
         // keep running=true so monitor treats as active (paused) control session
         if (this.currentCampaignId) {
+            const campaignId = this.currentCampaignId
+            try {
+                // Release in-flight leases to retry without consuming attempt budget
+                await trafficVisitQueue.releaseRunningForPause(campaignId)
+                const counters = trafficVisitQueue.getCampaignCounters(campaignId)
+                this._completedVisits = counters.done
+                this._failedVisits = counters.failed
+            } catch (queueError) {
+                console.error('[TrafficBoost] releaseRunningForPause failed:', queueError)
+            }
             const db = getDatabase()
             db.update(schema.trafficCampaigns)
                 .set({
@@ -4204,7 +4343,7 @@ export class TrafficBoostEngine {
                     failedVisits: this._failedVisits,
                     currentRound: this._currentRound,
                 })
-                .where(eq(schema.trafficCampaigns.id, this.currentCampaignId))
+                .where(eq(schema.trafficCampaigns.id, campaignId))
                 .run()
         }
         for (const contextId of Array.from(this.activeContexts.keys())) {
@@ -4236,10 +4375,23 @@ export class TrafficBoostEngine {
         }
         this.paused = false
         if (this.currentCampaignId) {
+            const campaignId = this.currentCampaignId
+            try {
+                await trafficVisitQueue.recoverExpiredLeases(campaignId)
+                const counters = trafficVisitQueue.getCampaignCounters(campaignId)
+                this._completedVisits = counters.done
+                this._failedVisits = counters.failed
+            } catch (queueError) {
+                console.error('[TrafficBoost] resume recoverExpiredLeases failed:', queueError)
+            }
             const db = getDatabase()
             db.update(schema.trafficCampaigns)
-                .set({ status: 'running' })
-                .where(eq(schema.trafficCampaigns.id, this.currentCampaignId))
+                .set({
+                    status: 'running',
+                    completedVisits: this._completedVisits,
+                    failedVisits: this._failedVisits,
+                })
+                .where(eq(schema.trafficCampaigns.id, campaignId))
                 .run()
         }
         // Proxy: resume with freeze-remaining restore + refresh-if-expired (provider safeguard)
@@ -4247,6 +4399,16 @@ export class TrafficBoostEngine {
         this.sendStatus(this.buildStatus({
             message: '▶ Campaign resumed',
         }))
+    }
+
+    /** Durable visit queue counters for IPC / recovery UI. */
+    getVisitQueueCounters(campaignId: number) {
+        return trafficVisitQueue.getCampaignCounters(campaignId)
+    }
+
+    async recoverVisitLeases(campaignId?: number) {
+        await trafficVisitQueue.ensureLoaded()
+        return trafficVisitQueue.recoverExpiredLeases(campaignId)
     }
 
     // ============================================================

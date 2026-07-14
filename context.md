@@ -1,15 +1,15 @@
 stack: Electron 28 + Vite 5 + React 19 + TypeScript + SQLite/Drizzle + Playwright
 structure: main=src/main; preload=src/preload; renderer=src/renderer/src; shared=src/shared; tests=tests
 conventions: strict IPC validation; public DTOs redact secrets; minimal diffs; comments in English; no any mới
-phase: production + Web SEO hardening complete; next is packaged release and durable Traffic visit queue
-verification: gate:quick pass; 664 tests pass; NSIS+portable build pass; Electron smoke 19/19 pass on 2026-07-14
+phase: production release hardening + operational durability complete
+verification: gate:quick pass; 845 tests pass; source/unpacked/NSIS smoke 23/23; NSIS+portable build pass on 2026-07-15
 ---
 recent_decisions:
-- [2026-07-14] CAPTCHA research completed: prevention policy, verified image-grid solving, durable metrics/dashboard, fail-closed verification
-- [2026-07-14] Audit P0/P1 stealth fix: single StealthPatcher path, UA pool SSOT, NT10.0, OS-matched WebGL, CDP userAgentMetadata
-- [2026-07-14] CAPTCHA bypass upgrade → consolidates detection, hCaptcha/Turnstile, modern UA pool, fallback solver chain
-- [2026-07-14] Web SEO separates organic/direct/captcha discovery; requireOrganic never accepts fallback -> honest SEO metrics
-- [2026-07-14] Web SEO uses public-URL guards, same-site read-only actions, real dwell budgets, no cart/form side effects
+- [2026-07-15] Packaged smoke configures temp-only data root before runtime imports -> never touches real app data
+- [2026-07-15] Backup/restore requires RESTORE, checksums, SQLite integrity, pre-snapshot, and symlink-safe targets
+- [2026-07-15] Review submitting/unconfirmed intents require atomic manual reconciliation before retry/success
+- [2026-07-15] Traffic uses durable per-visit seed/claim/lease/retry/recovery with terminal-state counters
+- [2026-07-15] Release jobs depend on reusable quality gate and upload only after unpacked + NSIS smoke
 ---
 active_tasks:
 - [x] Durable Review JobQueue, crash recovery, atomic claim, terminal-state protection
@@ -21,9 +21,10 @@ active_tasks:
 - [x] Fix stealth P0/P1 from Worker5 audit (double inject, UA desync, CDP CH, WebGL OS)
 - [x] Durable CAPTCHA metrics backend (IPC + SQLite + preload + unit tests)
 - [x] Wire solver metrics, image-grid provider chain, Settings dashboard, and Electron smoke coverage
-- [ ] Add manual reconciliation UI for submitting/unconfirmed review intents
-- [ ] Add packaged win-unpacked/NSIS smoke and make release workflow depend on quality gates
-- [ ] Add user-facing backup/restore and compliance audit history
-- [ ] Add rollback parity for remaining JobQueue transitions and durable per-visit Traffic atomic claim/recovery
+- [x] Add manual reconciliation UI for submitting/unconfirmed review intents
+- [x] Add packaged win-unpacked/NSIS smoke and make release workflow depend on quality gates
+- [x] Add user-facing backup/restore and compliance audit history
+- [x] Durable per-visit Traffic atomic claim/recovery (seed/claim/complete/pause/resume/stop)
+- [x] Add rollback parity for remaining JobQueue transitions
 
 blockers: none

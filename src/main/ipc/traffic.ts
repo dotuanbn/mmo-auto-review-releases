@@ -4,6 +4,7 @@ import { getDatabase } from '../database'
 import { trafficTasks, TrafficTask, locations, trafficCampaigns, trafficLogs, accounts } from '../database/schema'
 import { eq, inArray } from 'drizzle-orm'
 import { trafficBoostEngine } from '../automation/TrafficBoostEngine'
+import { trafficVisitQueue } from '../automation/TrafficVisitQueue'
 import {
     idSchema,
     normalizeWebSeoTargetUrl,
@@ -14,6 +15,11 @@ import {
     trafficTaskCreateSchema,
     trafficTaskUpdateSchema,
 } from '../../shared/ipc-schemas'
+import {
+    trafficVisitCampaignIdSchema,
+    trafficVisitQueueStatsSchema,
+    trafficVisitRecoverResultSchema,
+} from '../../shared/traffic-visit-contracts'
 import { parseIpcArgs, parseIpcPayload, withIpcValidation } from './validate'
 
 const WEB_SEO_DWELL_DEFAULT_MIN = 45
@@ -426,6 +432,7 @@ export function registerTrafficHandlers() {
     ipcMain.handle('trafficBoost:deleteCampaign', withIpcValidation('trafficBoost:deleteCampaign', async (_event, id: unknown) => {
         const parsedId = parseIpcPayload('trafficBoost:deleteCampaign', idSchema, id)
         try {
+            await trafficVisitQueue.cancelCampaignVisits(parsedId)
             const db = getDatabase()
             db.delete(trafficLogs).where(eq(trafficLogs.campaignId, parsedId)).run()
             db.delete(trafficCampaigns).where(eq(trafficCampaigns.id, parsedId)).run()
@@ -443,6 +450,7 @@ export function registerTrafficHandlers() {
             const uniqueIds = Array.from(new Set(campaignIds))
 
             for (const campaignId of uniqueIds) {
+                await trafficVisitQueue.cancelCampaignVisits(campaignId)
                 db.delete(trafficLogs).where(eq(trafficLogs.campaignId, campaignId)).run()
                 db.delete(trafficCampaigns).where(eq(trafficCampaigns.id, campaignId)).run()
             }
@@ -457,6 +465,9 @@ export function registerTrafficHandlers() {
     ipcMain.handle('trafficBoost:start', withIpcValidation('trafficBoost:start', async (_event, id: unknown) => {
         const parsedId = parseIpcPayload('trafficBoost:start', idSchema, id)
         try {
+            // Recover any expired leases from a prior crash before workers claim
+            await trafficVisitQueue.ensureLoaded()
+            await trafficVisitQueue.recoverExpiredLeases(parsedId)
             trafficBoostEngine.startCampaign(parsedId).catch(err => {
                 console.error('[TrafficBoost] Campaign failed:', err)
             })
@@ -547,4 +558,56 @@ export function registerTrafficHandlers() {
             throw error
         }
     }))
+
+    // Durable per-visit queue stats (campaign counters without duplicate visits)
+    ipcMain.handle('trafficBoost:getVisitQueueStats', withIpcValidation(
+        'trafficBoost:getVisitQueueStats',
+        async (_event, campaignId: unknown) => {
+            const parsedId = parseIpcPayload(
+                'trafficBoost:getVisitQueueStats',
+                trafficVisitCampaignIdSchema,
+                campaignId,
+            )
+            try {
+                await trafficVisitQueue.ensureLoaded()
+                const counters = trafficVisitQueue.getCampaignCounters(parsedId)
+                // Strict Zod outbound: reject malformed counter shapes before IPC return
+                return parseIpcPayload(
+                    'trafficBoost:getVisitQueueStats:response',
+                    trafficVisitQueueStatsSchema,
+                    {
+                        campaignId: parsedId,
+                        counters,
+                        recoveredOnBoot: trafficVisitQueue.getLastRecoveredCount(),
+                    },
+                )
+            } catch (error) {
+                console.error('Failed to get visit queue stats:', error)
+                throw error
+            }
+        },
+    ))
+
+    // Recover expired running leases for a campaign (requires positive campaign id)
+    ipcMain.handle('trafficBoost:recoverVisitLeases', withIpcValidation(
+        'trafficBoost:recoverVisitLeases',
+        async (_event, campaignId: unknown) => {
+            const parsedId = parseIpcPayload(
+                'trafficBoost:recoverVisitLeases',
+                trafficVisitCampaignIdSchema,
+                campaignId,
+            )
+            try {
+                const result = await trafficBoostEngine.recoverVisitLeases(parsedId)
+                return parseIpcPayload(
+                    'trafficBoost:recoverVisitLeases:response',
+                    trafficVisitRecoverResultSchema,
+                    result,
+                )
+            } catch (error) {
+                console.error('Failed to recover visit leases:', error)
+                throw error
+            }
+        },
+    ))
 }

@@ -44,6 +44,7 @@ import {
 import { useTheme } from '../contexts/ThemeContext'
 import { SETTINGS_SECRET_MASK } from '../../../shared/types'
 import { CaptchaMetricsPanel } from '../components/captcha'
+import { BackupRestorePanel, ComplianceAuditPanel } from '../components/backup'
 
 interface AppSettings {
     // Browser
@@ -955,6 +956,10 @@ export function Settings() {
                     ) : <div className="text-xs text-[#6f697c]">{t('settings.noProfileData')}</div>}
                 </div>
             </SectionPanel>
+
+            {/* Backup / Restore + Compliance audit history (public DTO only) */}
+            <BackupRestorePanel />
+            <ComplianceAuditPanel />
 
             {/* 6. GIỚI THIỆU / ABOUT */}
             <SectionPanel icon={Info} title={t('settings.appAbout')} tone="slate">

@@ -20,6 +20,10 @@
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "gate:quick": "npm run typecheck && npm run lint",
     "gate:pre-release": "npm run gate:quick && npm run build:exe",
+    "smoke:app": "node scripts/app-feature-smoke.cjs",
+    "smoke:packaged:unpacked": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\packaged-feature-smoke.ps1 -Mode unpacked",
+    "smoke:packaged:nsis": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\packaged-feature-smoke.ps1 -Mode nsis",
+    "smoke:packaged": "npm run smoke:packaged:unpacked && npm run smoke:packaged:nsis",
     "test": "vitest",
     "test:run": "vitest run"
   },
