@@ -1,17 +1,124 @@
 import { ipcMain } from 'electron'
+import { z } from 'zod'
 import { getDatabase } from '../database'
 import { trafficTasks, TrafficTask, locations, trafficCampaigns, trafficLogs, accounts } from '../database/schema'
-import { eq } from 'drizzle-orm'
+import { eq, inArray } from 'drizzle-orm'
 import { trafficBoostEngine } from '../automation/TrafficBoostEngine'
+import {
+    idSchema,
+    normalizeWebSeoTargetUrl,
+    parseWebSeoKeywords,
+    positiveIdListSchema,
+    trafficBoostCreateSchema,
+    trafficBoostUpdateSchema,
+    trafficTaskCreateSchema,
+    trafficTaskUpdateSchema,
+} from '../../shared/ipc-schemas'
+import { parseIpcArgs, parseIpcPayload, withIpcValidation } from './validate'
+
+const WEB_SEO_DWELL_DEFAULT_MIN = 45
+const WEB_SEO_DWELL_DEFAULT_MAX = 90
+
+type TrafficDb = ReturnType<typeof getDatabase>
+type TrafficCampaignRow = typeof trafficCampaigns.$inferSelect
+
+function parseIdListJson(raw: string | null | undefined): number[] {
+    if (!raw) return []
+    try {
+        const parsed: unknown = JSON.parse(raw)
+        if (!Array.isArray(parsed)) return []
+        return parsed.filter((id): id is number => typeof id === 'number' && Number.isInteger(id) && id > 0)
+    } catch {
+        return []
+    }
+}
+
+/**
+ * Load every requested location; each URL must be a public/safe Web SEO target.
+ * Errors never include credential-bearing or raw secret URL material.
+ */
+function assertWebSeoLocationsSafe(db: TrafficDb, locationIds: number[]): void {
+    const uniqueIds = Array.from(new Set(locationIds))
+    if (uniqueIds.length === 0) {
+        throw new Error('web_seo mode requires at least one location')
+    }
+
+    const rows = db.select().from(locations).where(inArray(locations.id, uniqueIds)).all()
+    if (rows.length !== uniqueIds.length) {
+        const found = new Set(rows.map((r) => r.id))
+        const missing = uniqueIds.filter((id) => !found.has(id))
+        throw new Error(
+            `web_seo campaign references missing location id(s): ${missing.join(', ')}`,
+        )
+    }
+
+    for (const loc of rows) {
+        // Shared fail-closed helper: returns absolute public URL or null (never raw unsafe input).
+        const normalized = normalizeWebSeoTargetUrl(loc.url ?? '')
+        if (!normalized) {
+            throw new Error(
+                `web_seo location ${loc.id} has invalid or non-public target URL`,
+            )
+        }
+    }
+}
+
+function resolveDwellWindow(
+    minInput: number | undefined,
+    maxInput: number | undefined,
+    currentMin: number | null | undefined,
+    currentMax: number | null | undefined,
+): { min: number; max: number } {
+    const min = typeof minInput === 'number'
+        ? minInput
+        : (currentMin ?? WEB_SEO_DWELL_DEFAULT_MIN)
+    const maxRaw = typeof maxInput === 'number'
+        ? maxInput
+        : (currentMax ?? WEB_SEO_DWELL_DEFAULT_MAX)
+    return { min, max: Math.max(min, maxRaw) }
+}
+
+/**
+ * When the resulting traffic mode is web_seo, enforce public locations + non-empty keywords.
+ * Mutates updateData only for keyword re-normalization already staged by caller.
+ */
+function applyWebSeoUpdateGuards(
+    db: TrafficDb,
+    current: TrafficCampaignRow,
+    parsed: {
+        locationIds?: number[]
+        searchKeywords?: string[]
+    },
+    updateData: Record<string, string | number | boolean | null>,
+): void {
+    const locationIds = parsed.locationIds ?? parseIdListJson(current.locationIds)
+    assertWebSeoLocationsSafe(db, locationIds)
+
+    const keywords = parsed.searchKeywords !== undefined
+        ? parseWebSeoKeywords(parsed.searchKeywords)
+        : parseWebSeoKeywords(
+            typeof updateData.searchKeywords === 'string'
+                ? updateData.searchKeywords
+                : current.searchKeywords,
+        )
+
+    if (keywords.length === 0) {
+        throw new Error('web_seo mode requires at least one non-empty search keyword')
+    }
+
+    // Ensure persisted keywords are normalized/deduped when mode is web_seo
+    if (parsed.searchKeywords !== undefined || updateData.searchKeywords !== undefined) {
+        updateData.searchKeywords = JSON.stringify(keywords)
+    }
+}
 
 export function registerTrafficHandlers() {
     // Get all traffic tasks
-    ipcMain.handle('traffic:getAll', async () => {
+    ipcMain.handle('traffic:getAll', withIpcValidation('traffic:getAll', async () => {
         try {
             const db = getDatabase()
             const tasks = db.select().from(trafficTasks).all()
 
-            // Get location names for display
             const result = []
             for (const task of tasks) {
                 const location = db.select().from(locations).where(eq(locations.id, task.locationId)).get()
@@ -25,23 +132,19 @@ export function registerTrafficHandlers() {
             console.error('Failed to get traffic tasks:', error)
             return []
         }
-    })
+    }))
 
     // Create a new traffic task
-    ipcMain.handle('traffic:create', async (_event, data: {
-        locationId: number
-        targetViews: number
-        viewsPerDay?: number
-        useProxies?: boolean
-    }) => {
+    ipcMain.handle('traffic:create', withIpcValidation('traffic:create', async (_event, data: unknown) => {
+        const parsed = parseIpcPayload('traffic:create', trafficTaskCreateSchema, data)
         try {
             const db = getDatabase()
             const result = db.insert(trafficTasks).values({
-                locationId: data.locationId,
-                targetViews: data.targetViews,
+                locationId: parsed.locationId,
+                targetViews: parsed.targetViews,
                 currentViews: 0,
-                viewsPerDay: data.viewsPerDay || 100,
-                useProxies: data.useProxies !== false, // Default true
+                viewsPerDay: parsed.viewsPerDay || 100,
+                useProxies: parsed.useProxies !== false,
                 status: 'pending',
                 createdAt: new Date(),
             }).returning().get()
@@ -50,15 +153,20 @@ export function registerTrafficHandlers() {
             console.error('Failed to create traffic task:', error)
             throw error
         }
-    })
+    }))
 
     // Update traffic task
-    ipcMain.handle('traffic:update', async (_event, id: number, data: Partial<TrafficTask>) => {
+    ipcMain.handle('traffic:update', withIpcValidation('traffic:update', async (_event, id: unknown, data: unknown) => {
+        const [parsedId, parsedData] = parseIpcArgs(
+            'traffic:update',
+            z.tuple([idSchema, trafficTaskUpdateSchema]),
+            [id, data],
+        )
         try {
             const db = getDatabase()
             const result = db.update(trafficTasks)
-                .set(data)
-                .where(eq(trafficTasks.id, id))
+                .set(parsedData)
+                .where(eq(trafficTasks.id, parsedId))
                 .returning()
                 .get()
             return result
@@ -66,51 +174,52 @@ export function registerTrafficHandlers() {
             console.error('Failed to update traffic task:', error)
             throw error
         }
-    })
+    }))
 
     // Delete traffic task
-    ipcMain.handle('traffic:delete', async (_event, id: number) => {
+    ipcMain.handle('traffic:delete', withIpcValidation('traffic:delete', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('traffic:delete', idSchema, id)
         try {
             const db = getDatabase()
-            db.delete(trafficTasks).where(eq(trafficTasks.id, id)).run()
+            db.delete(trafficTasks).where(eq(trafficTasks.id, parsedId)).run()
         } catch (error) {
             console.error('Failed to delete traffic task:', error)
             throw error
         }
-    })
+    }))
 
-    // Start traffic task (placeholder - will integrate with automation engine)
-    ipcMain.handle('traffic:start', async (_event, id: number) => {
+    // Start traffic task
+    ipcMain.handle('traffic:start', withIpcValidation('traffic:start', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('traffic:start', idSchema, id)
         try {
             const db = getDatabase()
             db.update(trafficTasks)
                 .set({ status: 'running', startedAt: new Date() })
-                .where(eq(trafficTasks.id, id))
+                .where(eq(trafficTasks.id, parsedId))
                 .run()
-            // TODO: Start traffic automation
         } catch (error) {
             console.error('Failed to start traffic task:', error)
             throw error
         }
-    })
+    }))
 
     // Stop traffic task
-    ipcMain.handle('traffic:stop', async (_event, id: number) => {
+    ipcMain.handle('traffic:stop', withIpcValidation('traffic:stop', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('traffic:stop', idSchema, id)
         try {
             const db = getDatabase()
             db.update(trafficTasks)
                 .set({ status: 'stopped' })
-                .where(eq(trafficTasks.id, id))
+                .where(eq(trafficTasks.id, parsedId))
                 .run()
-            // TODO: Stop traffic automation
         } catch (error) {
             console.error('Failed to stop traffic task:', error)
             throw error
         }
-    })
+    }))
 
     // Get traffic stats
-    ipcMain.handle('traffic:getStats', async () => {
+    ipcMain.handle('traffic:getStats', withIpcValidation('traffic:getStats', async () => {
         try {
             const db = getDatabase()
             const all = db.select().from(trafficTasks).all()
@@ -130,19 +239,17 @@ export function registerTrafficHandlers() {
             console.error('Failed to get traffic stats:', error)
             return { total: 0, running: 0, pending: 0, completed: 0, totalViews: 0 }
         }
-    })
+    }))
 
     // ============================================================
     // Traffic Boost Campaign Handlers
     // ============================================================
 
-    // Get all campaigns with enriched data
-    ipcMain.handle('trafficBoost:getCampaigns', async () => {
+    ipcMain.handle('trafficBoost:getCampaigns', withIpcValidation('trafficBoost:getCampaigns', async () => {
         try {
             const db = getDatabase()
             const campaigns = db.select().from(trafficCampaigns).all()
 
-            // Query accounts and locations once instead of per-campaign
             const allAccounts = db.select().from(accounts).all()
             const allLocations = db.select().from(locations).all()
             const accountMap = new Map(allAccounts.map(a => [a.id, a]))
@@ -164,49 +271,58 @@ export function registerTrafficHandlers() {
             console.error('Failed to get traffic campaigns:', error)
             return []
         }
-    })
+    }))
 
-    // Create campaign. Map traffic defaults to deterministic SEO automation.
-    ipcMain.handle('trafficBoost:createCampaign', async (_event, data: {
-        name: string
-        trafficMode?: 'direct' | 'organic' | 'web_seo' | 'map_search'
-        searchKeywords?: string[]
-        maxMapScroll?: number
-        accountIds: number[]
-        locationIds: number[]
-        threadsCount?: number
-        visitsPerLocation?: number
-        delayMinSeconds?: number
-        delayMaxSeconds?: number
-        aiAutoControl?: boolean
-    }) => {
+    ipcMain.handle('trafficBoost:createCampaign', withIpcValidation('trafficBoost:createCampaign', async (_event, data: unknown) => {
+        const parsed = parseIpcPayload('trafficBoost:createCampaign', trafficBoostCreateSchema, data)
         try {
             const db = getDatabase()
-            const delayMinSeconds = Math.max(0, data.delayMinSeconds ?? 10)
-            const delayMaxSecondsInput = Math.max(0, data.delayMaxSeconds ?? 30)
+            const trafficMode = parsed.trafficMode || 'direct'
+            const delayMinSeconds = Math.max(0, parsed.delayMinSeconds ?? 10)
+            const delayMaxSecondsInput = Math.max(0, parsed.delayMaxSeconds ?? 30)
             const delayMaxSeconds = Math.max(delayMinSeconds, delayMaxSecondsInput)
-            const threadsCount = Math.max(1, Math.floor(data.threadsCount ?? 1))
+            const threadsCount = Math.max(1, Math.floor(parsed.threadsCount ?? 1))
 
-            const providedMax = typeof data.maxMapScroll === 'number' ? data.maxMapScroll : 15
+            const providedMax = typeof parsed.maxMapScroll === 'number' ? parsed.maxMapScroll : 15
             const clampedMax = Math.max(1, Math.min(100, Math.floor(providedMax)))
 
+            const dwell = resolveDwellWindow(
+                parsed.webSeoMinDwellSeconds,
+                parsed.webSeoMaxDwellSeconds,
+                WEB_SEO_DWELL_DEFAULT_MIN,
+                WEB_SEO_DWELL_DEFAULT_MAX,
+            )
+            const webSeoRequireOrganic = parsed.webSeoRequireOrganic === true
+
+            const normalizedKeywords = parseWebSeoKeywords(parsed.searchKeywords)
+            if (trafficMode === 'web_seo') {
+                if (normalizedKeywords.length === 0) {
+                    throw new Error('web_seo mode requires at least one non-empty search keyword')
+                }
+                assertWebSeoLocationsSafe(db, parsed.locationIds)
+            }
+
             return db.insert(trafficCampaigns).values({
-                name: data.name,
-                trafficMode: data.trafficMode || 'direct',
-                searchKeywords: data.searchKeywords ? JSON.stringify(data.searchKeywords) : null,
+                name: parsed.name,
+                trafficMode,
+                searchKeywords: normalizedKeywords.length > 0
+                    ? JSON.stringify(normalizedKeywords)
+                    : null,
                 maxMapScroll: clampedMax,
-                accountIds: JSON.stringify(data.accountIds),
-                locationIds: JSON.stringify(data.locationIds),
+                accountIds: JSON.stringify(parsed.accountIds),
+                locationIds: JSON.stringify(parsed.locationIds),
                 threadsCount,
-                visitsPerLocation: data.visitsPerLocation || 10,
+                visitsPerLocation: parsed.visitsPerLocation || 10,
                 delayMinSeconds,
                 delayMaxSeconds,
-                // Deterministic SEO defaults kept for DB compatibility.
                 actionsPerVisit: 4,
                 fixedActionCount: false,
                 enabledActions: null,
                 targetKpi: null,
-                aiAutoControl: data.aiAutoControl === true,
+                aiAutoControl: parsed.aiAutoControl === true,
+                webSeoMinDwellSeconds: dwell.min,
+                webSeoMaxDwellSeconds: dwell.max,
+                webSeoRequireOrganic,
                 status: 'pending',
                 createdAt: new Date(),
             }).returning().get()
@@ -214,94 +330,134 @@ export function registerTrafficHandlers() {
             console.error('Failed to create campaign:', error)
             throw error
         }
-    })
+    }))
 
-    // Update campaign.
-    ipcMain.handle('trafficBoost:updateCampaign', async (_event, id: number, data: any) => {
+    ipcMain.handle('trafficBoost:updateCampaign', withIpcValidation('trafficBoost:updateCampaign', async (
+        _event,
+        id: unknown,
+        data: unknown,
+    ) => {
+        const [parsedId, parsed] = parseIpcArgs(
+            'trafficBoost:updateCampaign',
+            z.tuple([idSchema, trafficBoostUpdateSchema]),
+            [id, data],
+        )
         try {
             const db = getDatabase()
-            const updateData: any = {}
-
-            // Core fields that users can still change
-            if (data.name !== undefined) updateData.name = data.name
-            if (data.trafficMode !== undefined) updateData.trafficMode = data.trafficMode
-            if (data.accountIds) updateData.accountIds = JSON.stringify(data.accountIds)
-            if (data.locationIds) updateData.locationIds = JSON.stringify(data.locationIds)
-            if (data.searchKeywords) updateData.searchKeywords = JSON.stringify(data.searchKeywords)
-            if (typeof data.visitsPerLocation === 'number') updateData.visitsPerLocation = data.visitsPerLocation
-
-            if (typeof data.threadsCount === 'number') {
-                updateData.threadsCount = Math.max(1, Math.floor(data.threadsCount))
+            const current = db.select().from(trafficCampaigns).where(eq(trafficCampaigns.id, parsedId)).get()
+            if (!current) {
+                throw new Error(`Campaign ${parsedId} not found`)
             }
 
-            if (typeof data.delayMinSeconds === 'number' || typeof data.delayMaxSeconds === 'number') {
-                const current = db.select().from(trafficCampaigns).where(eq(trafficCampaigns.id, id)).get()
-                const resolvedMin = Math.max(0, typeof data.delayMinSeconds === 'number'
-                    ? data.delayMinSeconds
-                    : current?.delayMinSeconds ?? 10)
-                const resolvedMaxInput = Math.max(0, typeof data.delayMaxSeconds === 'number'
-                    ? data.delayMaxSeconds
-                    : current?.delayMaxSeconds ?? 30)
+            const updateData: Record<string, string | number | boolean | null> = {}
+            const resultingMode = parsed.trafficMode ?? current.trafficMode
+
+            if (parsed.name !== undefined) updateData.name = parsed.name
+            if (parsed.trafficMode !== undefined) updateData.trafficMode = parsed.trafficMode
+            if (parsed.accountIds) updateData.accountIds = JSON.stringify(parsed.accountIds)
+            if (parsed.locationIds) updateData.locationIds = JSON.stringify(parsed.locationIds)
+
+            if (parsed.searchKeywords !== undefined) {
+                const normalizedKeywords = parseWebSeoKeywords(parsed.searchKeywords)
+                updateData.searchKeywords = normalizedKeywords.length > 0
+                    ? JSON.stringify(normalizedKeywords)
+                    : null
+            }
+
+            if (typeof parsed.visitsPerLocation === 'number') {
+                updateData.visitsPerLocation = parsed.visitsPerLocation
+            }
+
+            if (typeof parsed.threadsCount === 'number') {
+                updateData.threadsCount = Math.max(1, Math.floor(parsed.threadsCount))
+            }
+
+            if (typeof parsed.delayMinSeconds === 'number' || typeof parsed.delayMaxSeconds === 'number') {
+                const resolvedMin = Math.max(0, typeof parsed.delayMinSeconds === 'number'
+                    ? parsed.delayMinSeconds
+                    : current.delayMinSeconds ?? 10)
+                const resolvedMaxInput = Math.max(0, typeof parsed.delayMaxSeconds === 'number'
+                    ? parsed.delayMaxSeconds
+                    : current.delayMaxSeconds ?? 30)
                 updateData.delayMinSeconds = resolvedMin
                 updateData.delayMaxSeconds = Math.max(resolvedMin, resolvedMaxInput)
             }
 
-            if (typeof data.aiAutoControl === 'boolean') {
-                updateData.aiAutoControl = data.aiAutoControl
+            if (
+                typeof parsed.webSeoMinDwellSeconds === 'number'
+                || typeof parsed.webSeoMaxDwellSeconds === 'number'
+            ) {
+                const dwell = resolveDwellWindow(
+                    parsed.webSeoMinDwellSeconds,
+                    parsed.webSeoMaxDwellSeconds,
+                    current.webSeoMinDwellSeconds,
+                    current.webSeoMaxDwellSeconds,
+                )
+                updateData.webSeoMinDwellSeconds = dwell.min
+                updateData.webSeoMaxDwellSeconds = dwell.max
             }
 
-            if (typeof data.maxMapScroll === 'number') {
-                updateData.maxMapScroll = Math.max(1, Math.min(100, Math.floor(data.maxMapScroll)))
+            if (typeof parsed.webSeoRequireOrganic === 'boolean') {
+                updateData.webSeoRequireOrganic = parsed.webSeoRequireOrganic
+            }
+
+            if (typeof parsed.aiAutoControl === 'boolean') {
+                updateData.aiAutoControl = parsed.aiAutoControl
+            }
+
+            if (typeof parsed.maxMapScroll === 'number') {
+                updateData.maxMapScroll = Math.max(1, Math.min(100, Math.floor(parsed.maxMapScroll)))
+            }
+
+            if (resultingMode === 'web_seo') {
+                applyWebSeoUpdateGuards(db, current, parsed, updateData)
             }
 
             return db.update(trafficCampaigns)
                 .set(updateData)
-                .where(eq(trafficCampaigns.id, id))
+                .where(eq(trafficCampaigns.id, parsedId))
                 .returning().get()
         } catch (error) {
             console.error('Failed to update campaign:', error)
             throw error
         }
-    })
+    }))
 
-    // Delete campaign and its logs
-    ipcMain.handle('trafficBoost:deleteCampaign', async (_event, id: number) => {
+    ipcMain.handle('trafficBoost:deleteCampaign', withIpcValidation('trafficBoost:deleteCampaign', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('trafficBoost:deleteCampaign', idSchema, id)
         try {
             const db = getDatabase()
-            db.delete(trafficLogs).where(eq(trafficLogs.campaignId, id)).run()
-            db.delete(trafficCampaigns).where(eq(trafficCampaigns.id, id)).run()
+            db.delete(trafficLogs).where(eq(trafficLogs.campaignId, parsedId)).run()
+            db.delete(trafficCampaigns).where(eq(trafficCampaigns.id, parsedId)).run()
             return { success: true }
         } catch (error) {
             console.error('Failed to delete campaign:', error)
             throw error
         }
-    })
+    }))
 
-    // Bulk delete campaigns and their logs
-    ipcMain.handle('trafficBoost:deleteCampaigns', async (_event, ids: number[]) => {
+    ipcMain.handle('trafficBoost:deleteCampaigns', withIpcValidation('trafficBoost:deleteCampaigns', async (_event, ids: unknown) => {
+        const campaignIds = parseIpcPayload('trafficBoost:deleteCampaigns', positiveIdListSchema, ids)
         try {
             const db = getDatabase()
-            const campaignIds = Array.from(new Set((Array.isArray(ids) ? ids : [])
-                .map(id => Number(id))
-                .filter(id => Number.isInteger(id) && id > 0)))
+            const uniqueIds = Array.from(new Set(campaignIds))
 
-            for (const campaignId of campaignIds) {
+            for (const campaignId of uniqueIds) {
                 db.delete(trafficLogs).where(eq(trafficLogs.campaignId, campaignId)).run()
                 db.delete(trafficCampaigns).where(eq(trafficCampaigns.id, campaignId)).run()
             }
 
-            return { success: true, deleted: campaignIds.length }
+            return { success: true, deleted: uniqueIds.length }
         } catch (error) {
             console.error('Failed to bulk delete campaigns:', error)
             throw error
         }
-    })
+    }))
 
-    // Start campaign
-    ipcMain.handle('trafficBoost:start', async (_event, id: number) => {
+    ipcMain.handle('trafficBoost:start', withIpcValidation('trafficBoost:start', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('trafficBoost:start', idSchema, id)
         try {
-            // Start in background (don't await)
-            trafficBoostEngine.startCampaign(id).catch(err => {
+            trafficBoostEngine.startCampaign(parsedId).catch(err => {
                 console.error('[TrafficBoost] Campaign failed:', err)
             })
             return { success: true }
@@ -309,10 +465,9 @@ export function registerTrafficHandlers() {
             console.error('Failed to start campaign:', error)
             throw error
         }
-    })
+    }))
 
-    // Stop campaign
-    ipcMain.handle('trafficBoost:stop', async () => {
+    ipcMain.handle('trafficBoost:stop', withIpcValidation('trafficBoost:stop', async () => {
         try {
             await trafficBoostEngine.stopCampaign()
             return { success: true }
@@ -320,10 +475,9 @@ export function registerTrafficHandlers() {
             console.error('Failed to stop campaign:', error)
             throw error
         }
-    })
+    }))
 
-    // Pause campaign
-    ipcMain.handle('trafficBoost:pause', async () => {
+    ipcMain.handle('trafficBoost:pause', withIpcValidation('trafficBoost:pause', async () => {
         try {
             await trafficBoostEngine.pauseCampaign()
             return { success: true }
@@ -331,10 +485,9 @@ export function registerTrafficHandlers() {
             console.error('Failed to pause campaign:', error)
             throw error
         }
-    })
+    }))
 
-    // Resume campaign (from paused; continues from saved visits/round/keyword/account position via DB logs + counters)
-    ipcMain.handle('trafficBoost:resume', async () => {
+    ipcMain.handle('trafficBoost:resume', withIpcValidation('trafficBoost:resume', async () => {
         try {
             await trafficBoostEngine.resumeCampaign()
             return { success: true }
@@ -342,29 +495,28 @@ export function registerTrafficHandlers() {
             console.error('Failed to resume campaign:', error)
             throw error
         }
-    })
+    }))
 
-    // Get realtime status
-    ipcMain.handle('trafficBoost:getStatus', async () => {
+    ipcMain.handle('trafficBoost:getStatus', withIpcValidation('trafficBoost:getStatus', async () => {
         return trafficBoostEngine.getStatus()
-    })
+    }))
 
-    // Get campaign report
-    ipcMain.handle('trafficBoost:getReport', async (_event, id: number) => {
+    ipcMain.handle('trafficBoost:getReport', withIpcValidation('trafficBoost:getReport', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('trafficBoost:getReport', idSchema, id)
         try {
-            return trafficBoostEngine.getReport(id)
+            return trafficBoostEngine.getReport(parsedId)
         } catch (error) {
             console.error('Failed to get report:', error)
             throw error
         }
-    })
+    }))
 
-    // Get logs for a campaign
-    ipcMain.handle('trafficBoost:getLogs', async (_event, campaignId: number) => {
+    ipcMain.handle('trafficBoost:getLogs', withIpcValidation('trafficBoost:getLogs', async (_event, campaignId: unknown) => {
+        const parsedId = parseIpcPayload('trafficBoost:getLogs', idSchema, campaignId)
         try {
             const db = getDatabase()
             const logs = db.select().from(trafficLogs)
-                .where(eq(trafficLogs.campaignId, campaignId))
+                .where(eq(trafficLogs.campaignId, parsedId))
                 .all()
 
             return logs.map(log => {
@@ -384,17 +536,15 @@ export function registerTrafficHandlers() {
             console.error('Failed to get logs:', error)
             return []
         }
-    })
+    }))
 
-    // Get traffic audit report (quality analysis)
-    ipcMain.handle('trafficBoost:getAudit', async (_event, campaignId: number) => {
+    ipcMain.handle('trafficBoost:getAudit', withIpcValidation('trafficBoost:getAudit', async (_event, campaignId: unknown) => {
+        const parsedId = parseIpcPayload('trafficBoost:getAudit', idSchema, campaignId)
         try {
-            return trafficBoostEngine.getAuditReport(campaignId)
+            return trafficBoostEngine.getAuditReport(parsedId)
         } catch (error) {
             console.error('Failed to get audit report:', error)
             throw error
         }
-    })
-
+    }))
 }
-

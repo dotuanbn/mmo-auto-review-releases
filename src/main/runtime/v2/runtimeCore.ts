@@ -11,6 +11,7 @@ class RuntimeCore {
     private latestStatus: RuntimeStatusV2 = {
         version: 'v2',
         isRunning: false,
+        isPaused: false,
         campaignId: null,
         campaignName: '',
         currentRound: 0,
@@ -39,6 +40,7 @@ class RuntimeCore {
             this.latestStatus = {
                 version: 'v2',
                 isRunning: status.isRunning,
+                isPaused: status.isPaused === true,
                 campaignId: status.campaignId,
                 campaignName: status.campaignName,
                 currentRound: status.currentRound,

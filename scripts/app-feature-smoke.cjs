@@ -109,11 +109,24 @@ async function main() {
 
       await step('settings.crud', async () => {
         const before = await api.settings.getAll()
-        await api.settings.set('smokeKey', 'smokeValue')
-        assert(await api.settings.get('smokeKey') === 'smokeValue', 'settings.set/get mismatch')
-        await api.settings.saveAll({ ...before, smokeKey2: 'saved' })
-        assert(await api.settings.get('smokeKey2') === 'saved', 'settings.saveAll mismatch')
+        const toggledHeadless = before.headless !== true
+        await api.settings.set('headless', toggledHeadless)
+        assert(await api.settings.get('headless') === toggledHeadless, 'settings.set/get mismatch')
+        await api.settings.saveAll({ ...before, headless: before.headless === true })
+        assert(await api.settings.get('headless') === (before.headless === true), 'settings.saveAll mismatch')
         return await api.settings.getAll()
+      })
+
+      await step('captcha.metrics', async () => {
+        assert(api.captcha && typeof api.captcha.getMetrics === 'function', 'captcha metrics API missing')
+        const before = await api.captcha.getMetrics()
+        assert(typeof before.totals?.attempts === 'number', 'captcha totals missing')
+        assert(Array.isArray(before.recentAttempts), 'captcha recentAttempts missing')
+        const reset = await api.captcha.resetMetrics()
+        assert(reset.success === true, 'captcha metrics reset failed')
+        const after = await api.captcha.getMetrics()
+        assert(after.totals.attempts === 0, 'captcha metrics reset did not clear attempts')
+        return { before: before.totals, reset }
       })
 
       await step('projects.crud', async () => {
@@ -138,9 +151,19 @@ async function main() {
         })
         ids.accountId = account.id
         assert(account.loginType === 'manual', 'account loginType not persisted')
+        assert(!('password' in account), 'account password leaked over IPC')
+        assert(!('twoFactorSecret' in account), 'account TOTP leaked over IPC')
+        assert(!('cookies' in account), 'account cookies leaked over IPC')
+        assert(account.hasPassword === true, 'account hasPassword flag missing')
         const updated = await api.accounts.update(account.id, { status: 'active' })
         assert(updated.status === 'active', 'account update mismatch')
         await api.accounts.importCSV([{ email: `import-${Date.now()}@example.test`, password: 'not-real', loginType: 'manual' }])
+        if (api.warmup) {
+          const warmupStatus = await api.warmup.getStatus(account.id)
+          assert(warmupStatus.accountId === account.id, 'warmup status account mismatch')
+          const warmupStatuses = await api.warmup.getAllStatuses()
+          assert(Array.isArray(warmupStatuses), 'warmup batch status missing')
+        }
         return await api.accounts.getStats()
       })
 
@@ -260,6 +283,46 @@ async function main() {
         return campaign
       })
 
+      await step('traffic.web-seo-config', async () => {
+        const location = await api.locations.add({
+          name: 'Smoke Web SEO Target',
+          url: 'https://example.com/landing?source=smoke',
+          address: 'https://example.com/landing?source=smoke',
+          placeId: `web_seo_smoke_${Date.now()}`,
+        })
+        ids.webSeoLocationId = location.id
+
+        const campaign = await api.trafficBoost.createCampaign({
+          name: 'Smoke Web SEO Campaign',
+          trafficMode: 'web_seo',
+          searchKeywords: ['example landing', 'example website'],
+          accountIds: [],
+          locationIds: [location.id],
+          threadsCount: 1,
+          visitsPerLocation: 1,
+          delayMinSeconds: 1,
+          delayMaxSeconds: 2,
+          webSeoMinDwellSeconds: 10,
+          webSeoMaxDwellSeconds: 20,
+          webSeoRequireOrganic: true,
+        })
+        ids.webSeoCampaignId = campaign.id
+        assert(campaign.trafficMode === 'web_seo', 'web seo campaign mode mismatch')
+        assert(campaign.webSeoMinDwellSeconds === 10, 'web seo min dwell mismatch')
+        assert(campaign.webSeoMaxDwellSeconds === 20, 'web seo max dwell mismatch')
+        assert(campaign.webSeoRequireOrganic === true, 'web seo organic gate mismatch')
+
+        const updated = await api.trafficBoost.updateCampaign(campaign.id, {
+          webSeoMinDwellSeconds: 15,
+          webSeoMaxDwellSeconds: 30,
+          webSeoRequireOrganic: false,
+        })
+        assert(updated.webSeoMinDwellSeconds === 15, 'web seo update min dwell mismatch')
+        assert(updated.webSeoMaxDwellSeconds === 30, 'web seo update max dwell mismatch')
+        assert(updated.webSeoRequireOrganic === false, 'web seo update organic gate mismatch')
+        return updated
+      })
+
       await step('runtime-network-rag-reports-tiling-soak-compliance', async () => {
         await api.runtime.getStatusV2()
         await api.runtime.getDiagnostics()
@@ -280,11 +343,14 @@ async function main() {
       })
 
       await step('proxies-fproxy.local', async () => {
-        const proxy = await api.proxies.add({ host: '127.0.0.1', port: 8080, type: 'http', country: 'local' })
+        const proxy = await api.proxies.add({ host: '127.0.0.1', port: 8080, username: 'smoke', password: 'not-real', type: 'http', country: 'local' })
         ids.proxyId = proxy.id
+        assert(!('password' in proxy), 'proxy password leaked over IPC')
+        assert(proxy.hasPassword === true, 'proxy hasPassword flag missing')
         await api.proxies.update(proxy.id, { status: 'dead' })
         await api.proxies.importText('127.0.0.2:8081:user:pass:http')
-        await api.proxies.getAll()
+        const listedProxies = await api.proxies.getAll()
+        assert(listedProxies.every(item => !('password' in item)), 'proxy list leaked password')
         await api.proxies.getActive()
         await api.proxies.getStats()
         await api.proxies.deleteDead()
@@ -359,6 +425,7 @@ async function main() {
 
       await step('cleanup', async () => {
         if (ids.scheduleId) await api.scheduler.delete(ids.scheduleId)
+        if (ids.webSeoCampaignId) await api.trafficBoost.deleteCampaign(ids.webSeoCampaignId)
         if (ids.trafficCampaignId) await api.trafficBoost.deleteCampaign(ids.trafficCampaignId)
         if (ids.trafficTaskId) await api.traffic.delete(ids.trafficTaskId)
         if (ids.campaignId) await api.campaigns.delete(ids.campaignId)
@@ -366,6 +433,7 @@ async function main() {
         if (ids.scriptId) await api.scripts.delete(ids.scriptId)
         if (ids.imageFolderId) await api.images.deleteFolder(ids.imageFolderId)
         if (ids.locationFromUrlId) await api.locations.delete(ids.locationFromUrlId)
+        if (ids.webSeoLocationId) await api.locations.delete(ids.webSeoLocationId)
         if (ids.locationId) await api.locations.delete(ids.locationId)
         if (ids.accountId) await api.accounts.delete(ids.accountId)
         if (ids.projectId) await api.projects.delete(ids.projectId, false)

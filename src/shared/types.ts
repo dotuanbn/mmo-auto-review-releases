@@ -1,26 +1,28 @@
 // Shared types between main and renderer processes
+import type {
+    AccountCreatePayload,
+    AccountLoginType,
+    AccountStatus,
+    AccountUpdatePayload,
+    PublicAccount,
+} from './account-contracts'
 
-// Account types
-export interface Account {
-    id: number
-    email: string
-    password: string
-    recoveryEmail?: string
-    recoveryPhone?: string
-    loginType: 'auto' | 'manual'
-    cookies?: string
-    profilePath?: string
-    status: 'active' | 'banned' | 'pending' | 'suspended' | 'checking'
-    lastUsed?: Date
-    totalReviews: number
-    createdAt: Date
-}
+export type { PublicAccount, AccountCreatePayload, AccountUpdatePayload, AccountLoginType, AccountStatus }
+
+/**
+ * Renderer-facing account type (IPC). Secrets are never included —
+ * use hasPassword / hasTwoFactorSecret flags instead.
+ * @deprecated Prefer PublicAccount from account-contracts for new code.
+ */
+export type Account = PublicAccount
 
 export interface AccountCreate {
     email: string
     password: string
     recoveryEmail?: string
     recoveryPhone?: string
+    loginType?: AccountLoginType
+    twoFactorSecret?: string
 }
 
 // Proxy types
@@ -145,6 +147,24 @@ export interface ReviewStats {
 }
 
 // Settings types
+export type SettingsValue = string | number | boolean
+/** Open settings bag used by main-process loadSettings / saveSettings. */
+export type SettingsRecord = Record<string, SettingsValue>
+
+/**
+ * Secret setting keys stored via SecretVault (enc:v1) at rest.
+ * Never returned as plaintext over settings:get / settings:getAll.
+ */
+export const SETTINGS_SECRET_KEYS = ['groqApiKey', 'fproxyApiKey', 'captchaSolverApiKey', 'captchaSolverFallbackApiKey'] as const
+export type SettingsSecretKey = (typeof SETTINGS_SECRET_KEYS)[number]
+
+/** ASCII mask returned to the renderer for nonempty secrets. */
+export const SETTINGS_SECRET_MASK = '********'
+
+export function isSettingsSecretKey(key: string): key is SettingsSecretKey {
+    return (SETTINGS_SECRET_KEYS as readonly string[]).includes(key)
+}
+
 export interface AppSettings {
     headless: boolean
     defaultDelay: { min: number; max: number }
@@ -153,6 +173,16 @@ export interface AppSettings {
     autoStartCampaign: boolean
     notificationsEnabled: boolean
     theme: 'light' | 'dark' | 'system'
+    /**
+     * Opt-in agentic review planner. Default false.
+     * Must never auto-enable solely because Ollama is online.
+     */
+    enableAgenticReview?: boolean
+    /** Masked in renderer IPC when set (never raw). */
+    groqApiKey?: string
+    fproxyApiKey?: string
+    captchaSolverApiKey?: string
+    captchaSolverFallbackApiKey?: string
 }
 
 // IPC Event types
@@ -176,10 +206,10 @@ export interface CampaignUpdateEvent {
 export interface ElectronAPI {
     getVersion: () => Promise<string>
 
-    // Accounts
-    getAccounts: () => Promise<Account[]>
-    addAccount: (data: AccountCreate) => Promise<Account>
-    updateAccount: (id: number, data: Partial<Account>) => Promise<Account>
+    // Accounts (public DTO — no password / twoFactorSecret)
+    getAccounts: () => Promise<PublicAccount[]>
+    addAccount: (data: AccountCreate) => Promise<PublicAccount>
+    updateAccount: (id: number, data: AccountUpdatePayload) => Promise<PublicAccount | undefined>
     deleteAccount: (id: number) => Promise<void>
     testAccountLogin: (id: number) => Promise<{ success: boolean; message: string }>
 
@@ -219,7 +249,7 @@ export interface ElectronAPI {
     // Event listeners
     onReviewProgress: (callback: (data: ReviewProgressEvent) => void) => () => void
     onCampaignUpdate: (callback: (data: CampaignUpdateEvent) => void) => () => void
-    onAccountUpdate: (callback: (data: Account) => void) => () => void
+    onAccountUpdate: (callback: (data: PublicAccount) => void) => () => void
 }
 
 // Window typing is declared in src/preload/index.ts to avoid duplicate global declarations.

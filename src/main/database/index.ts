@@ -2,11 +2,29 @@ import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { app } from 'electron'
 import { join } from 'path'
-import { existsSync, mkdirSync } from 'fs'
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+} from 'fs'
 import * as schema from './schema'
+import { runVersionedMigrations, type SqliteTableInfoRow } from './migrations'
 
-let db: ReturnType<typeof drizzle> | null = null
+type AppDatabase = ReturnType<typeof drizzle<typeof schema>>
+
+/** Max retained pre-migration snapshots under data/backups (newest kept). */
+const MAX_PRE_MIGRATE_BACKUPS = 3
+
+/** SQLite busy_timeout (ms) for brief lock waits in single-process Electron. */
+const SQLITE_BUSY_TIMEOUT_MS = 5000
+
+let db: AppDatabase | null = null
 let sqlite: Database.Database | null = null
+/** Sync re-entrancy guard: prevents a second open while init is mid-flight. */
+let initInProgress = false
 
 // Get the path to the database file
 function getDatabasePath(): string {
@@ -21,27 +39,157 @@ function getDatabasePath(): string {
   return join(dbFolder, 'mmo-review.db')
 }
 
+function getBackupsDir(dbPath: string): string {
+  return join(dbPath, '..', 'backups')
+}
+
+/**
+ * Close a sqlite handle (best-effort) and clear module singletons so the next
+ * initDatabase/getDatabase call can retry from a clean state.
+ */
+function resetDatabaseHandles(handle: Database.Database | null = sqlite): void {
+  const toClose = handle ?? sqlite
+  if (toClose) {
+    try {
+      toClose.close()
+    } catch (closeError) {
+      console.error('Failed to close database handle during reset:', closeError)
+    }
+  }
+  sqlite = null
+  db = null
+}
+
+/** WAL + busy_timeout: safe for better-sqlite3 / Electron main single process. */
+function applyConnectionPragmas(handle: Database.Database): void {
+  handle.pragma('journal_mode = WAL')
+  handle.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`)
+}
+
+/**
+ * Fail-closed integrity gate before any migrations mutate schema/data.
+ */
+function assertDatabaseIntegrity(handle: Database.Database): void {
+  const rows = handle.prepare('PRAGMA integrity_check').all() as Array<
+    Record<string, unknown>
+  >
+  const messages = rows.map((row) => String(Object.values(row)[0] ?? ''))
+  if (messages.length !== 1 || messages[0] !== 'ok') {
+    const detail = messages.join('; ') || 'empty result'
+    throw new Error(`SQLite integrity_check failed (fail-closed): ${detail}`)
+  }
+}
+
+function listPreMigrateBackups(backupsDir: string): Array<{ path: string; mtimeMs: number }> {
+  if (!existsSync(backupsDir)) return []
+
+  return readdirSync(backupsDir)
+    .filter((name) => name.startsWith('mmo-review.pre-migrate.') && name.endsWith('.db'))
+    .map((name) => {
+      const path = join(backupsDir, name)
+      return { path, mtimeMs: statSync(path).mtimeMs }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+}
+
+/** Keep newest MAX_PRE_MIGRATE_BACKUPS; delete older snapshot files. */
+function retainMaxPreMigrateBackups(backupsDir: string): void {
+  const ranked = listPreMigrateBackups(backupsDir)
+  for (const stale of ranked.slice(MAX_PRE_MIGRATE_BACKUPS)) {
+    unlinkSync(stale.path)
+  }
+}
+
+/**
+ * Pre-migration snapshot of an existing DB file into data/backups.
+ * - Not used for brand-new empty DBs
+ * - Unique destination (no overwrite)
+ * - Retain max 3
+ * - Disk errors fail-closed
+ */
+function createPreMigrationSnapshot(dbPath: string): void {
+  try {
+    const backupsDir = getBackupsDir(dbPath)
+    if (!existsSync(backupsDir)) {
+      mkdirSync(backupsDir, { recursive: true })
+    }
+
+    const stamp = `${Date.now()}-${process.pid}`
+    const dest = join(backupsDir, `mmo-review.pre-migrate.${stamp}.db`)
+    if (existsSync(dest)) {
+      throw new Error(`backup destination already exists: ${dest}`)
+    }
+
+    // Checkpoint first so the main file is a consistent on-disk image under WAL.
+    if (sqlite) {
+      sqlite.pragma('wal_checkpoint(TRUNCATE)')
+    }
+    copyFileSync(dbPath, dest)
+    retainMaxPreMigrateBackups(backupsDir)
+    console.log('Pre-migration DB snapshot:', dest)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Pre-migration snapshot failed (fail-closed): ${message}`)
+  }
+}
+
 // Initialize the database connection
-export function initDatabase() {
+// Boot order: re-entrancy guard → open → WAL/busy_timeout → integrity_check →
+// (optional pre-migration snapshot if DB existed) → tables/legacy/versioned
+// migrations → default settings → publish singleton.
+// Fail-closed: only publish after the full pipeline succeeds; on error close
+// the handle, clear cache, and rethrow so the next call can retry cleanly.
+export function initDatabase(): AppDatabase {
   if (db) return db
 
-  const dbPath = getDatabasePath()
-  console.log('Database path:', dbPath)
+  if (initInProgress) {
+    throw new Error(
+      'Database initialization already in progress (re-entrancy guard)'
+    )
+  }
 
-  sqlite = new Database(dbPath)
-  db = drizzle(sqlite, { schema })
+  initInProgress = true
+  let opened: Database.Database | null = null
 
-  // Create tables if they don't exist
-  createTables()
+  try {
+    const dbPath = getDatabasePath()
+    const dbExistedBeforeOpen = existsSync(dbPath)
+    console.log('Database path:', dbPath)
 
-  // Insert default settings
-  insertDefaultSettings()
+    opened = new Database(dbPath)
+    // Expose raw handle for createTables / migrations only — drizzle singleton
+    // is published after the full pipeline succeeds.
+    sqlite = opened
 
-  return db
+    applyConnectionPragmas(opened)
+    assertDatabaseIntegrity(opened)
+
+    // Snapshot only when a prior file existed (never snapshot a brand-new empty DB).
+    if (dbExistedBeforeOpen) {
+      createPreMigrationSnapshot(dbPath)
+    }
+
+    const pendingDb = drizzle(opened, { schema })
+
+    // Create tables if they don't exist (+ legacy + versioned migrations)
+    createTables()
+
+    // Insert default settings
+    insertDefaultSettings()
+
+    db = pendingDb
+    return db
+  } catch (error) {
+    console.error('Database initialization failed (fail-closed):', error)
+    resetDatabaseHandles(opened)
+    throw error
+  } finally {
+    initInProgress = false
+  }
 }
 
 // Get the database instance
-export function getDatabase() {
+export function getDatabase(): AppDatabase {
   if (!db) {
     return initDatabase()
   }
@@ -49,12 +197,8 @@ export function getDatabase() {
 }
 
 // Close database connection
-export function closeDatabase() {
-  if (sqlite) {
-    sqlite.close()
-    sqlite = null
-    db = null
-  }
+export function closeDatabase(): void {
+  resetDatabaseHandles(sqlite)
 }
 
 // Create tables manually (since we're not using migrations in dev)
@@ -95,7 +239,22 @@ function createTables() {
       last_review_date INTEGER,
       warmup_level INTEGER NOT NULL DEFAULT 0,
       reputation_score INTEGER NOT NULL DEFAULT 0,
-      warmup_history TEXT
+      warmup_history TEXT,
+      -- Phase 2 extended: review style + warmup schedule
+      review_style_profile TEXT,
+      review_style_seed TEXT,
+      last_warmup_at INTEGER,
+      next_warmup_at INTEGER,
+      warmup_sessions INTEGER NOT NULL DEFAULT 0
+    )
+  `)
+
+  // Version ledger for new migrations (CREATE also happens in runner for old DBs)
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      applied_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
     )
   `)
 
@@ -244,6 +403,11 @@ function createTables() {
       actions_per_visit INTEGER NOT NULL DEFAULT 4,
       fixed_action_count INTEGER NOT NULL DEFAULT 0,
       enabled_actions TEXT,
+      target_kpi TEXT,
+      ai_auto_control INTEGER NOT NULL DEFAULT 0,
+      web_seo_min_dwell_seconds INTEGER NOT NULL DEFAULT 45,
+      web_seo_max_dwell_seconds INTEGER NOT NULL DEFAULT 90,
+      web_seo_require_organic INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'pending',
       total_visits INTEGER NOT NULL DEFAULT 0,
       completed_visits INTEGER NOT NULL DEFAULT 0,
@@ -267,8 +431,10 @@ function createTables() {
       round INTEGER NOT NULL DEFAULT 1,
       status TEXT NOT NULL,
       error_message TEXT,
-      last_check INTEGER,
-      response_time INTEGER,
+      discovery_source TEXT,
+      quality_score INTEGER NOT NULL DEFAULT 0,
+      countable INTEGER NOT NULL DEFAULT 0,
+      target_host TEXT,
       created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
     )
   `)
@@ -361,20 +527,88 @@ function createTables() {
   sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)`)
   sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(status)`)
 
+  // CAPTCHA solve metrics (no secrets/tokens)
+  ensureCaptchaMetricsTable()
+
+  // Durable review/automation job queue (fresh DB)
+  ensureJobQueueTable()
+
   console.log('Database tables created successfully')
 
-  // Run migrations for existing database
+  // Legacy column/table backfills for existing databases (kept intact)
   runMigrations()
+
+  // Versioned idempotent migrations (schema_migrations ledger)
+  runVersionedMigrations(sqlite)
 }
 
-// Run migrations for existing databases
-function runMigrations() {
+/** Idempotent CREATE + indexes for captcha_metrics (fresh and old DBs). */
+function ensureCaptchaMetricsTable() {
+  if (!sqlite) return
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS captcha_metrics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      captcha_type TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      success INTEGER NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      error_code TEXT,
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    )
+  `)
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_captcha_metrics_created ON captcha_metrics(created_at DESC)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_captcha_metrics_type_created ON captcha_metrics(captcha_type, created_at DESC)`
+  )
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS idx_captcha_metrics_provider_created ON captcha_metrics(provider, created_at DESC)`
+  )
+}
+
+/** Idempotent CREATE + indexes for job_queue (fresh and old DBs). */
+function ensureJobQueueTable() {
+  if (!sqlite) return
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS job_queue (
+      id TEXT PRIMARY KEY NOT NULL,
+      campaign_id INTEGER REFERENCES campaigns(id),
+      type TEXT NOT NULL,
+      account_id INTEGER NOT NULL,
+      location_id INTEGER NOT NULL,
+      review_text TEXT,
+      rating INTEGER,
+      target_views INTEGER,
+      priority INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      max_retries INTEGER NOT NULL DEFAULT 3,
+      result TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT
+    )
+  `)
+  sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_job_queue_status ON job_queue(status)`)
+  sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_job_queue_campaign ON job_queue(campaign_id)`)
+  sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_job_queue_account_status ON job_queue(account_id, status)`)
+}
+
+// Run migrations for existing databases.
+// Fail-closed: errors are logged and rethrown so versioned migrations and
+// singleton publish never proceed on a partially migrated schema.
+function runMigrations(): void {
   if (!sqlite) return
 
   try {
     // Check if project_id column exists in locations
-    const locationsInfo = sqlite.prepare("PRAGMA table_info(locations)").all() as any[]
-    const hasLocationProjectId = locationsInfo.some((col: any) => col.name === 'project_id')
+    const locationsInfo = sqlite.prepare("PRAGMA table_info(locations)").all() as SqliteTableInfoRow[]
+    const hasLocationProjectId = locationsInfo.some((col) => col.name === 'project_id')
 
     if (!hasLocationProjectId) {
       console.log('Migration: Adding project_id to locations table')
@@ -382,8 +616,8 @@ function runMigrations() {
     }
 
     // Check if project_id column exists in campaigns
-    const campaignsInfo = sqlite.prepare("PRAGMA table_info(campaigns)").all() as any[]
-    const hasCampaignProjectId = campaignsInfo.some((col: any) => col.name === 'project_id')
+    const campaignsInfo = sqlite.prepare("PRAGMA table_info(campaigns)").all() as SqliteTableInfoRow[]
+    const hasCampaignProjectId = campaignsInfo.some((col) => col.name === 'project_id')
 
     if (!hasCampaignProjectId) {
       console.log('Migration: Adding project_id to campaigns table')
@@ -391,8 +625,8 @@ function runMigrations() {
     }
 
     // Check if project_id column exists in traffic_tasks
-    const trafficInfo = sqlite.prepare("PRAGMA table_info(traffic_tasks)").all() as any[]
-    const hasTrafficProjectId = trafficInfo.some((col: any) => col.name === 'project_id')
+    const trafficInfo = sqlite.prepare("PRAGMA table_info(traffic_tasks)").all() as SqliteTableInfoRow[]
+    const hasTrafficProjectId = trafficInfo.some((col) => col.name === 'project_id')
 
     if (!hasTrafficProjectId) {
       console.log('Migration: Adding project_id to traffic_tasks table')
@@ -400,98 +634,98 @@ function runMigrations() {
     }
 
     // Account table migrations for Phase A features
-    const accountsInfo = sqlite.prepare("PRAGMA table_info(accounts)").all() as any[]
+    const accountsInfo = sqlite.prepare("PRAGMA table_info(accounts)").all() as SqliteTableInfoRow[]
 
     // Add login_type column
-    if (!accountsInfo.some((col: any) => col.name === 'login_type')) {
+    if (!accountsInfo.some((col) => col.name === 'login_type')) {
       console.log('Migration: Adding login_type to accounts table')
       sqlite.exec("ALTER TABLE accounts ADD COLUMN login_type TEXT NOT NULL DEFAULT 'auto'")
     }
 
     // Add two_factor_secret column
-    if (!accountsInfo.some((col: any) => col.name === 'two_factor_secret')) {
+    if (!accountsInfo.some((col) => col.name === 'two_factor_secret')) {
       console.log('Migration: Adding two_factor_secret to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN two_factor_secret TEXT')
     }
 
     // Add fingerprint_id column
-    if (!accountsInfo.some((col: any) => col.name === 'fingerprint_id')) {
+    if (!accountsInfo.some((col) => col.name === 'fingerprint_id')) {
       console.log('Migration: Adding fingerprint_id to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN fingerprint_id TEXT')
     }
 
     // Add last_check_at column
-    if (!accountsInfo.some((col: any) => col.name === 'last_check_at')) {
+    if (!accountsInfo.some((col) => col.name === 'last_check_at')) {
       console.log('Migration: Adding last_check_at to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN last_check_at INTEGER')
     }
 
     // Phase 2 - Anti-Detection Warmup & Reputation fields
-    if (!accountsInfo.some((col: any) => col.name === 'first_review_date')) {
+    if (!accountsInfo.some((col) => col.name === 'first_review_date')) {
       console.log('Migration: Adding first_review_date to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN first_review_date INTEGER')
     }
-    if (!accountsInfo.some((col: any) => col.name === 'last_review_date')) {
+    if (!accountsInfo.some((col) => col.name === 'last_review_date')) {
       console.log('Migration: Adding last_review_date to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN last_review_date INTEGER')
     }
-    if (!accountsInfo.some((col: any) => col.name === 'warmup_level')) {
+    if (!accountsInfo.some((col) => col.name === 'warmup_level')) {
       console.log('Migration: Adding warmup_level to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN warmup_level INTEGER NOT NULL DEFAULT 0')
     }
-    if (!accountsInfo.some((col: any) => col.name === 'reputation_score')) {
+    if (!accountsInfo.some((col) => col.name === 'reputation_score')) {
       console.log('Migration: Adding reputation_score to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN reputation_score INTEGER NOT NULL DEFAULT 0')
     }
-    if (!accountsInfo.some((col: any) => col.name === 'warmup_history')) {
+    if (!accountsInfo.some((col) => col.name === 'warmup_history')) {
       console.log('Migration: Adding warmup_history to accounts table')
       sqlite.exec('ALTER TABLE accounts ADD COLUMN warmup_history TEXT')
     }
 
     // Proxy table migrations for health-check metadata
-    const proxiesInfo = sqlite.prepare("PRAGMA table_info(proxies)").all() as any[]
-    if (!proxiesInfo.some((col: any) => col.name === 'last_check')) {
+    const proxiesInfo = sqlite.prepare("PRAGMA table_info(proxies)").all() as SqliteTableInfoRow[]
+    if (!proxiesInfo.some((col) => col.name === 'last_check')) {
       console.log('Migration: Adding last_check to proxies table')
       sqlite.exec('ALTER TABLE proxies ADD COLUMN last_check INTEGER')
     }
-    if (!proxiesInfo.some((col: any) => col.name === 'response_time')) {
+    if (!proxiesInfo.some((col) => col.name === 'response_time')) {
       console.log('Migration: Adding response_time to proxies table')
       sqlite.exec('ALTER TABLE proxies ADD COLUMN response_time INTEGER')
     }
-    if (!proxiesInfo.some((col: any) => col.name === 'provider')) {
+    if (!proxiesInfo.some((col) => col.name === 'provider')) {
       console.log('Migration: Adding provider to proxies table (DataImpulse / Smartproxy / etc. support)')
       sqlite.exec('ALTER TABLE proxies ADD COLUMN provider TEXT')
     }
 
     // Add search_keywords column to locations for organic search
-    if (!locationsInfo.some((col: any) => col.name === 'search_keywords')) {
+    if (!locationsInfo.some((col) => col.name === 'search_keywords')) {
       console.log('Migration: Adding search_keywords to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN search_keywords TEXT')
     }
 
     // Add traffic_mode and search_keywords columns to traffic_campaigns
-    const tcInfo = sqlite.prepare('PRAGMA table_info(traffic_campaigns)').all() as any[]
-    if (!tcInfo.some((col: any) => col.name === 'traffic_mode')) {
+    const tcInfo = sqlite.prepare('PRAGMA table_info(traffic_campaigns)').all() as SqliteTableInfoRow[]
+    if (!tcInfo.some((col) => col.name === 'traffic_mode')) {
       console.log('Migration: Adding traffic_mode to traffic_campaigns table')
       sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN traffic_mode TEXT NOT NULL DEFAULT 'direct'")
     }
-    if (!tcInfo.some((col: any) => col.name === 'search_keywords')) {
+    if (!tcInfo.some((col) => col.name === 'search_keywords')) {
       console.log('Migration: Adding search_keywords to traffic_campaigns table')
       sqlite.exec('ALTER TABLE traffic_campaigns ADD COLUMN search_keywords TEXT')
     }
-    if (!tcInfo.some((col: any) => col.name === 'fixed_action_count')) {
+    if (!tcInfo.some((col) => col.name === 'fixed_action_count')) {
       console.log('Migration: Adding fixed_action_count to traffic_campaigns table')
       sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN fixed_action_count INTEGER NOT NULL DEFAULT 0")
     }
-    if (!tcInfo.some((col: any) => col.name === 'target_kpi')) {
+    if (!tcInfo.some((col) => col.name === 'target_kpi')) {
       console.log('Migration: Adding target_kpi to traffic_campaigns table')
       sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN target_kpi TEXT")
     }
-    if (!tcInfo.some((col: any) => col.name === 'ai_auto_control')) {
+    if (!tcInfo.some((col) => col.name === 'ai_auto_control')) {
       console.log('Migration: Adding ai_auto_control to traffic_campaigns table')
       sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN ai_auto_control INTEGER NOT NULL DEFAULT 0")
     }
-    if (!tcInfo.some((col: any) => col.name === 'max_map_scroll')) {
+    if (!tcInfo.some((col) => col.name === 'max_map_scroll')) {
       console.log('Migration: Adding max_map_scroll to traffic_campaigns table')
       sqlite.exec("ALTER TABLE traffic_campaigns ADD COLUMN max_map_scroll INTEGER NOT NULL DEFAULT 15")
     }
@@ -555,46 +789,52 @@ function runMigrations() {
     sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_analytics_snapshots_location_source ON analytics_snapshots(location_id, source, created_at DESC)`)
 
     // Add analytics columns to locations table
-    const locInfoMigrate = sqlite.prepare("PRAGMA table_info(locations)").all() as any[]
-    if (!locInfoMigrate.some((col: any) => col.name === 'analytics_mode')) {
+    const locInfoMigrate = sqlite.prepare("PRAGMA table_info(locations)").all() as SqliteTableInfoRow[]
+    if (!locInfoMigrate.some((col) => col.name === 'analytics_mode')) {
       console.log('Migration: Adding analytics_mode to locations table')
       sqlite.exec("ALTER TABLE locations ADD COLUMN analytics_mode TEXT DEFAULT 'none'")
     }
-    if (!locInfoMigrate.some((col: any) => col.name === 'ga4_property_id')) {
+    if (!locInfoMigrate.some((col) => col.name === 'ga4_property_id')) {
       console.log('Migration: Adding ga4_property_id to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN ga4_property_id TEXT')
     }
-    if (!locInfoMigrate.some((col: any) => col.name === 'gsc_site_url')) {
+    if (!locInfoMigrate.some((col) => col.name === 'gsc_site_url')) {
       console.log('Migration: Adding gsc_site_url to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN gsc_site_url TEXT')
     }
-    if (!locInfoMigrate.some((col: any) => col.name === 'analytics_google_email')) {
+    if (!locInfoMigrate.some((col) => col.name === 'analytics_google_email')) {
       console.log('Migration: Adding analytics_google_email to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN analytics_google_email TEXT')
     }
-    if (!locInfoMigrate.some((col: any) => col.name === 'phone')) {
+    if (!locInfoMigrate.some((col) => col.name === 'phone')) {
       console.log('Migration: Adding phone to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN phone TEXT')
     }
-    if (!locInfoMigrate.some((col: any) => col.name === 'website')) {
+    if (!locInfoMigrate.some((col) => col.name === 'website')) {
       console.log('Migration: Adding website to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN website TEXT')
     }
 
     // Strong map identity columns for target verification (placeId already existed; add cid + feature_hex)
-    const locInfo2 = sqlite.prepare("PRAGMA table_info(locations)").all() as any[]
-    if (!locInfo2.some((col: any) => col.name === 'cid')) {
+    const locInfo2 = sqlite.prepare("PRAGMA table_info(locations)").all() as SqliteTableInfoRow[]
+    if (!locInfo2.some((col) => col.name === 'cid')) {
       console.log('Migration: Adding cid to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN cid TEXT')
     }
-    if (!locInfo2.some((col: any) => col.name === 'feature_hex')) {
+    if (!locInfo2.some((col) => col.name === 'feature_hex')) {
       console.log('Migration: Adding feature_hex to locations table')
       sqlite.exec('ALTER TABLE locations ADD COLUMN feature_hex TEXT')
     }
 
+    // Durable job_queue (idempotent for existing DBs)
+    ensureJobQueueTable()
+    console.log('Migration: ensured job_queue table')
+
     console.log('Database migrations completed')
   } catch (error) {
     console.error('Migration error:', error)
+    // Fail-closed: do not continue to versioned migrations or publish singleton
+    throw error
   }
 }
 

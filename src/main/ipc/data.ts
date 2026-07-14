@@ -2,7 +2,14 @@ import { ipcMain, shell, app } from 'electron'
 import { dataRootService } from '../services/DataRootService'
 import { profileService } from '../services/ProfileService'
 import { existsSync, readdirSync, statSync, mkdirSync, rmSync } from 'fs'
-import { join, basename } from 'path'
+import { join } from 'path'
+import {
+    assertOptionalPathWithinRoots,
+    assertPathWithinRoots,
+    getDataOpenAllowedRoots,
+    getLegacyMigrateAllowedRoots,
+    withIpcValidation,
+} from './validate'
 
 function safeGetDirSize(dir: string): number {
     if (!existsSync(dir)) return 0
@@ -34,7 +41,6 @@ function scanProfileLikeDir(baseDir: string): { size: number; count: number; coo
         for (const e of entries) {
             if (e.isDirectory()) {
                 const p = join(baseDir, e.name)
-                // include profile_* and account_* (legacy traffic)
                 if (e.name.startsWith('profile_') || e.name.startsWith('account_')) {
                     count++
                     size += safeGetDirSize(p)
@@ -43,7 +49,7 @@ function scanProfileLikeDir(baseDir: string): { size: number; count: number; coo
                 }
             }
         }
-    } catch {}
+    } catch { /* ignore */ }
     return { size, count, cookiesAccounts }
 }
 
@@ -54,7 +60,7 @@ function getDbSize(): number {
         if (existsSync(dbPath)) {
             return statSync(dbPath).size
         }
-    } catch {}
+    } catch { /* ignore */ }
     return 0
 }
 
@@ -72,12 +78,11 @@ async function computeStorageInfo() {
     const dbSize = getDbSize()
     const shotsSize = getScreenshotsSize(dataRoot)
 
-    // Also add profileService disk list for profiles (more accurate for its managed)
     let managedProfilesSize = 0
     try {
         const listed = profileService.listProfiles()
         managedProfilesSize = listed.reduce((s, p) => s + (p.size || 0), 0)
-    } catch {}
+    } catch { /* ignore */ }
 
     const items = [
         {
@@ -124,40 +129,74 @@ async function computeStorageInfo() {
 }
 
 export function registerDataHandlers() {
-    ipcMain.handle('data:getRoot', async () => {
+    ipcMain.handle('data:getRoot', withIpcValidation('data:getRoot', async () => {
         return {
             dataRoot: dataRootService.getDataRoot(),
         }
-    })
+    }))
 
-    ipcMain.handle('data:detectLegacy', async () => {
+    ipcMain.handle('data:detectLegacy', withIpcValidation('data:detectLegacy', async () => {
         return dataRootService.detectLegacyRoots()
-    })
+    }))
 
-    ipcMain.handle('data:migrateLegacy', async (_event, sourcePath?: string) => {
-        return dataRootService.migrateLegacyData(sourcePath)
-    })
+    ipcMain.handle('data:migrateLegacy', withIpcValidation('data:migrateLegacy', async (_event, sourcePath?: unknown) => {
+        const safeSource = assertOptionalPathWithinRoots(
+            'data:migrateLegacy',
+            sourcePath,
+            getLegacyMigrateAllowedRoots(),
+        )
+        return dataRootService.migrateLegacyData(safeSource)
+    }))
 
-    ipcMain.handle('data:getStorageInfo', async () => {
+    ipcMain.handle('data:getStorageInfo', withIpcValidation('data:getStorageInfo', async () => {
         return computeStorageInfo()
-    })
+    }))
 
-    ipcMain.handle('data:openPath', async (_event, targetPath?: string) => {
-        if (!targetPath || typeof targetPath !== 'string') return 'invalid'
-        try {
-            // ensure exists for root cases
-            if (!existsSync(targetPath)) {
-                // open parent if child missing
-                const parent = join(targetPath, '..')
-                if (existsSync(parent)) return await shell.openPath(parent)
-            }
-            return await shell.openPath(targetPath)
-        } catch (e: any) {
-            return e?.message || 'error'
+    ipcMain.handle('data:openPath', withIpcValidation('data:openPath', async (_event, targetPath?: unknown) => {
+        if (targetPath === undefined || targetPath === null || targetPath === '') {
+            return 'invalid'
         }
-    })
 
-    ipcMain.handle('data:clearCaches', async () => {
+        let safePath: string
+        try {
+            const dataRoot = dataRootService.getDataRoot()
+            let profilesPath: string | undefined
+            try {
+                profilesPath = profileService.getProfilesPath()
+            } catch {
+                profilesPath = undefined
+            }
+            safePath = assertPathWithinRoots(
+                'data:openPath',
+                targetPath,
+                getDataOpenAllowedRoots(dataRoot, profilesPath),
+            )
+        } catch {
+            return 'invalid'
+        }
+
+        try {
+            if (!existsSync(safePath)) {
+                const parent = join(safePath, '..')
+                try {
+                    const safeParent = assertPathWithinRoots(
+                        'data:openPath',
+                        parent,
+                        getDataOpenAllowedRoots(dataRootService.getDataRoot()),
+                    )
+                    if (existsSync(safeParent)) return await shell.openPath(safeParent)
+                } catch {
+                    return 'invalid'
+                }
+            }
+            return await shell.openPath(safePath)
+        } catch (e: unknown) {
+            const message = e instanceof Error ? e.message : 'error'
+            return message
+        }
+    }))
+
+    ipcMain.handle('data:clearCaches', withIpcValidation('data:clearCaches', async () => {
         let cleared = 0
         try {
             const profBase = profileService.getProfilesPath()
@@ -169,13 +208,12 @@ export function registerDataHandlers() {
                         try {
                             profileService.clearProfileCache(full)
                             cleared++
-                        } catch {}
+                        } catch { /* ignore */ }
                     }
                 }
             }
-        } catch {}
+        } catch { /* ignore */ }
 
-        // traffic_profiles caches (manual, same structure)
         try {
             const tBase = join(app.getPath('userData'), 'traffic_profiles')
             if (existsSync(tBase)) {
@@ -189,14 +227,13 @@ export function registerDataHandlers() {
                                 rmSync(cacheP, { recursive: true, force: true })
                                 mkdirSync(cacheP, { recursive: true })
                                 cleared++
-                            } catch {}
+                            } catch { /* ignore */ }
                         }
                     }
                 }
             }
-        } catch {}
+        } catch { /* ignore */ }
 
         return { success: true, cleared }
-    })
+    }))
 }
-

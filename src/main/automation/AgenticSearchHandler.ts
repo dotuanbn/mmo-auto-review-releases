@@ -5,6 +5,15 @@ import { HumanBehavior } from './HumanBehavior'
 import { contextualInterruptionResolver } from './ContextualInterruptionResolver'
 import { AgenticPerformedAction } from './AgenticTrafficHandler'
 import { captchaSolverService } from '../services/CaptchaSolverService'
+import { CaptchaDetector } from '../../shared/captcha/CaptchaDetector'
+import {
+    adaptiveDelayFactor,
+    boundedWaitExact,
+    createEmptyThrottleState,
+    evaluateGoogleSearchThrottle,
+    recordGoogleSearchQuery,
+    type GoogleSearchThrottleState,
+} from './CaptchaAvoidancePolicy'
 
 export interface LocationInfo {
     name: string
@@ -26,6 +35,10 @@ export class AgenticSearchHandler {
     private onStatusUpdate: StatusCallback
     private readonly LLM_TIMEOUT_MS = 60000
     private readonly MAX_SEARCH_STEPS = 6
+    /** Per-handler Google query throttle (bounded max queries + inter-query gap). */
+    private googleThrottle: GoogleSearchThrottleState = createEmptyThrottleState()
+    /** CAPTCHA pressure for adaptive delays within this search handler. */
+    private captchaStrikes = 0
 
     constructor(
         onStatusUpdate: StatusCallback
@@ -54,7 +67,65 @@ export class AgenticSearchHandler {
     }
 
     private async delay(min: number, max: number): Promise<void> {
+        if (this.captchaStrikes > 0) {
+            await HumanBehavior.adaptiveRandomDelay(min, max, this.captchaStrikes)
+            return
+        }
         await HumanBehavior.randomDelay(min, max)
+    }
+
+    /**
+     * Enforce Google search request throttle before issuing a query.
+     * Blocks when session query budget is exhausted; waits bounded cooldown otherwise.
+     */
+    private async enforceGoogleSearchThrottle(
+        history: AgenticPerformedAction[],
+        step: number,
+    ): Promise<{ allowed: boolean; step: number }> {
+        const now = Date.now()
+        const decision = evaluateGoogleSearchThrottle(this.googleThrottle, now)
+        if (!decision.allowed && decision.reason === 'max_queries') {
+            this.log(
+                `Google throttle: max queries reached ` +
+                `(${decision.queriesInSession}/${decision.maxQueries})`,
+            )
+            this.pushAction(history, {
+                action: 'google_search_throttled',
+                detail: `Max ${decision.maxQueries} Google queries/session reached`,
+                source: 'safety',
+                step,
+                success: false,
+            })
+            return { allowed: false, step: step + 1 }
+        }
+        if (!decision.allowed && decision.reason === 'cooldown' && decision.waitMs > 0) {
+            // Remaining min-interval, stretched under CAPTCHA pressure (still bounded).
+            const restMs = Math.floor(
+                decision.waitMs * adaptiveDelayFactor(this.captchaStrikes),
+            )
+            this.onStatusUpdate(
+                `[AI] Nghỉ chống CAPTCHA ~${Math.ceil(restMs / 1000)}s trước query tiếp...`,
+            )
+            this.log(`Google throttle: cooldown wait ${restMs}ms (strikes=${this.captchaStrikes})`)
+            await boundedWaitExact(restMs, { maxBoundMs: 90_000 })
+            this.pushAction(history, {
+                action: 'google_search_cooldown',
+                detail: `Waited ${restMs}ms between Google queries`,
+                source: 'safety',
+                step,
+                success: true,
+            })
+            return { allowed: true, step: step + 1 }
+        }
+        return { allowed: true, step }
+    }
+
+    private markGoogleQueryIssued(): void {
+        this.googleThrottle = recordGoogleSearchQuery(this.googleThrottle, Date.now())
+    }
+
+    private noteCaptchaStrike(): void {
+        this.captchaStrikes = Math.min(20, this.captchaStrikes + 1)
     }
 
     private async resolveUnexpectedPrompt(page: Page, reason: string): Promise<void> {
@@ -219,19 +290,7 @@ export class AgenticSearchHandler {
     }
 
     private async isCaptchaOrSorryPage(page: Page): Promise<boolean> {
-        if (page.isClosed()) return false;
-        try {
-            const currentUrl = page.url().toLowerCase();
-            if (currentUrl.includes('google.com/sorry') ||
-                currentUrl.includes('/sorry/index') ||
-                currentUrl.includes('ipv4.google.com/sorry') ||
-                currentUrl.includes('recaptcha')) {
-                return true;
-            }
-            const hasRecaptchaFrame = await page.locator('iframe[src*="recaptcha"], div.g-recaptcha').count().catch(() => 0);
-            if (hasRecaptchaFrame > 0) return true;
-        } catch { /* ignore */ }
-        return false;
+        return CaptchaDetector.isCaptchaPage(page)
     }
 
     /**
@@ -286,6 +345,20 @@ export class AgenticSearchHandler {
             }
 
             // ========= STRATEGY 1: Google Search → Navigate to Maps =========
+            const throttleGate = await this.enforceGoogleSearchThrottle(
+                actionsPerformed,
+                currentStep,
+            )
+            currentStep = throttleGate.step
+            if (!throttleGate.allowed) {
+                return {
+                    success: false,
+                    foundMap: false,
+                    actionsPerformed,
+                    message: 'GOOGLE_SEARCH_THROTTLED',
+                }
+            }
+
             this.onStatusUpdate(`[AI] Truy cập google.com.vn...`)
             await page.goto('https://www.google.com.vn', {
                 waitUntil: 'commit',
@@ -311,6 +384,7 @@ export class AgenticSearchHandler {
             await this.delay(800, 1500)
 
             await page.keyboard.press('Enter')
+            this.markGoogleQueryIssued()
             await page.waitForLoadState('domcontentloaded', { timeout: 8000 })
             await this.delay(2000, 4000)
 
@@ -344,6 +418,7 @@ export class AgenticSearchHandler {
                 if (await this.isCaptchaOrSorryPage(page)) {
                     this.onStatusUpdate(`[AI] Phát hiện mã xác nhận (CAPTCHA), đang xử lý...`)
                     this.log(`T${threadId}: CAPTCHA detected on step ${i + 1}`)
+                    this.noteCaptchaStrike()
                     
                     // Check if a CAPTCHA solver provider is configured
                     const settings = (await import('../ipc/settings')).loadSettings()

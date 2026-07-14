@@ -81,9 +81,72 @@ export function classifyTrafficFailureMessage(message: string): TrafficFailureCl
     if (/direct_mode_map_not_ready/.test(lower)) {
         return buildClassification('direct_map_not_ready', 'direct_map_not_ready', true, 'Direct mode could not restore map context', ['direct_mode'])
     }
-    if (/web_seo.*not.*found|target.*not.*found/.test(lower)) {
-        return buildClassification('web_seo_target_not_found', 'web_seo_target_not_found', true, 'Web SEO target could not be found', ['web_seo'])
+
+    // Web SEO structured error codes (prefer exact codes before generic target-not-found)
+    if (/web_seo_invalid_target/.test(lower)) {
+        return buildClassification(
+            'web_seo_target_not_found',
+            'web_seo_invalid_target',
+            false,
+            'Web SEO target URL/host is invalid',
+            ['web_seo', 'invalid_target']
+        )
     }
+    if (/web_seo_host_mismatch|host_mismatch/.test(lower)) {
+        return buildClassification(
+            'web_seo_target_not_found',
+            'web_seo_host_mismatch',
+            true,
+            'Web SEO landed on a host that does not match the target',
+            ['web_seo', 'host_mismatch']
+        )
+    }
+    if (/web_seo_deadline/.test(lower)) {
+        return buildClassification(
+            'watchdog_timeout',
+            'web_seo_deadline',
+            true,
+            'Web SEO visit hit soft/hard deadline before completion',
+            ['web_seo', 'deadline']
+        )
+    }
+    if (/web_seo_organic_required|organic_required/.test(lower)) {
+        return buildClassification(
+            'web_seo_target_not_found',
+            'web_seo_organic_required',
+            false,
+            'Web SEO campaign requires an organic Google discovery hit',
+            ['web_seo', 'organic_required']
+        )
+    }
+    if (/web_seo_low_quality/.test(lower)) {
+        return buildClassification(
+            'web_seo_target_not_found',
+            'web_seo_low_quality',
+            false,
+            'Web SEO reached the target but did not meet the quality gate',
+            ['web_seo', 'low_quality']
+        )
+    }
+    if (/web_seo_cancelled/.test(lower)) {
+        return buildClassification(
+            'other',
+            'web_seo_cancelled',
+            true,
+            'Web SEO visit was cancelled cooperatively',
+            ['web_seo', 'cancelled']
+        )
+    }
+    if (/web_seo_target_not_found|web_seo.*not.*found|target_not_found|target.*not.*found/.test(lower)) {
+        return buildClassification(
+            'web_seo_target_not_found',
+            'web_seo_target_not_found',
+            true,
+            'Web SEO target could not be found',
+            ['web_seo']
+        )
+    }
+
     if (/agentic|planner|llm|ollama/.test(lower)) {
         return buildClassification('agentic_planner', 'agentic_planner_failed', true, 'Agentic planner failed during visit', ['agentic'])
     }

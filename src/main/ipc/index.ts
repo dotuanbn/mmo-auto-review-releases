@@ -30,6 +30,8 @@ import { registerHFModelHandlers } from './hfmodel'
 import { registerTrackioHandlers } from './trackio'
 import { registerDatasetHandlers } from './datasets'
 import { registerToolHandlers } from './tools'
+import { registerWarmupHandlers } from './warmup'
+import { registerCaptchaHandlers } from './captcha'
 
 // Register all IPC handlers
 export function registerAllHandlers() {
@@ -65,6 +67,8 @@ export function registerAllHandlers() {
     registerTrackioHandlers()
     registerDatasetHandlers()
     registerToolHandlers()
+    registerWarmupHandlers()
+    registerCaptchaHandlers()
 
     console.log('All IPC handlers registered')
 }

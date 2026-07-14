@@ -15,7 +15,7 @@ import pRetry from 'p-retry'
 import PQueue from 'p-queue'
 import { OrganicSearchFlow } from './OrganicSearchFlow'
 import { AgenticSearchHandler } from './AgenticSearchHandler'
-import { WebSeoFlow } from './WebSeoFlow'
+import { WebSeoFlow, type SeoFlowConfig, type SeoFlowResult } from './WebSeoFlow'
 import { MapSearchFlow } from './MapSearchFlow'
 import { extractIdentity, identitiesMatch, parseMapIdentity } from './MapIdentity'
 import { agenticTrafficHandler } from './AgenticTrafficHandler'
@@ -36,6 +36,11 @@ import {
     classifyTrafficFailureMessage,
     readTrafficFailureBucketFromActions,
 } from './TrafficFailureClassifier'
+import {
+    normalizeWebSeoTargetUrl,
+    parseWebSeoKeywords,
+} from '../../shared/web-seo-contracts'
+import { CaptchaDetector } from '../../shared/captcha/CaptchaDetector'
 
 // ============================================================
 // Types
@@ -121,6 +126,216 @@ type ActionContext = {
     domain?: string
     goal?: string
     riskType?: string
+}
+
+/** Contract-aligned Web SEO discovery source (matches traffic_logs.discovery_source enum). */
+type WebSeoDiscoverySource = 'organic' | 'direct_fallback' | 'captcha_cooldown' | 'unreachable'
+
+/**
+ * Per-visit Web SEO outcome (typed). Prefer numeric fields from flow result when present;
+ * engine maps SeoFlowResult → this shape without string/regex quality heuristics.
+ */
+type WebSeoFlowResult = SeoFlowResult & {
+    discoverySource?: WebSeoDiscoverySource
+    hostVerified?: boolean
+    organicHit?: boolean
+    qualityScore?: number
+    countable?: boolean
+    targetHost?: string
+    errorCode?: string
+    reachedTarget?: boolean
+}
+
+type WebSeoExecuteConfig = SeoFlowConfig & {
+    deadlineAt?: number
+    shouldStop?: () => boolean
+    requireOrganic?: boolean
+}
+
+type WebSeoVisitOutcome = {
+    success: boolean
+    reachedTarget: boolean
+    discoverySource: WebSeoDiscoverySource
+    hostVerified: boolean
+    organicHit: boolean
+    qualityScore: number
+    countable: boolean
+    targetHost: string | null
+    errorCode?: string
+    message: string
+}
+
+function unknownErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+        return error.message
+    }
+    if (typeof error === 'string') {
+        return error
+    }
+    if (error == null) {
+        return 'unknown'
+    }
+    try {
+        return String(error)
+    } catch {
+        return 'unknown'
+    }
+}
+
+function sanitizeErrorDetail(error: unknown, maxLen = 500): string {
+    const raw = unknownErrorMessage(error)
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+    if (!raw) {
+        return 'unknown'
+    }
+    return raw.length > maxLen ? `${raw.slice(0, maxLen)}…` : raw
+}
+
+function parseStrictKeywordList(raw: unknown): string[] {
+    if (raw == null) {
+        return []
+    }
+    if (Array.isArray(raw)) {
+        return raw
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim())
+            .filter(Boolean)
+    }
+    if (typeof raw !== 'string') {
+        return []
+    }
+    const trimmed = raw.trim()
+    if (!trimmed) {
+        return []
+    }
+    try {
+        const parsed: unknown = JSON.parse(trimmed)
+        if (Array.isArray(parsed)) {
+            return parsed
+                .filter((item): item is string => typeof item === 'string')
+                .map((item) => item.trim())
+                .filter(Boolean)
+        }
+    } catch {
+        // Fall through to delimiter split for non-JSON campaign/location keyword blobs.
+    }
+    return trimmed.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean)
+}
+
+function extractTargetHost(urlOrHost: string): string | null {
+    const raw = (urlOrHost || '').trim()
+    if (!raw) {
+        return null
+    }
+    try {
+        const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
+        const host = new URL(withProtocol).hostname.replace(/^www\./i, '').toLowerCase()
+        return host || null
+    } catch {
+        const cleaned = raw.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split(/[/?#]/)[0]?.toLowerCase()
+        return cleaned || null
+    }
+}
+
+function readOptionalNumber(record: Record<string, unknown>, key: string): number | null {
+    const value = record[key]
+    return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function readOptionalBoolean(record: Record<string, unknown>, key: string): boolean | null {
+    const value = record[key]
+    return typeof value === 'boolean' ? value : null
+}
+
+function readOptionalString(record: Record<string, unknown>, key: string): string | null {
+    const value = record[key]
+    return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function asResultRecord(result: WebSeoFlowResult): Record<string, unknown> {
+    return result as unknown as Record<string, unknown>
+}
+
+function asWebSeoDiscoverySource(value: string | null | undefined): WebSeoDiscoverySource | null {
+    if (
+        value === 'organic'
+        || value === 'direct_fallback'
+        || value === 'captcha_cooldown'
+        || value === 'unreachable'
+    ) {
+        return value
+    }
+    return null
+}
+
+function mapWebSeoFlowResult(
+    result: WebSeoFlowResult,
+    fallbackTargetHost: string | null,
+    discoveryOverride?: WebSeoDiscoverySource
+): WebSeoVisitOutcome {
+    const record = asResultRecord(result)
+    const actionNames = (result.actionsPerformed || []).map((a) => a.action)
+    const usedFallback = actionNames.some((name) => /fallback/i.test(name))
+    const reachedTarget =
+        readOptionalBoolean(record, 'reachedTarget')
+        ?? result.foundWebsite
+        ?? false
+
+    let discoverySource: WebSeoDiscoverySource =
+        discoveryOverride
+        ?? asWebSeoDiscoverySource(readOptionalString(record, 'discoverySource'))
+        ?? 'unreachable'
+
+    if (!discoveryOverride && discoverySource === 'unreachable') {
+        if (usedFallback && reachedTarget) {
+            discoverySource = 'direct_fallback'
+        } else if (reachedTarget) {
+            discoverySource = 'organic'
+        } else {
+            discoverySource = 'unreachable'
+        }
+    }
+
+    const hostVerified =
+        readOptionalBoolean(record, 'hostVerified')
+        ?? (reachedTarget && result.success)
+    const organicHit =
+        readOptionalBoolean(record, 'organicHit')
+        ?? discoverySource === 'organic'
+    const targetHost =
+        readOptionalString(record, 'targetHost')
+        ?? fallbackTargetHost
+
+    // Prefer numeric quality from flow result; never parse string detail heuristics here.
+    const successActionCount = (result.actionsPerformed || []).filter((a) => a.success).length
+    const qualityFromResult = readOptionalNumber(record, 'qualityScore')
+    const qualityScore = qualityFromResult != null
+        ? Math.max(0, Math.min(100, Math.round(qualityFromResult)))
+        : result.success
+            ? Math.min(100, 40 + successActionCount * 8 + (organicHit ? 20 : 0) + (hostVerified ? 10 : 0))
+            : Math.min(40, successActionCount * 5)
+
+    const countableFromResult = readOptionalBoolean(record, 'countable')
+    const countable = countableFromResult != null
+        ? countableFromResult
+        : Boolean(result.success && hostVerified && qualityScore >= 40)
+
+    const errorCode = readOptionalString(record, 'errorCode') || undefined
+
+    return {
+        success: Boolean(result.success),
+        reachedTarget,
+        discoverySource,
+        hostVerified: Boolean(hostVerified),
+        organicHit: Boolean(organicHit),
+        qualityScore,
+        countable,
+        targetHost,
+        errorCode,
+        message: result.message || '',
+    }
 }
 
 export interface TrafficReport {
@@ -1049,6 +1264,8 @@ export class TrafficBoostEngine {
     private statusListeners: Set<(status: TrafficBoostStatus) => void> = new Set()
     private actionListeners: Set<(event: RuntimeActionEvent) => void> = new Set()
     private threadUrlBroadcastAt: Map<number, number> = new Map()
+    /** Campaign-local account/profile exclusivity: one concurrent visit per account/profile. */
+    private campaignAccountLocks: Map<string, Promise<void>> = new Map()
 
     onStatus(listener: (status: TrafficBoostStatus) => void): () => void {
         this.statusListeners.add(listener)
@@ -1065,6 +1282,112 @@ export class TrafficBoostEngine {
         while (this.paused && !this.shouldStop) {
             await new Promise(resolve => setTimeout(resolve, 250))
         }
+    }
+
+    /**
+     * Campaign-local exclusivity: same account/profile cannot run two visits at once.
+     * Anonymous (no account) skips lock. Waits cooperatively; always release in finally.
+     */
+    private async acquireCampaignAccountLock(
+        account: { id?: number | null; profilePath?: string | null } | null | undefined
+    ): Promise<() => void> {
+        if (!account?.id) {
+            return () => { /* anonymous: no lock */ }
+        }
+        const profileKey = typeof account.profilePath === 'string' && account.profilePath.trim()
+            ? `profile:${account.profilePath.trim()}`
+            : null
+        const key = profileKey || `account:${account.id}`
+
+        while (this.campaignAccountLocks.has(key) && !this.shouldStop) {
+            const pending = this.campaignAccountLocks.get(key)
+            if (!pending) {
+                break
+            }
+            await pending.catch(() => { /* previous holder released or failed */ })
+        }
+        if (this.shouldStop) {
+            throw new Error('visit_cancelled: campaign stopped while waiting for account exclusivity')
+        }
+
+        let releaseOuter!: () => void
+        const gate = new Promise<void>((resolve) => {
+            releaseOuter = resolve
+        })
+        this.campaignAccountLocks.set(key, gate)
+
+        let released = false
+        return () => {
+            if (released) {
+                return
+            }
+            released = true
+            if (this.campaignAccountLocks.get(key) === gate) {
+                this.campaignAccountLocks.delete(key)
+            }
+            releaseOuter()
+        }
+    }
+
+    private resolveWebSeoSearchKeywords(
+        campaign: { searchKeywords?: string | null },
+        location: { searchKeywords?: string | null; name: string }
+    ): string[] {
+        const fromCampaign = parseStrictKeywordList(campaign.searchKeywords)
+        if (fromCampaign.length > 0) {
+            return fromCampaign
+        }
+        const fromLocation = parseStrictKeywordList(location.searchKeywords)
+        if (fromLocation.length > 0) {
+            return fromLocation
+        }
+        return [location.name]
+    }
+
+    private resolveWebSeoDwellSeconds(campaign: {
+        webSeoMinDwellSeconds?: number | null
+        webSeoMaxDwellSeconds?: number | null
+    }): { minSeconds: number; maxSeconds: number } {
+        const minSeconds = Math.max(1, Number(campaign.webSeoMinDwellSeconds ?? 45) || 45)
+        const maxRaw = Number(campaign.webSeoMaxDwellSeconds ?? 90) || 90
+        const maxSeconds = Math.max(minSeconds, maxRaw)
+        return { minSeconds, maxSeconds }
+    }
+
+    private recordWebSeoStructuredOutcome(
+        actionsPerformed: VisitActionRecord[],
+        outcome: WebSeoVisitOutcome,
+        threadId: number,
+        actionContext: ActionContext
+    ): void {
+        this.recordAction(actionsPerformed, {
+            action: 'web_seo_discovery',
+            success: outcome.reachedTarget,
+            source: 'web_seo',
+            detail: `discoverySource=${outcome.discoverySource}; organicHit=${outcome.organicHit}; hostVerified=${outcome.hostVerified}; targetHost=${outcome.targetHost || ''}`,
+            threadId,
+            timestamp: new Date().toISOString(),
+        }, actionContext)
+        this.recordAction(actionsPerformed, {
+            action: 'web_seo_quality',
+            success: outcome.countable,
+            source: 'web_seo',
+            detail: `qualityScore=${outcome.qualityScore}; countable=${outcome.countable}`,
+            threadId,
+            timestamp: new Date().toISOString(),
+        }, actionContext)
+    }
+
+    private assertWebSeoOutcomeOrThrow(outcome: WebSeoVisitOutcome): void {
+        if (outcome.success && outcome.reachedTarget) {
+            return
+        }
+        const rawCode = outcome.errorCode
+        const code = rawCode
+            ? (rawCode.startsWith('web_seo_') ? rawCode : `web_seo_${rawCode}`)
+            : (outcome.reachedTarget ? 'web_seo_low_quality' : 'web_seo_target_not_found')
+        const detail = outcome.message || 'Web SEO did not reach target successfully'
+        throw new Error(`${code}: ${detail}`)
     }
 
     // ============================================================
@@ -1776,46 +2099,7 @@ export class TrafficBoostEngine {
     }
 
     private async isCaptchaOrSorryPage(page: Page): Promise<boolean> {
-        if (page.isClosed()) {
-            return false
-        }
-
-        const currentUrl = page.url().toLowerCase()
-        if (
-            currentUrl.includes('google.com/sorry')
-            || currentUrl.includes('/sorry/index')
-            || currentUrl.includes('ipv4.google.com/sorry')
-            || currentUrl.includes('recaptcha')
-        ) {
-            return true
-        }
-
-        const hasRecaptchaFrame = await page.locator('iframe[src*="recaptcha"], div.g-recaptcha').count().catch(() => 0)
-        if (hasRecaptchaFrame > 0) {
-            return true
-        }
-
-        try {
-            const snapshot = await page.evaluate(() => {
-                const bodyText = (document.body?.innerText || '').toLowerCase().slice(0, 5000)
-                const pageTitle = (document.title || '').toLowerCase()
-                return `${pageTitle}\n${bodyText}`
-            })
-            if (
-                snapshot.includes("i'm not a robot")
-                || snapshot.includes('unusual traffic')
-                || snapshot.includes('our systems have detected unusual traffic')
-                || snapshot.includes('to continue')
-                || snapshot.includes('toi khong phai la nguoi may')
-                || snapshot.includes('captcha')
-            ) {
-                return true
-            }
-        } catch {
-            // Ignore evaluate failures and treat as no-captcha.
-        }
-
-        return false
+        return CaptchaDetector.isCaptchaPage(page)
     }
 
     private async handleCaptchaIfNeeded(
@@ -2293,7 +2577,7 @@ export class TrafficBoostEngine {
         const systemRecs = systemResourceDetector.getRecommendations()
         const globalSettings = loadSettings()
         const maxGlobalBrowsers = globalSettings.maxConcurrentBrowsers ?? 3
-        const safeThreadCount = Math.min(maxGlobalBrowsers, Math.max(1, Math.floor(Number(campaign.threadsCount || 1))))
+        let safeThreadCount = Math.min(maxGlobalBrowsers, Math.max(1, Math.floor(Number(campaign.threadsCount || 1))))
 
         // Load proxy runtime settings from a single source of truth
         const runtimeProxySettings = this.applyRuntimeProxySettings()
@@ -2392,9 +2676,26 @@ export class TrafficBoostEngine {
         }
         if (accounts.length === 0) accounts = [null] // anonymous / no usable account
 
+        const usableAccountCount = accounts.filter((account) => account !== null).length
+        if (campaign.trafficMode === 'web_seo' && usableAccountCount > 0) {
+            safeThreadCount = Math.min(safeThreadCount, usableAccountCount)
+        }
+
         // Get locations
         const allLocations = db.select().from(schema.locations).all().filter(l => locationIds.includes(l.id))
         if (allLocations.length === 0) throw new Error('No valid locations found')
+
+        if (campaign.trafficMode === 'web_seo') {
+            const campaignKeywords = parseWebSeoKeywords(campaign.searchKeywords)
+            if (campaignKeywords.length === 0) {
+                throw new Error('web_seo_invalid_target: campaign has no valid search keywords')
+            }
+            for (const location of allLocations) {
+                if (!normalizeWebSeoTargetUrl(location.url)) {
+                    throw new Error(`web_seo_invalid_target: location ${location.id} is not a public safe URL`)
+                }
+            }
+        }
 
         // Calculate total visits needed
         const totalVisits = allLocations.length * campaign.visitsPerLocation
@@ -2531,6 +2832,8 @@ export class TrafficBoostEngine {
                                     this._currentRound = currentRound
                                 }
                                 await visitQueue.add(async () => {
+                                const releaseAccountLock = await this.acquireCampaignAccountLock(task.account)
+                                try {
                                 this.currentQueueDepth = Math.max(
                                     0,
                                     (visitTasks.length - taskIndex) + visitQueue.size + visitQueue.pending
@@ -2600,6 +2903,11 @@ export class TrafficBoostEngine {
                             }
                             
                             const visitStart = Date.now()
+                            /**
+                             * Typed per-visit Web SEO outcome (null for non-web_seo modes).
+                             * Held in a box so nested async + catch can read without CF narrowing to never.
+                             */
+                            const webSeoVisitState: { outcome: WebSeoVisitOutcome | null } = { outcome: null }
                             const requestedActionsForVisit = this.normalizeDesiredActions(task.requestedActions)
                             const watchdogMode: 'agentic' | 'seo' = (campaign.trafficMode !== 'web_seo' && agenticMapPlannerReady)
                                 ? 'agentic'
@@ -2950,18 +3258,19 @@ export class TrafficBoostEngine {
                                     // Navigate to location - branch by traffic mode
                                     if (campaign.trafficMode === 'organic' || campaign.trafficMode === 'web_seo' || campaign.trafficMode === 'map_search') {
                                         // ORGANIC / MAP_SEARCH / WEB_SEO MODE (keyword per-location round-robin)
-                                        let searchKeywords: string[] = [task.location.name]
-                                        if ((task.location as any).searchKeywords) {
-                                            try {
-                                                const parsed = JSON.parse((task.location as any).searchKeywords)
-                                                if (Array.isArray(parsed) && parsed.length > 0) {
-                                                    searchKeywords = parsed
-                                                }
-                                            } catch {
-                                                // If not JSON, try comma-separated
-                                                searchKeywords = (task.location as any).searchKeywords
-                                                    .split(',').map((k: string) => k.trim()).filter(Boolean)
-                                                if (searchKeywords.length === 0) searchKeywords = [task.location.name]
+                                        // web_seo: campaign.searchKeywords first, then location.searchKeywords/name
+                                        let searchKeywords: string[]
+                                        if (campaign.trafficMode === 'web_seo') {
+                                            searchKeywords = this.resolveWebSeoSearchKeywords(campaign, task.location)
+                                        } else {
+                                            searchKeywords = [task.location.name]
+                                            const locationKeywordRaw =
+                                                typeof task.location.searchKeywords === 'string'
+                                                    ? task.location.searchKeywords
+                                                    : null
+                                            const parsedLocationKeywords = parseStrictKeywordList(locationKeywordRaw)
+                                            if (parsedLocationKeywords.length > 0) {
+                                                searchKeywords = parsedLocationKeywords
                                             }
                                         }
                                         // Round-robin keyword selection: cycle through all keywords evenly
@@ -2971,6 +3280,9 @@ export class TrafficBoostEngine {
                                         this._keywordCounters[locationKey]++
                                         const keyword = searchKeywords[keywordIdx]
                                         const avoidGoogleSearchForThread = this.shouldAvoidGoogleSearch(threadIdx)
+                                        const webSeoDwell = campaign.trafficMode === 'web_seo'
+                                            ? this.resolveWebSeoDwellSeconds(campaign)
+                                            : null
 
                                         this.threadDetails[threadIdx].currentKeyword = keyword
                                         this.sendStatus(this.buildStatus({
@@ -3011,12 +3323,17 @@ export class TrafficBoostEngine {
                                             await HumanBehavior.randomDelay(1200, 2600)
                                         } else if (avoidGoogleSearchForThread && campaign.trafficMode === 'web_seo') {
                                             this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct website browsing'
-                                            let targetDomain = task.location.url
-                                            try {
-                                                targetDomain = new URL(task.location.url).hostname.replace('www.', '')
-                                            } catch { /* use raw url */ }
+                                            const targetUrl = normalizeWebSeoTargetUrl(task.location.url)
+                                            const targetHost = targetUrl ? extractTargetHost(targetUrl) : null
+                                            if (!targetUrl || !targetHost) {
+                                                throw new Error(`web_seo_invalid_target: invalid URL for location ${task.location.id}`)
+                                            }
+                                            if (campaign.webSeoRequireOrganic) {
+                                                throw new Error('web_seo_organic_required: Google search unavailable during CAPTCHA cooldown')
+                                            }
+                                            const dwell = webSeoDwell || this.resolveWebSeoDwellSeconds(campaign)
 
-                                            await page.goto(task.location.url, {
+                                            await page.goto(targetUrl, {
                                                 waitUntil: 'domcontentloaded',
                                                 timeout: 20000
                                             })
@@ -3024,15 +3341,48 @@ export class TrafficBoostEngine {
                                             const cooldownFlow = new WebSeoFlow((status) => {
                                                 this.threadDetails[threadIdx].currentAction = status.message || status.action
                                             })
+                                            const cooldownConfig: WebSeoExecuteConfig = {
+                                                keyword,
+                                                targetDomain: targetUrl,
+                                                minTimeOnPageSeconds: dwell.minSeconds,
+                                                maxTimeOnPageSeconds: dwell.maxSeconds,
+                                                captchaStrategy: 'auto_skip',
+                                                deadlineAt: visitSoftDeadlineAt,
+                                                shouldStop: () => this.shouldStop || shouldStopForVisitBudget(),
+                                                requireOrganic: false,
+                                            }
+                                            let browseOk = false
                                             try {
-                                                await (cooldownFlow as any).browseWebsiteLikeRealUser(page, {
-                                                    keyword,
-                                                    targetDomain,
-                                                    minTimeOnPageSeconds: campaign.delayMinSeconds,
-                                                    maxTimeOnPageSeconds: campaign.delayMaxSeconds,
-                                                })
-                                            } catch { /* ignore */ }
+                                                // Public typed browse path (no private method cast)
+                                                browseOk = await cooldownFlow.browseWebsiteLikeRealUser(page, cooldownConfig)
+                                            } catch (cooldownErr: unknown) {
+                                                console.warn(
+                                                    `[TrafficBoost] web_seo captcha cooldown browse failed:`,
+                                                    sanitizeErrorDetail(cooldownErr)
+                                                )
+                                                browseOk = false
+                                            }
                                             await this.cleanupExtraTabsForThread(page, threadIdx, 'after_web_seo_captcha_cooldown_browse')
+                                            webSeoVisitState.outcome = {
+                                                success: browseOk,
+                                                reachedTarget: browseOk,
+                                                discoverySource: 'captcha_cooldown',
+                                                hostVerified: browseOk,
+                                                organicHit: false,
+                                                qualityScore: browseOk ? 55 : 0,
+                                                countable: browseOk,
+                                                targetHost,
+                                                message: browseOk
+                                                    ? 'Captcha cooldown direct browse completed'
+                                                    : 'Captcha cooldown direct browse failed',
+                                            }
+                                            this.recordWebSeoStructuredOutcome(
+                                                actionsPerformed,
+                                                webSeoVisitState.outcome,
+                                                threadIdx,
+                                                actionContext
+                                            )
+                                            this.assertWebSeoOutcomeOrThrow(webSeoVisitState.outcome)
                                         } else if (campaign.trafficMode === 'organic') {
                                             const searchHandler = new AgenticSearchHandler((status) => {
                                                 this.threadDetails[threadIdx].currentAction = status
@@ -3119,11 +3469,14 @@ export class TrafficBoostEngine {
                                             }
                                             // On success or fallback we are on map page -> fall through to common consent/login/stabilize + autonomous KPI
                                         } else {
-                                            // WEB SEO MODE
-                                            let targetDomain = task.location.url
-                                            try {
-                                                targetDomain = new URL(task.location.url).hostname.replace('www.', '')
-                                            } catch { /* use as-is if invalid URL */ }
+                                            // WEB SEO MODE — single flow path; no engine-level double direct fallback/browse
+                                            const targetUrl = normalizeWebSeoTargetUrl(task.location.url)
+                                            const targetHost = targetUrl ? extractTargetHost(targetUrl) : null
+                                            if (!targetUrl || !targetHost) {
+                                                throw new Error(`web_seo_invalid_target: invalid URL for location ${task.location.id}`)
+                                            }
+                                            const dwell = webSeoDwell || this.resolveWebSeoDwellSeconds(campaign)
+                                            const requireOrganic = Boolean(campaign.webSeoRequireOrganic)
 
                                             const webSeoFlow = new WebSeoFlow((status) => {
                                                 this.threadDetails[threadIdx].currentAction = status.message || status.action
@@ -3136,16 +3489,39 @@ export class TrafficBoostEngine {
                                                 }))
                                             })
 
-                                            const webSeoResult = await webSeoFlow.execute(page, {
+                                            const webSeoConfig: WebSeoExecuteConfig = {
                                                 keyword,
-                                                targetDomain,
-                                                minTimeOnPageSeconds: campaign.delayMinSeconds,
-                                                maxTimeOnPageSeconds: campaign.delayMaxSeconds,
+                                                targetDomain: targetUrl,
+                                                minTimeOnPageSeconds: dwell.minSeconds,
+                                                maxTimeOnPageSeconds: dwell.maxSeconds,
                                                 captchaStrategy: 'auto_skip',
-                                            })
+                                                deadlineAt: visitSoftDeadlineAt,
+                                                shouldStop: () => this.shouldStop || shouldStopForVisitBudget(),
+                                                requireOrganic,
+                                            }
+
+                                            let webSeoResult: WebSeoFlowResult
+                                            try {
+                                                webSeoResult = await webSeoFlow.execute(page, webSeoConfig)
+                                            } catch (flowErr: unknown) {
+                                                const msg = sanitizeErrorDetail(flowErr)
+                                                if (/deadline/i.test(msg)) {
+                                                    throw new Error(`web_seo_deadline: ${msg}`)
+                                                }
+                                                if (/cancel/i.test(msg) || this.shouldStop) {
+                                                    throw new Error(`web_seo_cancelled: ${msg}`)
+                                                }
+                                                if (/host.?mismatch/i.test(msg)) {
+                                                    throw new Error(`web_seo_host_mismatch: ${msg}`)
+                                                }
+                                                if (/invalid.?target/i.test(msg)) {
+                                                    throw new Error(`web_seo_invalid_target: ${msg}`)
+                                                }
+                                                throw new Error(`web_seo_target_not_found: ${msg}`)
+                                            }
                                             await this.cleanupExtraTabsForThread(page, threadIdx, 'after_web_seo_flow')
 
-                                            // Log web_seo actions
+                                            // Log web_seo flow actions
                                             for (const a of webSeoResult.actionsPerformed) {
                                                 this.recordAction(actionsPerformed, {
                                                     action: `web_seo:${a.action}`,
@@ -3157,29 +3533,32 @@ export class TrafficBoostEngine {
                                                 }, actionContext)
                                             }
 
-                                            if (!webSeoResult.foundWebsite) {
-                                                this.threadDetails[threadIdx].currentAction = 'Fallback: Direct navigation â†’ browsing website'
-                                                console.log(`[TrafficBoost] Web SEO failed to find "${targetDomain}" for "${keyword}", falling back to direct URL + browsing`)
-                                                await page.goto(task.location.url, {
-                                                    waitUntil: 'domcontentloaded',
-                                                    timeout: 20000
-                                                })
-                                                await HumanBehavior.randomDelay(2000, 4000)
-                                                // Even on fallback, still browse the website like a real user
-                                                const fallbackFlow = new WebSeoFlow((status) => {
-                                                    this.threadDetails[threadIdx].currentAction = status.message || status.action
-                                                })
-                                                // Use the browseWebsiteLikeRealUser indirectly via a mini execute
-                                                // Just perform browsing actions on current page
-                                                try {
-                                                    await (fallbackFlow as any).browseWebsiteLikeRealUser(page, {
-                                                        keyword,
-                                                        targetDomain,
-                                                        minTimeOnPageSeconds: campaign.delayMinSeconds,
-                                                        maxTimeOnPageSeconds: campaign.delayMaxSeconds,
-                                                    })
-                                                } catch { /* ignore browsing errors on fallback */ }
-                                                await this.cleanupExtraTabsForThread(page, threadIdx, 'after_web_seo_fallback_browse')
+                                            webSeoVisitState.outcome = mapWebSeoFlowResult(webSeoResult, targetHost)
+                                            // requireOrganic: flow-level direct_fallback is not acceptable
+                                            if (
+                                                requireOrganic
+                                                && webSeoVisitState.outcome.discoverySource === 'direct_fallback'
+                                            ) {
+                                                throw new Error(
+                                                    `web_seo_target_not_found: requireOrganic but discovery was direct_fallback for host ${targetHost}`
+                                                )
+                                            }
+
+                                            this.recordWebSeoStructuredOutcome(
+                                                actionsPerformed,
+                                                webSeoVisitState.outcome,
+                                                threadIdx,
+                                                actionContext
+                                            )
+
+                                            // Direct-fallback success still completes the visit (logged via discoverySource).
+                                            // Hard fail only when flow did not succeed / reach target.
+                                            this.assertWebSeoOutcomeOrThrow(webSeoVisitState.outcome)
+
+                                            if (webSeoVisitState.outcome.discoverySource === 'direct_fallback') {
+                                                console.log(
+                                                    `[TrafficBoost] Web SEO completed via direct_fallback for "${targetHost}" keyword="${keyword}"`
+                                                )
                                             }
                                         }
 
@@ -3253,6 +3632,7 @@ export class TrafficBoostEngine {
                                         } catch { /* defensive: never block direct path */ }
                                     }
                                     await this.cleanupExtraTabsForThread(page, threadIdx, 'after_navigation')
+                                    if (campaign.trafficMode !== 'web_seo') {
                                     await this.handleGoogleLoginIfNeeded(
                                         page,
                                         threadIdx,
@@ -3361,6 +3741,7 @@ export class TrafficBoostEngine {
                                         actionContext,
                                         task.location.url
                                     )
+                                    }
 
                                     if (campaign.trafficMode !== 'web_seo') {
                                         await this.handleGoogleLoginIfNeeded(
@@ -3480,11 +3861,30 @@ export class TrafficBoostEngine {
                                     // Log success with visit quality scoring
                                     const duration = Math.round((Date.now() - visitStart) / 1000)
                                     const successfulSeoActions = actionsPerformed.filter(a => a.success && !a.action.startsWith('context_') && !a.action.startsWith('visit_') && !a.action.startsWith('captcha_') && !a.action.startsWith('browser_') && !a.action.startsWith('google_login') && !a.action.startsWith('proxy_') && !a.action.startsWith('action_count')).length
-                                    // Quality score: 0-100 based on duration and actions completed
-                                    // Google typically counts visits with >10s duration and meaningful interaction
-                                    const durationScore = Math.min(50, Math.floor((duration / 120) * 50)) // max 50 points for 2+ min
-                                    const actionScore = Math.min(50, successfulSeoActions * 12) // max 50 points for 4+ actions
-                                    const visitQualityScore = durationScore + actionScore
+
+                                    // web_seo: numeric outcome fields only (no string/regex quality heuristic)
+                                    // other modes: existing duration/action heuristic + column defaults
+                                    let visitQualityScore: number
+                                    let visitCountable: boolean
+                                    let visitDiscoverySource: WebSeoDiscoverySource | null = null
+                                    let visitTargetHost: string | null = null
+
+                                    const webSeoOutcome = webSeoVisitState.outcome
+                                    if (campaign.trafficMode === 'web_seo' && webSeoOutcome) {
+                                        visitQualityScore = webSeoOutcome.qualityScore
+                                        visitCountable = webSeoOutcome.countable
+                                        visitDiscoverySource = webSeoOutcome.discoverySource
+                                        visitTargetHost = webSeoOutcome.targetHost
+                                    } else {
+                                        const durationScore = Math.min(50, Math.floor((duration / 120) * 50))
+                                        const actionScore = Math.min(50, successfulSeoActions * 12)
+                                        visitQualityScore = durationScore + actionScore
+                                        visitCountable = visitQualityScore >= 40
+                                    }
+
+                                    const qualityDetail = campaign.trafficMode === 'web_seo' && webSeoOutcome
+                                        ? `Quality=${visitQualityScore}/100 (web_seo numeric; discovery=${webSeoOutcome.discoverySource}; countable=${visitCountable})`
+                                        : `Quality=${visitQualityScore}/100 (duration=${duration}s, actions=${successfulSeoActions})${visitQualityScore < 40 ? ' ⚠️ LOW QUALITY - Google may not count this visit' : ' ✅ Good quality'}`
 
                                     db.insert(schema.trafficLogs).values({
                                         campaignId,
@@ -3494,9 +3894,9 @@ export class TrafficBoostEngine {
                                             ...actionsPerformed,
                                             {
                                                 action: 'visit_quality_assessment',
-                                                success: visitQualityScore >= 40,
-                                                source: 'runtime',
-                                                detail: `Quality=${visitQualityScore}/100 (duration=${duration}s→${durationScore}pts, actions=${successfulSeoActions}→${actionScore}pts)${visitQualityScore < 40 ? ' ⚠️ LOW QUALITY - Google may not count this visit' : ' ✅ Good quality'}`,
+                                                success: visitCountable,
+                                                source: campaign.trafficMode === 'web_seo' ? 'web_seo' : 'runtime',
+                                                detail: qualityDetail,
                                                 threadId: threadIdx,
                                                 timestamp: new Date().toISOString(),
                                             }
@@ -3504,6 +3904,10 @@ export class TrafficBoostEngine {
                                         duration,
                                         round: task.round,
                                         status: 'success',
+                                        discoverySource: visitDiscoverySource,
+                                        qualityScore: visitQualityScore,
+                                        countable: visitCountable,
+                                        targetHost: visitTargetHost,
                                         createdAt: new Date(),
                                     }).run()
 
@@ -3519,11 +3923,13 @@ export class TrafficBoostEngine {
                                     await recycleVisitContext('watchdog_timeout')
                                 })
 
-                            } catch (error: any) {
-                                const errMsg = error.message || String(error)
-                                const errStack = error.stack || ''
+                            } catch (error: unknown) {
+                                const errMsg = sanitizeErrorDetail(error)
+                                const errStack = error instanceof Error ? (error.stack || '') : ''
                                 console.error(`[TrafficBoost] Visit failed:`, errMsg)
-                                console.error(`[TrafficBoost] Stack:`, errStack)
+                                if (errStack) {
+                                    console.error(`[TrafficBoost] Stack:`, errStack)
+                                }
 
                                 // Write error to debug log file
                                 try {
@@ -3599,6 +4005,7 @@ export class TrafficBoostEngine {
                                     }, actionContext)
                                 } else {
                                     const duration = Math.round((Date.now() - visitStart) / 1000)
+                                    const failedSeoOutcome = webSeoVisitState.outcome
 
                                     db.insert(schema.trafficLogs).values({
                                         campaignId,
@@ -3609,6 +4016,10 @@ export class TrafficBoostEngine {
                                         round: task.round,
                                         status: 'failed',
                                         errorMessage: errMsg,
+                                        discoverySource: failedSeoOutcome?.discoverySource ?? null,
+                                        qualityScore: failedSeoOutcome?.qualityScore ?? 0,
+                                        countable: false,
+                                        targetHost: failedSeoOutcome?.targetHost ?? null,
                                         createdAt: new Date(),
                                     }).run()
 
@@ -3616,6 +4027,9 @@ export class TrafficBoostEngine {
                                     this._failedVisits = failedVisits
                                 }
                             }
+                                } finally {
+                                    releaseAccountLock()
+                                }
 
                             // Update campaign progress
                             db.update(schema.trafficCampaigns)
@@ -3645,8 +4059,8 @@ export class TrafficBoostEngine {
                                 }))
                             }
                             await this.waitWhilePaused()
-                                }).catch((queueError) => {
-                                    console.error(`[TrafficBoost] Thread ${threadIdx + 1}: queue task crashed`, queueError)
+                                }).catch((queueError: unknown) => {
+                                    console.error(`[TrafficBoost] Thread ${threadIdx + 1}: queue task crashed`, sanitizeErrorDetail(queueError))
                                 })
                             }
                         } catch (threadError) {
@@ -3693,26 +4107,28 @@ export class TrafficBoostEngine {
         terminalMessage = finalStatus === 'completed'
             ? 'Traffic boost completed'
             : 'Traffic boost stopped'
-        } catch (error: any) {
-            console.error('[TrafficBoost] Campaign error:', error)
+        } catch (error: unknown) {
+            const campaignErrMsg = sanitizeErrorDetail(error)
+            console.error('[TrafficBoost] Campaign error:', campaignErrMsg)
             db.update(schema.trafficCampaigns)
                 .set({ status: 'stopped' })
                 .where(eq(schema.trafficCampaigns.id, campaignId))
                 .run()
 
             this.sendStatus(this.buildStatus({
-                message: `❌ Error: ${error.message}`,
+                message: `❌ Error: ${campaignErrMsg}`,
             }))
-            terminalMessage = `Error: ${error.message}`
+            terminalMessage = `Error: ${campaignErrMsg}`
         } finally {
             this.running = false
+            this.campaignAccountLocks.clear()
             try {
                 this.sendStatus(this.buildStatus({
                     isRunning: false,
                     message: terminalMessage,
                 }))
-            } catch (statusError) {
-                console.error('[TrafficBoost] Failed to broadcast terminal status:', statusError)
+            } catch (statusError: unknown) {
+                console.error('[TrafficBoost] Failed to broadcast terminal status:', sanitizeErrorDetail(statusError))
             }
             this.currentCampaignId = null
 
@@ -4066,32 +4482,68 @@ export class TrafficBoostEngine {
         let veryShortVisits = 0
         let totalQualityScore = 0
         let qualityAssessmentCount = 0
+        let structuredCountableVisits = 0
+        let legacyHighQualityVisits = 0
+        let legacyMediumQualityVisits = 0
 
         for (const log of successLogs) {
             if ((log.duration || 0) < 15) veryShortVisits++
 
-            let actions: any[] = []
-            try { actions = JSON.parse(log.actions || '[]') } catch { /* ignore */ }
+            let actions: unknown[] = []
+            try {
+                const parsed: unknown = JSON.parse(log.actions || '[]')
+                actions = Array.isArray(parsed) ? parsed : []
+            } catch { /* ignore */ }
 
-            const qualityAction = actions.find((a: any) => a.action === 'visit_quality_assessment')
-            if (qualityAction && typeof qualityAction.detail === 'string') {
-                const match = qualityAction.detail.match(/Quality=(\d+)\/100/)
-                if (match) {
-                    const score = parseInt(match[1], 10)
-                    totalQualityScore += score
-                    qualityAssessmentCount++
-                    if (score >= 60) highQualityVisits++
-                    else if (score >= 40) mediumQualityVisits++
-                    else lowQualityVisits++
+            // Prefer structured quality_score column (web_seo numeric + new logs); fallback legacy detail regex for generic modes
+            const hasStructuredQuality = log.discoverySource !== null || log.countable === true || log.qualityScore > 0
+            let score: number | null =
+                hasStructuredQuality && typeof log.qualityScore === 'number' && Number.isFinite(log.qualityScore)
+                    ? log.qualityScore
+                    : null
+
+            if (score == null) {
+                const qualityAction = actions.find((entry) => {
+                    if (!entry || typeof entry !== 'object') return false
+                    return (entry as { action?: unknown }).action === 'visit_quality_assessment'
+                }) as { detail?: unknown } | undefined
+                if (qualityAction && typeof qualityAction.detail === 'string') {
+                    const match = qualityAction.detail.match(/Quality=(\d+)\/100/)
+                    if (match) {
+                        score = parseInt(match[1], 10)
+                    }
                 }
             }
 
-            const proxyAction = actions.find((a: any) => a.action === 'proxy_rotated_visit_ended')
+            if (score != null) {
+                totalQualityScore += score
+                qualityAssessmentCount++
+                if (score >= 60) {
+                    highQualityVisits++
+                    if (log.discoverySource === null) legacyHighQualityVisits++
+                } else if (score >= 40) {
+                    mediumQualityVisits++
+                    if (log.discoverySource === null) legacyMediumQualityVisits++
+                } else {
+                    lowQualityVisits++
+                }
+            }
+
+            if (log.discoverySource !== null && log.countable === true) {
+                structuredCountableVisits++
+            }
+
+            const proxyAction = actions.find((entry) => {
+                if (!entry || typeof entry !== 'object') return false
+                return (entry as { action?: unknown }).action === 'proxy_rotated_visit_ended'
+            })
             if (proxyAction) proxyRotatedVisits++
         }
 
         const avgQuality = qualityAssessmentCount > 0 ? Math.round(totalQualityScore / qualityAssessmentCount) : 0
-        const estimatedGoogleCountable = highQualityVisits + Math.floor(mediumQualityVisits * 0.5)
+        const estimatedGoogleCountable = structuredCountableVisits
+            + legacyHighQualityVisits
+            + Math.floor(legacyMediumQualityVisits * 0.5)
 
         return {
             campaignId,

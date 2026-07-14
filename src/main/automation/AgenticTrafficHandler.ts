@@ -11,6 +11,8 @@ import { DOMUtils, ExtractedInteractiveDOM, ObservedElementSummary } from './DOM
 import { contextualInterruptionResolver } from './ContextualInterruptionResolver'
 import { parseInterruptionCandidate, parseTrafficAgentAction } from './agentSchemas'
 import { kpiSkills, KpiSkillResult } from './KpiSkills'
+import { captchaSolverService } from '../services/CaptchaSolverService'
+import { CaptchaDetector } from '../../shared/captcha/CaptchaDetector'
 
 export interface AgentTrafficAction {
     thought: string
@@ -631,7 +633,7 @@ Respond strictly as JSON. No markdown:
         if (!current.includes('google.')) return false
 
         // On CAPTCHA/sorry page → not on target
-        if (current.includes('/sorry')) return false
+        if (CaptchaDetector.isCaptchaUrl(current) || current.includes('/sorry')) return false
 
         // On Directions page → not on target (this is the main cause of flickering)
         if (current.includes('/dir')) return false
@@ -662,46 +664,126 @@ Respond strictly as JSON. No markdown:
     }
 
     private async isCaptchaLikePage(page: Page): Promise<boolean> {
-        if (page.isClosed()) {
-            return false
-        }
+        return CaptchaDetector.isCaptchaPage(page)
+    }
 
-        const currentUrl = page.url().toLowerCase()
-        if (
-            currentUrl.includes('google.com/sorry')
-            || currentUrl.includes('/sorry/index')
-            || currentUrl.includes('ipv4.google.com/sorry')
-            || currentUrl.includes('recaptcha')
-        ) {
-            return true
-        }
-
-        const hasRecaptchaFrame = await page.locator('iframe[src*="recaptcha"], div.g-recaptcha').count().catch(() => 0)
-        if (hasRecaptchaFrame > 0) {
-            return true
-        }
-
-        try {
-            const textSnapshot = await page.evaluate(() => {
-                const bodyText = (document.body?.innerText || '').toLowerCase().slice(0, 5000)
-                const titleText = (document.title || '').toLowerCase()
-                return `${titleText}\n${bodyText}`
-            })
-
-            if (
-                textSnapshot.includes("i'm not a robot")
-                || textSnapshot.includes('unusual traffic')
-                || textSnapshot.includes('our systems have detected unusual traffic')
-                || textSnapshot.includes('toi khong phai la nguoi may')
-                || textSnapshot.includes('captcha')
-            ) {
+    /** Poll until CAPTCHA clears or timeoutMs elapses. */
+    private async waitForCaptchaClear(page: Page, timeoutMs: number): Promise<boolean> {
+        const start = Date.now()
+        while (Date.now() - start < timeoutMs) {
+            await this.delay(4000, 5000, 'transition')
+            if (!(await this.isCaptchaLikePage(page))) {
                 return true
             }
-        } catch {
-            // Ignore evaluation errors.
+        }
+        return false
+    }
+
+    private hasConfiguredCaptchaProvider(settings: {
+        captchaSolverProvider?: string
+        captchaSolverApiKey?: string
+    }): boolean {
+        return Boolean(
+            settings.captchaSolverProvider
+            && settings.captchaSolverProvider !== 'none'
+            && settings.captchaSolverApiKey,
+        )
+    }
+
+    /**
+     * Detect CAPTCHA, try API auto-solve, then optional manual wait.
+     * Returns 'ok' if cleared (caller continues step), 'captcha' if still blocked.
+     */
+    private async resolveCaptchaDuringStep(
+        page: Page,
+        threadId: number,
+        stepIndex: number,
+        actionsPerformed: AgenticPerformedAction[],
+        onStatusUpdate: (msg: string) => void,
+    ): Promise<'ok' | 'captcha'> {
+        if (!(await this.isCaptchaLikePage(page))) {
+            return 'ok'
         }
 
-        return false
+        this.log(`T${threadId}: CAPTCHA detected during plan execution.`)
+        this.pushAction(actionsPerformed, {
+            action: 'captcha_detected',
+            success: false,
+            source: 'safety',
+            detail: 'Google CAPTCHA/sorry page detected',
+            step: stepIndex + 1,
+        })
+
+        let hasProvider = false
+        try {
+            const settings = (await import('../ipc/settings')).loadSettings()
+            hasProvider = this.hasConfiguredCaptchaProvider(settings)
+        } catch {
+            hasProvider = false
+        }
+
+        if (hasProvider) {
+            onStatusUpdate('CAPTCHA detected. Trying auto-solve via API...')
+            const solved = await captchaSolverService.solveCaptchaOnPage(page, threadId)
+            if (solved) {
+                await this.delay(1500, 3000, 'transition')
+                if (!(await this.isCaptchaLikePage(page))) {
+                    this.log(`T${threadId}: CAPTCHA auto-solved via API.`)
+                    this.pushAction(actionsPerformed, {
+                        action: 'captcha_auto_solved',
+                        success: true,
+                        source: 'captcha_solver',
+                        detail: 'CAPTCHA auto-solved via API',
+                        step: stepIndex + 1,
+                    })
+                    onStatusUpdate('CAPTCHA auto-solved. Continuing...')
+                    return 'ok'
+                }
+            }
+
+            onStatusUpdate('Auto-solve failed/incomplete. Waiting for manual solve (60s)...')
+            this.log(`T${threadId}: Waiting 60s for manual CAPTCHA resolution.`)
+            if (await this.waitForCaptchaClear(page, 60_000)) {
+                this.pushAction(actionsPerformed, {
+                    action: 'captcha_manual_solved',
+                    success: true,
+                    source: 'safety',
+                    detail: 'CAPTCHA manually solved',
+                    step: stepIndex + 1,
+                })
+                return 'ok'
+            }
+
+            this.pushAction(actionsPerformed, {
+                action: 'captcha_timeout',
+                success: false,
+                source: 'safety',
+                detail: 'CAPTCHA not solved in time',
+                step: stepIndex + 1,
+            })
+            return 'captcha'
+        }
+
+        onStatusUpdate('CAPTCHA detected. No solver configured. Waiting 30s...')
+        if (await this.waitForCaptchaClear(page, 30_000)) {
+            this.pushAction(actionsPerformed, {
+                action: 'captcha_manual_solved',
+                success: true,
+                source: 'safety',
+                detail: 'CAPTCHA manually solved (no provider)',
+                step: stepIndex + 1,
+            })
+            return 'ok'
+        }
+
+        this.pushAction(actionsPerformed, {
+            action: 'captcha_no_provider',
+            success: false,
+            source: 'safety',
+            detail: 'No CAPTCHA solver configured and page still blocked',
+            step: stepIndex + 1,
+        })
+        return 'captcha'
     }
 
     private isExternalNavigationCandidate(summary?: ObservedElementSummary): boolean {
@@ -1401,17 +1483,15 @@ Respond strictly as JSON. No markdown:
             })
         }
 
-        // Captcha check
-        if (await this.isCaptchaLikePage(page)) {
-            this.log(`T${threadId}: CAPTCHA detected during plan execution.`)
-            onStatusUpdate('CAPTCHA detected. Waiting for manual solve...')
-            this.pushAction(actionsPerformed, {
-                action: 'captcha_detected',
-                success: false,
-                source: 'safety',
-                detail: 'Google CAPTCHA/sorry page detected',
-                step: stepIndex + 1,
-            })
+        // Captcha check + auto-solve integration (shared detector + solver chain)
+        const captchaOutcome = await this.resolveCaptchaDuringStep(
+            page,
+            threadId,
+            stepIndex,
+            actionsPerformed,
+            onStatusUpdate,
+        )
+        if (captchaOutcome === 'captcha') {
             return 'captcha'
         }
 

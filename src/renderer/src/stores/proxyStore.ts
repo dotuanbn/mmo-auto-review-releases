@@ -1,28 +1,13 @@
 import { create } from 'zustand'
-
-interface Proxy {
-    id: number
-    host: string
-    port: number
-    username?: string
-    password?: string
-    type: 'http' | 'https' | 'socks5'
-    country?: string
-    provider?: string          // 'dataimpulse' | 'fproxy' | 'smartproxy' | 'manual' | 'custom' ...
-    status: 'active' | 'dead' | 'checking'
-    lastCheck?: Date
-    responseTime?: number
-    createdAt: Date
-}
-
-interface ProxyStats {
-    total: number
-    active: number
-    dead: number
-}
+import type {
+    PublicProxy,
+    ProxyCreatePayload,
+    ProxyStats,
+    ProxyUpdatePayload,
+} from '../../../shared/proxy-contracts'
 
 interface ProxyStore {
-    proxies: Proxy[]
+    proxies: PublicProxy[]
     stats: ProxyStats
     loading: boolean
     error: string | null
@@ -30,8 +15,8 @@ interface ProxyStore {
     // Actions
     fetchProxies: () => Promise<void>
     fetchStats: () => Promise<void>
-    addProxy: (data: { host: string; port: number; username?: string; password?: string; type?: 'http' | 'https' | 'socks5'; country?: string; provider?: string }) => Promise<void>
-    updateProxy: (id: number, data: Partial<Proxy>) => Promise<void>
+    addProxy: (data: ProxyCreatePayload) => Promise<void>
+    updateProxy: (id: number, data: ProxyUpdatePayload) => Promise<void>
     deleteProxy: (id: number) => Promise<void>
     checkProxy: (id: number) => Promise<{ alive: boolean; responseTime: number; reason?: string }>
     checkAllProxies: () => Promise<void>

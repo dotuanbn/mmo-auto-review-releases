@@ -1,6 +1,11 @@
 import { Page, BrowserContext } from 'playwright'
 import { parseMapIdentity, extractIdentity, identitiesMatch, describeMatch } from './MapIdentity'
 import { moveCursor, clickCursor } from './BrowserCursorOverlay'
+import {
+    computeAdaptiveDelay,
+    planScrollDepth,
+    type AdaptiveDelayResult,
+} from './CaptchaAvoidancePolicy'
 
 /**
  * HumanBehavior - Simulate human-like browser interactions
@@ -116,6 +121,40 @@ export class HumanBehavior {
 
             await page.mouse.wheel(0, amount)
             await this.randomDelay(500, 1500)
+        }
+    }
+
+    /**
+     * Scroll toward a fractional page depth (0–1) with variable step sizes.
+     * Real users rarely scroll the entire page every time.
+     */
+    static async scrollToDepth(
+        page: Page,
+        targetDepth: number,
+        options: { steps?: number; captchaStrikes?: number } = {},
+    ): Promise<void> {
+        const plan = planScrollDepth(options.captchaStrikes ?? 0)
+        const depth = Math.min(1, Math.max(0.1, targetDepth || plan.targetDepth))
+        const steps = Math.max(1, options.steps ?? plan.steps)
+        const metrics = await page.evaluate(() => ({
+            scrollHeight: document.documentElement.scrollHeight || document.body.scrollHeight || 0,
+            clientHeight: window.innerHeight || 800,
+            scrollY: window.scrollY || 0,
+        })).catch(() => null)
+        if (!metrics || metrics.scrollHeight <= metrics.clientHeight) {
+            await this.randomScroll(page, Math.min(steps, 2))
+            return
+        }
+        const maxScroll = Math.max(0, metrics.scrollHeight - metrics.clientHeight)
+        const targetY = maxScroll * depth
+        const delta = targetY - metrics.scrollY
+        const stepDelta = delta / steps
+        for (let i = 0; i < steps; i++) {
+            await page.mouse.wheel(0, stepDelta).catch(() => undefined)
+            await this.randomDelay(
+                plan.pauseBetweenScrollsMs.min,
+                plan.pauseBetweenScrollsMs.max,
+            )
         }
     }
 
@@ -352,6 +391,36 @@ export class HumanBehavior {
     static async randomDelay(min: number, max: number): Promise<void> {
         const delay = this.getRandomDelay(min, max)
         await this.sleep(delay)
+    }
+
+    /**
+     * Adaptive delay scaled by CAPTCHA strike pressure (pure range via policy).
+     */
+    static computeAdaptiveDelay(
+        min: number,
+        max: number,
+        captchaStrikes = 0,
+        random?: () => number,
+    ): AdaptiveDelayResult {
+        return computeAdaptiveDelay({
+            baseMinMs: min,
+            baseMaxMs: max,
+            captchaStrikes,
+            random,
+        })
+    }
+
+    /**
+     * Sleep using adaptive delay range based on captcha strikes / risk.
+     */
+    static async adaptiveRandomDelay(
+        min: number,
+        max: number,
+        captchaStrikes = 0,
+    ): Promise<number> {
+        const result = this.computeAdaptiveDelay(min, max, captchaStrikes)
+        await this.sleep(result.delayMs)
+        return result.delayMs
     }
 
     /**

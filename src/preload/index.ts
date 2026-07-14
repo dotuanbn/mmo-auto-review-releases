@@ -1,41 +1,39 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { Account } from '../shared/types'
-
-type AccountLoginType = 'auto' | 'manual'
-
-type AccountAddPayload = {
-    email: string
-    password: string
-    recoveryEmail?: string
-    recoveryPhone?: string
-    loginType?: AccountLoginType
-    twoFactorSecret?: string
-}
-
-type AccountUpdatePayload = Partial<{
-    email?: string
-    password?: string
-    recoveryEmail?: string | null
-    recoveryPhone?: string | null
-    loginType?: 'auto' | 'manual'
-    status?: string
-    twoFactorSecret?: string | null
-}>
-
-type AccountImportPayload = {
-    email: string
-    password: string
-    recoveryEmail?: string
-    recoveryPhone?: string
-    twoFactorSecret?: string
-    loginType?: AccountLoginType
-}
-
-type AccountLiveCheckResult = {
-    alive: boolean
-    error?: string
-    needs2FA?: boolean
-}
+import type {
+    AccountCreatePayload,
+    AccountImportPayload,
+    AccountLiveCheckResult,
+    AccountLoginResult,
+    AccountStats,
+    AccountUpdatePayload,
+    PublicAccount,
+} from '../shared/account-contracts'
+import type {
+    PublicProxy,
+    ProxyCreatePayload,
+    ProxyRuntimeCheckResult,
+    ProxyStats,
+    ProxyUpdatePayload,
+} from '../shared/proxy-contracts'
+import type {
+    AccountWarmupStatusDto,
+    WarmupActionResultDto,
+    WarmupStartOptions,
+} from '../shared/warmup-contracts'
+import type {
+    AutomationActionResult,
+    AutomationConfigDto,
+    AutomationConfigSavePayload,
+    AutomationQueueStatsDto,
+    RecoveryReportDto,
+    ResumePlanDto,
+} from '../shared/automation-contracts'
+import type { SettingsKey } from '../shared/ipc-schemas'
+import type { SettingsRecord, SettingsValue } from '../shared/types'
+import type {
+    CaptchaMetricsResetResult,
+    CaptchaMetricsSnapshot,
+} from '../shared/captcha-metrics-contracts'
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
@@ -49,38 +47,60 @@ contextBridge.exposeInMainWorld('electronAPI', {
     reportRendererEvent: (payload: { level?: 'info' | 'warn' | 'error'; message: string }) =>
         ipcRenderer.invoke('app:reportRendererEvent', payload),
 
-    // Accounts
+    // Accounts — IPC returns PublicAccount (no password / twoFactorSecret)
     accounts: {
-        getAll: () => ipcRenderer.invoke('accounts:getAll'),
-        getActiveCount: () => ipcRenderer.invoke('accounts:getActiveCount'),
-        getById: (id: number) => ipcRenderer.invoke('accounts:getById', id),
-        add: (data: AccountAddPayload) =>
+        getAll: (): Promise<PublicAccount[]> => ipcRenderer.invoke('accounts:getAll'),
+        getActiveCount: (): Promise<number> => ipcRenderer.invoke('accounts:getActiveCount'),
+        getById: (id: number): Promise<PublicAccount | undefined> =>
+            ipcRenderer.invoke('accounts:getById', id),
+        add: (data: AccountCreatePayload): Promise<PublicAccount> =>
             ipcRenderer.invoke('accounts:add', data),
-        update: (id: number, data: AccountUpdatePayload) => ipcRenderer.invoke('accounts:update', id, data),
-        delete: (id: number) => ipcRenderer.invoke('accounts:delete', id),
-        importCSV: (accounts: AccountImportPayload[]) => ipcRenderer.invoke('accounts:importCSV', accounts),
-        getStats: () => ipcRenderer.invoke('accounts:getStats'),
-        testLogin: (id: number) => ipcRenderer.invoke('accounts:testLogin', id),
-        loginVisible: (id: number) => ipcRenderer.invoke('accounts:loginVisible', id),
-        checkLiveDie: (id: number) => ipcRenderer.invoke('accounts:checkLiveDie', id),
-        checkAllPending: () => ipcRenderer.invoke('accounts:checkAllPending'),
-        openManualLogin: (id: number) => ipcRenderer.invoke('accounts:openManualLogin', id),
+        update: (id: number, data: AccountUpdatePayload): Promise<PublicAccount | undefined> =>
+            ipcRenderer.invoke('accounts:update', id, data),
+        delete: (id: number): Promise<void> => ipcRenderer.invoke('accounts:delete', id),
+        importCSV: (accounts: AccountImportPayload[]): Promise<number> =>
+            ipcRenderer.invoke('accounts:importCSV', accounts),
+        getStats: (): Promise<AccountStats> => ipcRenderer.invoke('accounts:getStats'),
+        testLogin: (id: number): Promise<AccountLoginResult> =>
+            ipcRenderer.invoke('accounts:testLogin', id),
+        loginVisible: (id: number): Promise<AccountLoginResult> =>
+            ipcRenderer.invoke('accounts:loginVisible', id),
+        checkLiveDie: (id: number): Promise<AccountLiveCheckResult> =>
+            ipcRenderer.invoke('accounts:checkLiveDie', id),
+        checkAllPending: (): Promise<{ checked: number; alive: number; dead: number }> =>
+            ipcRenderer.invoke('accounts:checkAllPending'),
+        openManualLogin: (id: number): Promise<AccountLoginResult> =>
+            ipcRenderer.invoke('accounts:openManualLogin', id),
+    },
+
+    warmup: {
+        getStatus: (id: number): Promise<AccountWarmupStatusDto> =>
+            ipcRenderer.invoke('warmup:getStatus', id),
+        getAllStatuses: (): Promise<AccountWarmupStatusDto[]> =>
+            ipcRenderer.invoke('warmup:getAllStatuses'),
+        start: (id: number, options?: WarmupStartOptions): Promise<WarmupActionResultDto> =>
+            ipcRenderer.invoke('warmup:start', id, options),
+        cancel: (id: number): Promise<WarmupActionResultDto> =>
+            ipcRenderer.invoke('warmup:cancel', id),
     },
 
     // Proxies
     proxies: {
-        getAll: () => ipcRenderer.invoke('proxies:getAll'),
-        getActive: () => ipcRenderer.invoke('proxies:getActive'),
+        getAll: (): Promise<PublicProxy[]> => ipcRenderer.invoke('proxies:getAll'),
+        getActive: (): Promise<PublicProxy[]> => ipcRenderer.invoke('proxies:getActive'),
         getActiveCount: () => ipcRenderer.invoke('proxies:getActiveCount'),
-        add: (data: { host: string; port: number; username?: string; password?: string; type?: string; country?: string }) =>
+        add: (data: ProxyCreatePayload): Promise<PublicProxy> =>
             ipcRenderer.invoke('proxies:add', data),
-        update: (id: number, data: any) => ipcRenderer.invoke('proxies:update', id, data),
+        update: (id: number, data: ProxyUpdatePayload): Promise<PublicProxy | undefined> =>
+            ipcRenderer.invoke('proxies:update', id, data),
         delete: (id: number) => ipcRenderer.invoke('proxies:delete', id),
         check: (id: number) => ipcRenderer.invoke('proxies:check', id),
+        checkRuntime: (id: number): Promise<ProxyRuntimeCheckResult> =>
+            ipcRenderer.invoke('proxies:checkRuntime', id),
         checkAll: () => ipcRenderer.invoke('proxies:checkAll'),
         importText: (text: string, defaultProvider?: string) => ipcRenderer.invoke('proxies:importText', text, defaultProvider),
         deleteDead: () => ipcRenderer.invoke('proxies:deleteDead'),
-        getStats: () => ipcRenderer.invoke('proxies:getStats'),
+        getStats: (): Promise<ProxyStats> => ipcRenderer.invoke('proxies:getStats'),
     },
 
     // FProxy API (fproxy.me rotating proxy)
@@ -139,13 +159,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getHistory: (filters?: any) => ipcRenderer.invoke('reviews:getHistory', filters),
     },
 
-    // Settings
+    // Settings (key-value; whitelist + schema enforced in main).
+    // Secret keys (groqApiKey, fproxyApiKey, captchaSolverApiKey) are never returned raw:
+    // nonempty secrets appear as ASCII mask '********'. saveAll: mask = keep, '' = clear, other = replace.
     settings: {
-        get: (key: string) => ipcRenderer.invoke('settings:get', key),
-        set: (key: string, value: any) => ipcRenderer.invoke('settings:set', key, value),
-        getAll: () => ipcRenderer.invoke('settings:getAll'),
-        saveAll: (settings: Record<string, any>) => ipcRenderer.invoke('settings:saveAll', settings),
-        resetDefaults: () => ipcRenderer.invoke('settings:resetDefaults'),
+        get: (key: SettingsKey) => ipcRenderer.invoke('settings:get', key) as Promise<SettingsValue | undefined>,
+        set: (key: SettingsKey, value: SettingsValue) =>
+            ipcRenderer.invoke('settings:set', key, value) as Promise<void>,
+        getAll: () => ipcRenderer.invoke('settings:getAll') as Promise<SettingsRecord>,
+        saveAll: (settings: Partial<Record<SettingsKey, SettingsValue>>) =>
+            ipcRenderer.invoke('settings:saveAll', settings) as Promise<SettingsRecord>,
+        resetDefaults: () => ipcRenderer.invoke('settings:resetDefaults') as Promise<SettingsRecord>,
     },
 
     // Analytics (Google Analytics + Search Console + GBP Scraping)
@@ -168,27 +192,49 @@ contextBridge.exposeInMainWorld('electronAPI', {
         listSearchConsoleSites: (email?: string) => ipcRenderer.invoke('analytics:listSearchConsoleSites', email),
     },
 
-    // Automation
+    // Automation — typed via shared/automation-contracts
     automation: {
-        getConfig: () => ipcRenderer.invoke('automation:getConfig'),
-        saveConfig: (config: any) => ipcRenderer.invoke('automation:saveConfig', config),
-        startCampaign: (campaignId: number) => ipcRenderer.invoke('automation:startCampaign', campaignId),
-        stopCampaign: () => ipcRenderer.invoke('automation:stopCampaign'),
-        pause: () => ipcRenderer.invoke('automation:pause'),
-        resume: () => ipcRenderer.invoke('automation:resume'),
-        getStatus: () => ipcRenderer.invoke('automation:getStatus'),
-        isRunning: () => ipcRenderer.invoke('automation:isRunning'),
-        getQueueStats: () => ipcRenderer.invoke('automation:getQueueStats'),
-        clearCompleted: () => ipcRenderer.invoke('automation:clearCompleted'),
+        getConfig: (): Promise<AutomationConfigDto | null> =>
+            ipcRenderer.invoke('automation:getConfig'),
+        saveConfig: (config: AutomationConfigSavePayload): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:saveConfig', config),
+        startCampaign: (campaignId: number): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:startCampaign', campaignId),
+        resumeCampaign: (campaignId: number): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:resumeCampaign', campaignId),
+        stopCampaign: (): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:stopCampaign'),
+        pause: (): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:pause'),
+        resume: (): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:resume'),
+        getStatus: (): Promise<unknown> =>
+            ipcRenderer.invoke('automation:getStatus'),
+        isRunning: (): Promise<boolean> =>
+            ipcRenderer.invoke('automation:isRunning'),
+        getQueueStats: (campaignId?: number): Promise<AutomationQueueStatsDto> =>
+            ipcRenderer.invoke('automation:getQueueStats', campaignId),
+        clearCompleted: (campaignId?: number): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:clearCompleted', campaignId),
+        /** Readonly boot recovery snapshot — never auto-starts browsers. */
+        getRecoveryReport: (): Promise<RecoveryReportDto | null> =>
+            ipcRenderer.invoke('automation:getRecoveryReport'),
+        /** Readonly resume eligibility for one campaign (pending jobs only). */
+        getResumePlan: (campaignId: number): Promise<ResumePlanDto> =>
+            ipcRenderer.invoke('automation:getResumePlan', campaignId),
         // Status updates from main process
-        onStatusUpdate: (callback: (status: any) => void) => {
-            const handler = (_event: any, status: any) => callback(status)
+        onStatusUpdate: (callback: (status: unknown) => void): (() => void) => {
+            const handler = (_event: Electron.IpcRendererEvent, status: unknown) => callback(status)
             ipcRenderer.on('automation:status', handler)
             return () => ipcRenderer.removeListener('automation:status', handler)
         },
         // Test functions for debugging
-        testBrowser: () => ipcRenderer.invoke('automation:testBrowser'),
-        testFullFlow: (searchQuery?: string) => ipcRenderer.invoke('automation:testFullFlow', searchQuery),
+        testBrowser: (): Promise<AutomationActionResult> =>
+            ipcRenderer.invoke('automation:testBrowser'),
+        testFullFlow: (
+            searchQuery?: string,
+        ): Promise<{ success: boolean; step?: string; error?: string }> =>
+            ipcRenderer.invoke('automation:testFullFlow', searchQuery),
     },
 
     // Traffic Booster
@@ -470,6 +516,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
         cleanup: (keepDays?: number) => ipcRenderer.invoke('trackio:cleanup', keepDays),
     },
 
+    // CAPTCHA metrics (public snapshot only — no secrets/tokens)
+    captcha: {
+        getMetrics: (): Promise<CaptchaMetricsSnapshot> =>
+            ipcRenderer.invoke('captcha:getMetrics'),
+        resetMetrics: (): Promise<CaptchaMetricsResetResult> =>
+            ipcRenderer.invoke('captcha:resetMetrics'),
+    },
+
     // HuggingFace Datasets — Browse & Search
     datasets: {
         isValid: (datasetId: string) => ipcRenderer.invoke('datasets:isValid', datasetId),
@@ -537,32 +591,39 @@ declare global {
             reloadWindow: (reason?: string) => Promise<{ success: boolean }>
             reportRendererEvent: (payload: { level?: 'info' | 'warn' | 'error'; message: string }) => Promise<{ success: boolean }>
             accounts: {
-                getAll: () => Promise<Account[]>
+                getAll: () => Promise<PublicAccount[]>
                 getActiveCount: () => Promise<number>
-                getById: (id: number) => Promise<Account | undefined>
-                add: (data: AccountAddPayload) => Promise<Account>
-                update: (id: number, data: AccountUpdatePayload) => Promise<Account | undefined>
+                getById: (id: number) => Promise<PublicAccount | undefined>
+                add: (data: AccountCreatePayload) => Promise<PublicAccount>
+                update: (id: number, data: AccountUpdatePayload) => Promise<PublicAccount | undefined>
                 delete: (id: number) => Promise<void>
                 importCSV: (accounts: AccountImportPayload[]) => Promise<number>
-                getStats: () => Promise<any>
-                testLogin: (id: number) => Promise<any>
-                loginVisible: (id: number) => Promise<any>
+                getStats: () => Promise<AccountStats>
+                testLogin: (id: number) => Promise<AccountLoginResult>
+                loginVisible: (id: number) => Promise<AccountLoginResult>
                 checkLiveDie: (id: number) => Promise<AccountLiveCheckResult>
                 checkAllPending: () => Promise<{ checked: number; alive: number; dead: number }>
-                openManualLogin: (id: number) => Promise<any>
+                openManualLogin: (id: number) => Promise<AccountLoginResult>
+            }
+            warmup: {
+                getStatus: (id: number) => Promise<AccountWarmupStatusDto>
+                getAllStatuses: () => Promise<AccountWarmupStatusDto[]>
+                start: (id: number, options?: WarmupStartOptions) => Promise<WarmupActionResultDto>
+                cancel: (id: number) => Promise<WarmupActionResultDto>
             }
             proxies: {
-                getAll: () => Promise<any[]>
-                getActive: () => Promise<any[]>
+                getAll: () => Promise<PublicProxy[]>
+                getActive: () => Promise<PublicProxy[]>
                 getActiveCount: () => Promise<number>
-                add: (data: any) => Promise<any>
-                update: (id: number, data: any) => Promise<any>
+                add: (data: ProxyCreatePayload) => Promise<PublicProxy>
+                update: (id: number, data: ProxyUpdatePayload) => Promise<PublicProxy | undefined>
                 delete: (id: number) => Promise<void>
                 check: (id: number) => Promise<any>
+                checkRuntime: (id: number) => Promise<ProxyRuntimeCheckResult>
                 checkAll: () => Promise<any>
                 importText: (text: string, defaultProvider?: string) => Promise<number>
                 deleteDead: () => Promise<number>
-                getStats: () => Promise<any>
+                getStats: () => Promise<ProxyStats>
             }
             locations: {
                 getAll: () => Promise<any[]>
@@ -595,23 +656,38 @@ declare global {
                 getHistory: (filters?: any) => Promise<any[]>
             }
             settings: {
-                get: (key: string) => Promise<any>
-                set: (key: string, value: any) => Promise<void>
-                getAll: () => Promise<any>
-                saveAll: (settings: Record<string, any>) => Promise<any>
-                resetDefaults: () => Promise<any>
+                /** Secret keys return '********' when set, never plaintext. */
+                get: (key: SettingsKey) => Promise<SettingsValue | undefined>
+                set: (key: SettingsKey, value: SettingsValue) => Promise<void>
+                /** Public settings view — secrets masked as '********' when nonempty. */
+                getAll: () => Promise<SettingsRecord>
+                /**
+                 * Secret field semantics: '********' keeps prior secret, '' clears,
+                 * any other string replaces and encrypts at rest (fail-closed if unavailable).
+                 */
+                saveAll: (settings: Partial<Record<SettingsKey, SettingsValue>>) =>
+                    Promise<SettingsRecord>
+                resetDefaults: () => Promise<SettingsRecord>
             }
             automation: {
-                getConfig: () => Promise<any>
-                saveConfig: (config: any) => Promise<any>
-                startCampaign: (campaignId: number) => Promise<any>
-                stopCampaign: () => Promise<any>
-                pause: () => Promise<any>
-                resume: () => Promise<any>
-                getStatus: () => Promise<any>
+                getConfig: () => Promise<AutomationConfigDto | null>
+                saveConfig: (config: AutomationConfigSavePayload) => Promise<AutomationActionResult>
+                startCampaign: (campaignId: number) => Promise<AutomationActionResult>
+                resumeCampaign: (campaignId: number) => Promise<AutomationActionResult>
+                stopCampaign: () => Promise<AutomationActionResult>
+                pause: () => Promise<AutomationActionResult>
+                resume: () => Promise<AutomationActionResult>
+                getStatus: () => Promise<unknown>
                 isRunning: () => Promise<boolean>
-                getQueueStats: () => Promise<any>
-                clearCompleted: () => Promise<any>
+                getQueueStats: (campaignId?: number) => Promise<AutomationQueueStatsDto>
+                clearCompleted: (campaignId?: number) => Promise<AutomationActionResult>
+                getRecoveryReport: () => Promise<RecoveryReportDto | null>
+                getResumePlan: (campaignId: number) => Promise<ResumePlanDto>
+                onStatusUpdate: (callback: (status: unknown) => void) => () => void
+                testBrowser: () => Promise<AutomationActionResult>
+                testFullFlow: (
+                    searchQuery?: string,
+                ) => Promise<{ success: boolean; step?: string; error?: string }>
             }
             traffic: {
                 getAll: () => Promise<any[]>
@@ -770,6 +846,10 @@ declare global {
                 getHistory: (limit?: number) => Promise<any[]>
                 getAlerts: () => Promise<any[]>
                 cleanup: (keepDays?: number) => Promise<{ deleted: number }>
+            }
+            captcha: {
+                getMetrics: () => Promise<CaptchaMetricsSnapshot>
+                resetMetrics: () => Promise<CaptchaMetricsResetResult>
             }
             datasets: {
                 isValid: (datasetId: string) => Promise<any>

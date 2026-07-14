@@ -1,13 +1,23 @@
 import { ipcMain } from 'electron'
 import { accountService } from '../services/AccountService'
 import { profileService } from '../services/ProfileService'
+import { isProfileLockBusyError } from '../services/ProfileLockService'
 import { existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { loadSettings } from './settings'
 import type { Account } from '../database/schema'
+import {
+    accountCreateSchema,
+    accountIdSchema,
+    accountImportListSchema,
+    accountUpdateArgsSchema,
+    type AccountUpdatePayload,
+    type PublicAccount,
+} from '../../shared/account-contracts'
+import { parseIpcArgs, parseIpcPayload, withIpcValidation } from './validate'
 
 // Track open manual login browsers so we don't open duplicates
-const openManualBrowsers: Map<number, any> = new Map()
+const openManualBrowsers: Map<number, number> = new Map()
 
 type LegacyAccount = {
     loginType?: 'auto' | 'manual'
@@ -17,47 +27,63 @@ function isManualAccount(account: unknown): boolean {
     return (account as LegacyAccount).loginType === 'manual'
 }
 
-const ACCOUNT_STATUSES: ReadonlySet<Account['status']> = new Set<Account['status']>([
-    'active',
-    'banned',
-    'pending',
-    'suspended',
-    'checking',
-])
-
-type AccountUpdatePayload = {
-    email?: unknown
-    password?: unknown
-    recoveryEmail?: unknown
-    recoveryPhone?: unknown
-    twoFactorSecret?: unknown
-    loginType?: unknown
-    status?: unknown
-}
-
 function normalizeLoginType(value: unknown): 'auto' | 'manual' {
     return value === 'manual' ? 'manual' : 'auto'
 }
 
-function sanitizeAccountUpdatePayload(data: unknown): Partial<Account> {
-    const input = (data && typeof data === 'object' ? data : {}) as AccountUpdatePayload
+/**
+ * Map validated update payload to DB fields.
+ * Blank password / blank TOTP secret are ignored so existing secrets
+ * are not overwritten accidentally from the UI. null TOTP clears.
+ */
+function toAccountUpdateFields(input: AccountUpdatePayload): Partial<Account> {
     const update: Partial<Account> = {}
 
     if (typeof input.email === 'string') update.email = input.email.trim()
-    if (typeof input.password === 'string') update.password = input.password
-    if (typeof input.recoveryEmail === 'string' || input.recoveryEmail === null) update.recoveryEmail = input.recoveryEmail
-    if (typeof input.recoveryPhone === 'string' || input.recoveryPhone === null) update.recoveryPhone = input.recoveryPhone
-    if (typeof input.twoFactorSecret === 'string' || input.twoFactorSecret === null) update.twoFactorSecret = input.twoFactorSecret
-    if (input.loginType === 'auto' || input.loginType === 'manual') update.loginType = input.loginType
-    if (typeof input.status === 'string' && ACCOUNT_STATUSES.has(input.status as Account['status'])) {
-        update.status = input.status as Account['status']
+
+    // Blank password must NOT overwrite stored secret
+    if (typeof input.password === 'string' && input.password.trim() !== '') {
+        update.password = input.password
     }
+
+    if (input.recoveryEmail !== undefined) {
+        update.recoveryEmail = input.recoveryEmail
+    }
+    if (input.recoveryPhone !== undefined) {
+        update.recoveryPhone = input.recoveryPhone
+    }
+
+    // null clears TOTP; blank string leaves unchanged
+    if (input.twoFactorSecret === null) {
+        update.twoFactorSecret = null
+    } else if (typeof input.twoFactorSecret === 'string' && input.twoFactorSecret.trim() !== '') {
+        update.twoFactorSecret = input.twoFactorSecret
+    }
+
+    if (input.loginType === 'auto' || input.loginType === 'manual') {
+        update.loginType = input.loginType
+    }
+    if (input.status !== undefined) {
+        update.status = input.status
+    }
+    // profilePath must NOT come from accounts:update — profiles:* owns path mutation
 
     return update
 }
 
+function toPublicOrUndefined(account: Account | undefined): PublicAccount | undefined {
+    return account ? accountService.toPublicAccount(account) : undefined
+}
+
 function toFriendlyAccountError(err: unknown): string {
+    // In-process profile ownership conflict (manual/auto/script concurrent open).
+    if (isProfileLockBusyError(err)) {
+        return err.message
+    }
     const raw = err instanceof Error ? err.message : String(err ?? 'Unknown error')
+    if (/PROFILE_LOCK_BUSY|Profile đang được dùng bởi phiên khác/i.test(raw)) {
+        return 'Profile đang được dùng bởi phiên khác. Đóng browser/script đang mở profile này rồi thử lại.'
+    }
     // Never leak secrets/args; map launch/profile closed (common lock or conflict) to actionable UI text
     if (/target page, context or browser has been closed|launchPersistentContext|browser has been closed/i.test(raw)) {
         return 'Không mở được trình duyệt (profile có thể bị khóa bởi Chrome khác hoặc lỗi khởi động). Đóng Chrome đang dùng, thử lại hoặc xóa profile rồi đăng nhập.'
@@ -69,104 +95,105 @@ function toFriendlyAccountError(err: unknown): string {
 }
 
 export function registerAccountHandlers() {
-    // Get all accounts
-    ipcMain.handle('accounts:getAll', async () => {
-        return accountService.getAll()
-    })
+    // Get all accounts — public DTO only (no password / TOTP)
+    ipcMain.handle('accounts:getAll', withIpcValidation('accounts:getAll', async () => {
+        return accountService.getAllPublic()
+    }))
 
-    ipcMain.handle('accounts:getActiveCount', async () => {
+    ipcMain.handle('accounts:getActiveCount', withIpcValidation('accounts:getActiveCount', async () => {
         return accountService.getActiveCount()
-    })
+    }))
 
-    // Get account by ID
-    ipcMain.handle('accounts:getById', async (_event, id: number) => {
-        return accountService.getById(id)
-    })
+    // Get account by ID — public DTO only; reject non-positive / garbage ids
+    ipcMain.handle('accounts:getById', withIpcValidation('accounts:getById', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('accounts:getById', accountIdSchema, id)
+        return accountService.getByIdPublic(parsedId)
+    }))
 
-    // Add new account (supports 2FA secret)
-    ipcMain.handle('accounts:add', async (_event, data: {
-        email: string
-        password: string
-        recoveryEmail?: string
-        recoveryPhone?: string
-        loginType?: 'auto' | 'manual'
-        twoFactorSecret?: string
-    }) => {
-        return accountService.create({
-            email: data.email,
-            password: data.password,
-            recoveryEmail: data.recoveryEmail,
-            recoveryPhone: data.recoveryPhone,
-            loginType: normalizeLoginType(data.loginType),
-            twoFactorSecret: data.twoFactorSecret || null,
+    // Add new account (supports 2FA secret) — returns public DTO
+    ipcMain.handle('accounts:add', withIpcValidation('accounts:add', async (_event, data: unknown) => {
+        const parsed = parseIpcPayload('accounts:add', accountCreateSchema, data)
+        const created = await accountService.create({
+            email: parsed.email,
+            password: parsed.password,
+            recoveryEmail: parsed.recoveryEmail,
+            recoveryPhone: parsed.recoveryPhone,
+            loginType: normalizeLoginType(parsed.loginType),
+            twoFactorSecret: parsed.twoFactorSecret?.trim() ? parsed.twoFactorSecret : null,
             status: 'pending',
             totalReviews: 0,
             createdAt: new Date(),
         })
-    })
+        return accountService.toPublicAccount(created)
+    }))
 
-    // Update account
-    ipcMain.handle('accounts:update', async (_event, id: number, data: unknown) => {
-        const update = sanitizeAccountUpdatePayload(data)
+    // Update account — blank password/TOTP ignored; returns public DTO
+    ipcMain.handle('accounts:update', withIpcValidation('accounts:update', async (_event, id: unknown, data: unknown) => {
+        const [parsedId, parsedData] = parseIpcArgs(
+            'accounts:update',
+            accountUpdateArgsSchema,
+            [id, data],
+        )
+        const update = toAccountUpdateFields(parsedData)
         if (Object.keys(update).length === 0) {
-            return accountService.getById(id)
+            return accountService.getByIdPublic(parsedId)
         }
-        return accountService.update(id, update)
-    })
+        const updated = await accountService.update(parsedId, update)
+        return toPublicOrUndefined(updated)
+    }))
 
     // Delete account
-    ipcMain.handle('accounts:delete', async (_event, id: number) => {
-        return accountService.delete(id)
-    })
+    ipcMain.handle('accounts:delete', withIpcValidation('accounts:delete', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('accounts:delete', accountIdSchema, id)
+        return accountService.delete(parsedId)
+    }))
 
     // Import from CSV (rich: supports 2fa + loginType)
-    ipcMain.handle('accounts:importCSV', async (_event, accounts: Array<{
-        email: string
-        password: string
-        recoveryEmail?: string
-        recoveryPhone?: string
-        twoFactorSecret?: string
-        loginType?: 'auto' | 'manual'
-    }>) => {
-        return accountService.importFromCSV(accounts)
-    })
+    ipcMain.handle('accounts:importCSV', withIpcValidation('accounts:importCSV', async (_event, accounts: unknown) => {
+        const parsed = parseIpcPayload('accounts:importCSV', accountImportListSchema, accounts)
+        return accountService.importFromCSV(parsed)
+    }))
 
     // Get statistics
-    ipcMain.handle('accounts:getStats', async () => {
+    ipcMain.handle('accounts:getStats', withIpcValidation('accounts:getStats', async () => {
         return accountService.getStats()
-    })
+    }))
 
-    ipcMain.handle('accounts:checkLiveDie', async (_event, id: number) => {
-        return accountService.checkLiveDie(id)
-    })
+    ipcMain.handle('accounts:checkLiveDie', withIpcValidation('accounts:checkLiveDie', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('accounts:checkLiveDie', accountIdSchema, id)
+        return accountService.checkLiveDie(parsedId)
+    }))
 
     // Test account login (headless - FULL AUTO: credential + TOTP if secret; uses GoogleAuthHandler for reliability)
-    ipcMain.handle('accounts:testLogin', async (_event, id: number) => {
+    ipcMain.handle('accounts:testLogin', withIpcValidation('accounts:testLogin', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('accounts:testLogin', accountIdSchema, id)
         let contextId: number | null = null
         try {
-            const account = await accountService.getById(id)
+            // Internal getById decrypts secrets for login only (never returned to renderer)
+            const account = await accountService.getById(parsedId)
             if (!account) return { success: false, message: 'Account not found' }
 
             if (isManualAccount(account)) {
                 return { success: false, message: 'Tài khoản thủ công: Hãy dùng nút Đăng nhập thủ công' }
             }
             if (!account.password || !account.password.trim()) {
-                await accountService.updateStatus(id, 'pending')
+                await accountService.updateStatus(parsedId, 'pending')
                 return { success: false, message: 'Thiếu mật khẩu (cập nhật lại tài khoản)' }
             }
 
-            await accountService.updateStatus(id, 'checking')
+            await accountService.updateStatus(parsedId, 'checking')
 
             const { googleAuthHandler } = await import('../automation/GoogleAuthHandler')
-            const { profileService } = await import('../services/ProfileService')
+            const { profileService: ps } = await import('../services/ProfileService')
 
-            const profilePath = account.profilePath || await profileService.createProfile(id, account.email)
+            const profilePath = account.profilePath || await ps.createProfile(parsedId, account.email)
 
             // Single create via handler (reuses BrowserService with channel/args/stealth/lock-clean). No outer create to avoid same-profile lock conflict.
+            const headless = loadSettings().headless === true
             const loginResult = await googleAuthHandler.login(
                 account.email,
                 account.password,
-                { headless: loadSettings().headless ?? false, profilePath },
+                { headless, profilePath },
                 account.twoFactorSecret || undefined,
                 account.recoveryEmail || undefined,
                 account.recoveryPhone || undefined
@@ -180,29 +207,31 @@ export function registerAccountHandlers() {
                     const ctx = browserService.getContext(contextId!)
                     if (ctx) {
                         const ck = await ctx.cookies().catch(() => [])
-                        if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
+                        if (ck && ck.length) await accountService.saveCookies(parsedId, JSON.stringify(ck))
                     }
-                } catch {}
-                await accountService.updateStatus(id, 'active')
-                await accountService.updateLastUsed(id)
+                } catch {
+                    // ignore cookie persistence errors
+                }
+                await accountService.updateStatus(parsedId, 'active')
+                await accountService.updateLastUsed(parsedId)
                 return { success: true, message: 'Auto login successful (TOTP handled if present) - account active!' }
             }
 
             if (loginResult.requires2FA) {
-                await accountService.updateStatus(id, 'pending')
+                await accountService.updateStatus(parsedId, 'pending')
                 return { success: false, message: '2FA required but no valid secret - use manual login', needs2FA: true }
             }
 
             // Only banned/suspended on explicit Google disabled; auth fail (wrong pass etc) = pending for retry
             const err = (loginResult.error || '').toLowerCase()
             if (err.includes('disabled') || err.includes('suspended')) {
-                await accountService.updateStatus(id, err.includes('suspended') ? 'suspended' : 'banned')
+                await accountService.updateStatus(parsedId, err.includes('suspended') ? 'suspended' : 'banned')
             } else {
-                await accountService.updateStatus(id, 'pending')
+                await accountService.updateStatus(parsedId, 'pending')
             }
             return { success: false, message: loginResult.error || 'Auto login failed' }
         } catch (error) {
-            await accountService.updateStatus(id, 'pending')
+            await accountService.updateStatus(parsedId, 'pending')
             return {
                 success: false,
                 message: toFriendlyAccountError(error),
@@ -217,30 +246,31 @@ export function registerAccountHandlers() {
                 }
             }
         }
-    })
+    }))
 
     // Login with visible browser (visible for user intervention/CAPTCHA; tries auto + TOTP first)
-    ipcMain.handle('accounts:loginVisible', async (_event, id: number) => {
+    ipcMain.handle('accounts:loginVisible', withIpcValidation('accounts:loginVisible', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('accounts:loginVisible', accountIdSchema, id)
         let contextId: number | null = null
         let keepContextOpen = false
         try {
-            const account = await accountService.getById(id)
+            const account = await accountService.getById(parsedId)
             if (!account) return { success: false, message: 'Account not found' }
 
             if (isManualAccount(account)) {
                 return { success: false, message: 'Tài khoản thủ công: Hãy dùng nút Đăng nhập thủ công' }
             }
             if (!account.password || !account.password.trim()) {
-                await accountService.updateStatus(id, 'pending')
+                await accountService.updateStatus(parsedId, 'pending')
                 return { success: false, message: 'Thiếu mật khẩu (cập nhật lại tài khoản)' }
             }
 
-            await accountService.updateStatus(id, 'checking')
+            await accountService.updateStatus(parsedId, 'checking')
 
             const { googleAuthHandler } = await import('../automation/GoogleAuthHandler')
-            const { profileService } = await import('../services/ProfileService')
+            const { profileService: ps } = await import('../services/ProfileService')
 
-            const profilePath = account.profilePath || await profileService.createProfile(id, account.email)
+            const profilePath = account.profilePath || await ps.createProfile(parsedId, account.email)
 
             // Single create via handler (BrowserService channel/args/stealth + lock clean). No duplicate create on same profile.
             const loginResult = await googleAuthHandler.login(
@@ -259,17 +289,19 @@ export function registerAccountHandlers() {
                     const ctx = browserService.getContext(contextId!)
                     if (ctx) {
                         const ck = await ctx.cookies().catch(() => [])
-                        if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
+                        if (ck && ck.length) await accountService.saveCookies(parsedId, JSON.stringify(ck))
                     }
-                } catch {}
-                await accountService.updateStatus(id, 'active')
-                await accountService.updateLastUsed(id)
+                } catch {
+                    // ignore cookie persistence errors
+                }
+                await accountService.updateStatus(parsedId, 'active')
+                await accountService.updateLastUsed(parsedId)
                 return { success: true, message: 'Visible auto-login successful!' }
             }
 
             if (loginResult.requires2FA || loginResult.error?.includes('2FA')) {
                 keepContextOpen = true
-                await accountService.updateStatus(id, 'pending')
+                await accountService.updateStatus(parsedId, 'pending')
                 return {
                     success: false,
                     message: 'Trình duyệt đã mở (cần thao tác 2FA/CAPTCHA). Hãy hoàn tất rồi đóng hoặc dùng Kiểm tra.',
@@ -281,13 +313,13 @@ export function registerAccountHandlers() {
             // Only banned/suspended on explicit Google disabled; other fails (pass, incomplete) = pending
             const err = (loginResult.error || '').toLowerCase()
             if (err.includes('disabled') || err.includes('suspended')) {
-                await accountService.updateStatus(id, err.includes('suspended') ? 'suspended' : 'banned')
+                await accountService.updateStatus(parsedId, err.includes('suspended') ? 'suspended' : 'banned')
             } else {
-                await accountService.updateStatus(id, 'pending')
+                await accountService.updateStatus(parsedId, 'pending')
             }
             return { success: false, message: loginResult.error || 'Visible login failed' }
         } catch (error) {
-            await accountService.updateStatus(id, 'pending')
+            await accountService.updateStatus(parsedId, 'pending')
             return {
                 success: false,
                 message: toFriendlyAccountError(error),
@@ -302,10 +334,10 @@ export function registerAccountHandlers() {
                 }
             }
         }
-    })
+    }))
 
     // Check all pending accounts
-    ipcMain.handle('accounts:checkAllPending', async () => {
+    ipcMain.handle('accounts:checkAllPending', withIpcValidation('accounts:checkAllPending', async () => {
         try {
             return await accountService.checkAllPending()
         } catch (error) {
@@ -316,18 +348,19 @@ export function registerAccountHandlers() {
                 error: error instanceof Error ? error.message : 'Unknown error',
             }
         }
-    })
+    }))
 
     // Open browser for manual login (user completes themselves). Keeps visible context alive; polls strict isGoogleLoggedIn (strong cookies) up to ~10min.
     // Only sets active + saves cookies + auto-closes when isGoogleLoggedIn(true). Timeout or close without => pending. No URL heuristics.
-    ipcMain.handle('accounts:openManualLogin', async (_event, id: number) => {
+    ipcMain.handle('accounts:openManualLogin', withIpcValidation('accounts:openManualLogin', async (_event, id: unknown) => {
+        const parsedId = parseIpcPayload('accounts:openManualLogin', accountIdSchema, id)
         try {
             // Check if browser already open for this account
-            if (openManualBrowsers.has(id)) {
+            if (openManualBrowsers.has(parsedId)) {
                 return { success: false, message: 'Browser đã mở cho tài khoản này rồi!' }
             }
 
-            const account = await accountService.getById(id)
+            const account = await accountService.getById(parsedId)
             if (!account) {
                 return { success: false, message: 'Không tìm thấy tài khoản' }
             }
@@ -366,7 +399,7 @@ export function registerAccountHandlers() {
                 headless: false,
                 profilePath,
             })
-            openManualBrowsers.set(id, contextId)
+            openManualBrowsers.set(parsedId, contextId)
 
             // Navigate to Google signin (reuse service page if present)
             const rawContext = browserService.getContext(contextId)
@@ -379,7 +412,7 @@ export function registerAccountHandlers() {
             }
 
             // Persist profilePath
-            await accountService.update(id, { profilePath })
+            await accountService.update(parsedId, { profilePath })
 
             // Detect ONLY via strict isGoogleLoggedIn (SAPISID+SID strong cookies). No URL heuristic (myaccount alone or "left signin" is not enough).
             // If URL myaccount but cookies not yet strong => keep waiting (per spec).
@@ -387,32 +420,32 @@ export function registerAccountHandlers() {
                 try {
                     const ctx = browserService.getContext(contextId) || rawContext
                     if (!ctx) return false
-                    const isLogged = await browserService.isGoogleLoggedIn(contextId, ctx as any).catch(() => false)
+                    const isLogged = await browserService.isGoogleLoggedIn(contextId, ctx).catch(() => false)
                     if (isLogged) {
-                        await accountService.updateStatus(id, 'active')
-                        await accountService.updateLastUsed(id)
-                        try { await ctx.storageState({ path: join(profilePath, 'state.json') }).catch(() => {}) } catch {}
+                        await accountService.updateStatus(parsedId, 'active')
+                        await accountService.updateLastUsed(parsedId)
+                        try { await ctx.storageState({ path: join(profilePath, 'state.json') }).catch(() => {}) } catch { /* ignore */ }
                         try {
                             const ck = await ctx.cookies().catch(() => [])
-                            if (ck && ck.length) await accountService.saveCookies(id, JSON.stringify(ck))
-                        } catch {}
+                            if (ck && ck.length) await accountService.saveCookies(parsedId, JSON.stringify(ck))
+                        } catch { /* ignore */ }
                         console.log(`[ManualLogin] Detected login for ${account.email}, saved cookies + active`)
                         return true
                     }
                     if (isFinalCheck) {
                         // User closed without completing: explicit pending (never banned for manual).
                         // Guard: do not demote an already-active (race with poll-detect + auto-close emitting close event).
-                        const curr = await accountService.getById(id).catch(() => null)
+                        const curr = await accountService.getById(parsedId).catch(() => null)
                         if (!curr || curr.status !== 'active') {
-                            await accountService.updateStatus(id, 'pending')
+                            await accountService.updateStatus(parsedId, 'pending')
                         }
                     }
                     return false
                 } catch {
                     if (isFinalCheck) {
-                        const curr = await accountService.getById(id).catch(() => null)
+                        const curr = await accountService.getById(parsedId).catch(() => null)
                         if (!curr || curr.status !== 'active') {
-                            await accountService.updateStatus(id, 'pending').catch(() => {})
+                            await accountService.updateStatus(parsedId, 'pending').catch(() => {})
                         }
                     }
                     return false
@@ -425,39 +458,39 @@ export function registerAccountHandlers() {
                 const deadline = Date.now() + 10 * 60 * 1000
                 try {
                     while (Date.now() < deadline) {
-                        if (!openManualBrowsers.has(id)) break
+                        if (!openManualBrowsers.has(parsedId)) break
                         const liveCtx = browserService.getContext(contextId)
-                        if (!liveCtx) { openManualBrowsers.delete(id); break }
+                        if (!liveCtx) { openManualBrowsers.delete(parsedId); break }
                         const detected = await tryDetectAndSave(false)
                         if (detected) {
-                            openManualBrowsers.delete(id)
-                            try { await browserService.closeContext(contextId) } catch {}
+                            openManualBrowsers.delete(parsedId)
+                            try { await browserService.closeContext(contextId) } catch { /* ignore */ }
                             break
                         }
                         await new Promise(r => setTimeout(r, 2500))
                     }
                 } finally {
-                    openManualBrowsers.delete(id)
+                    openManualBrowsers.delete(parsedId)
                 }
             })()
 
             // On user close (or external close): LAST CHECK cookies before context gone; active if logged, else pending (no banned)
             if (rawContext) {
                 rawContext.on('close', async () => {
-                    openManualBrowsers.delete(id)
+                    openManualBrowsers.delete(parsedId)
                     await tryDetectAndSave(true) // final cookie check
-                    try { await browserService.closeContext(contextId) } catch {}
+                    try { await browserService.closeContext(contextId) } catch { /* ignore */ }
                     console.log(`[ManualLogin] Browser closed for ${account.email}`)
                 })
             }
 
             return { success: true, message: 'Browser đã mở! Hãy đăng nhập Google. App sẽ tự lưu phiên khi phát hiện thành công.' }
         } catch (error) {
-            openManualBrowsers.delete(id)
+            openManualBrowsers.delete(parsedId)
             return {
                 success: false,
                 message: toFriendlyAccountError(error),
             }
         }
-    })
+    }))
 }

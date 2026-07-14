@@ -1,60 +1,14 @@
 import { eq, or, sql } from 'drizzle-orm'
-import * as crypto from 'crypto'
 import { getDatabase, schema } from '../database'
 import type { Account, NewAccount } from '../database/schema'
 import { profileService } from './ProfileService'
 import { fingerprintService, BrowserFingerprint } from './FingerprintService'
-import { accountWarmupService } from './AccountWarmupService'
 import { browserService } from '../automation/BrowserService'
 import { googleAuthHandler } from '../automation/GoogleAuthHandler'
 import { app } from 'electron'
 import * as path from 'path'
-
-// Inline TOTP implementation to avoid external dependency issues
-function generateTOTP(secret: string): string {
-    try {
-        // Decode base32 secret
-        const base32chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
-        const cleanSecret = secret.replace(/\s/g, '').toUpperCase()
-        let bits = ''
-        for (const char of cleanSecret) {
-            const val = base32chars.indexOf(char)
-            if (val === -1) continue
-            bits += val.toString(2).padStart(5, '0')
-        }
-        const bytes = []
-        for (let i = 0; i < bits.length - 7; i += 8) {
-            bytes.push(parseInt(bits.substr(i, 8), 2))
-        }
-        const key = Buffer.from(bytes)
-
-        // Get current time step
-        const epoch = Math.floor(Date.now() / 1000)
-        const timeStep = Math.floor(epoch / 30)
-
-        // Create time buffer
-        const timeBuffer = Buffer.alloc(8)
-        timeBuffer.writeBigUInt64BE(BigInt(timeStep))
-
-        // HMAC-SHA1
-        const hmac = crypto.createHmac('sha1', key)
-        hmac.update(timeBuffer)
-        const hash = hmac.digest()
-
-        // Dynamic truncation
-        const offset = hash[hash.length - 1] & 0x0f
-        const binary = ((hash[offset] & 0x7f) << 24) |
-            ((hash[offset + 1] & 0xff) << 16) |
-            ((hash[offset + 2] & 0xff) << 8) |
-            (hash[offset + 3] & 0xff)
-
-        const otp = binary % 1000000
-        return otp.toString().padStart(6, '0')
-    } catch (error) {
-        console.error('TOTP generation failed:', error)
-        return ''
-    }
-}
+import { secretVault } from './SecretVault'
+import type { PublicAccount } from '../../shared/account-contracts'
 
 export interface AccountWithProfile extends Account {
     fingerprint?: BrowserFingerprint
@@ -73,6 +27,12 @@ export interface FullAccountImport {
     twoFactorSecret?: string
 }
 
+/** Writable secret fields that must be sealed before DB insert/update. */
+type SecretWriteFields = {
+    password?: string | null
+    twoFactorSecret?: string | null
+}
+
 export class AccountService {
     // Normalize short email like "user123" -> "user123@gmail.com" before persist (single source for add + import)
     private normalizeEmail(email: string | null | undefined): string | null | undefined {
@@ -82,10 +42,118 @@ export class AccountService {
         return t.includes('@') ? t : `${t}@gmail.com`
     }
 
+    /**
+     * Strip secrets for renderer IPC. Never includes password / twoFactorSecret values.
+     */
+    toPublicAccount(account: Account): PublicAccount {
+        const hasPassword = Boolean(account.password && account.password.trim())
+        const hasTwoFactorSecret = Boolean(account.twoFactorSecret && account.twoFactorSecret.trim())
+
+        return {
+            id: account.id,
+            email: account.email,
+            recoveryEmail: account.recoveryEmail,
+            recoveryPhone: account.recoveryPhone,
+            loginType: account.loginType,
+            profilePath: account.profilePath,
+            fingerprintId: account.fingerprintId,
+            status: account.status,
+            lastUsed: account.lastUsed,
+            lastCheckAt: account.lastCheckAt,
+            totalReviews: account.totalReviews,
+            createdAt: account.createdAt,
+            hasPassword,
+            hasTwoFactorSecret,
+            firstReviewDate: account.firstReviewDate,
+            lastReviewDate: account.lastReviewDate,
+            warmupLevel: account.warmupLevel,
+            reputationScore: account.reputationScore,
+            warmupSessions: account.warmupSessions,
+            lastWarmupAt: account.lastWarmupAt,
+            nextWarmupAt: account.nextWarmupAt,
+        }
+    }
+
+    /** Seal password / TOTP for at-rest storage. Blank password is omitted (no overwrite). */
+    private sealSecretsForWrite<T extends SecretWriteFields>(data: T): T {
+        const next: T = { ...data }
+
+        if ('password' in next && next.password !== undefined) {
+            if (typeof next.password === 'string' && next.password.trim() === '') {
+                delete (next as SecretWriteFields).password
+            } else if (typeof next.password === 'string') {
+                next.password = secretVault.seal(next.password)
+            } else if (next.password === null) {
+                delete (next as SecretWriteFields).password
+            }
+        }
+
+        if ('twoFactorSecret' in next && next.twoFactorSecret !== undefined) {
+            if (next.twoFactorSecret === null) {
+                next.twoFactorSecret = null
+            } else if (typeof next.twoFactorSecret === 'string' && next.twoFactorSecret.trim() === '') {
+                // Blank TOTP on update = leave unchanged
+                delete (next as SecretWriteFields).twoFactorSecret
+            } else if (typeof next.twoFactorSecret === 'string') {
+                next.twoFactorSecret = secretVault.seal(next.twoFactorSecret)
+            }
+        }
+
+        return next
+    }
+
+    /**
+     * Decrypt secrets for main-process use and lazily re-encrypt legacy plaintext rows.
+     */
+    private hydrateAccount(account: Account): Account {
+        const passwordPlain = secretVault.decrypt(account.password)
+        const totpStored = account.twoFactorSecret
+        const totpPlain = totpStored != null && totpStored !== ''
+            ? secretVault.decrypt(totpStored)
+            : null
+
+        this.lazyMigrateSecrets(account.id, account.password, totpStored)
+
+        return {
+            ...account,
+            password: passwordPlain,
+            twoFactorSecret: totpPlain,
+        }
+    }
+
+    /** Persist encrypted form when encryption becomes available (legacy plaintext rows). */
+    private lazyMigrateSecrets(
+        accountId: number,
+        passwordStored: string,
+        totpStored: string | null | undefined
+    ): void {
+        const pwdMig = secretVault.migrateIfNeeded(passwordStored)
+        const totpMig = totpStored != null && totpStored !== ''
+            ? secretVault.migrateIfNeeded(totpStored)
+            : { value: totpStored ?? null, migrated: false }
+
+        if (!pwdMig.migrated && !totpMig.migrated) return
+
+        try {
+            const patch: Partial<Account> = {}
+            if (pwdMig.migrated) patch.password = pwdMig.value
+            if (totpMig.migrated) patch.twoFactorSecret = totpMig.value as string
+
+            const db = getDatabase()
+            db.update(schema.accounts)
+                .set(patch)
+                .where(eq(schema.accounts.id, accountId))
+                .run()
+            console.log(`[AccountService] Migrated secrets to enc:v1 for account id=${accountId}`)
+        } catch (err) {
+            console.error('[AccountService] Secret migration failed (non-fatal):', err)
+        }
+    }
+
     // Heal profile path in case DB was copied from another computer
     private healProfilePath(account: Account): Account {
         if (!account.profilePath) return account
-        
+
         try {
             const userDataPath = app.getPath('userData')
             // If the absolute path doesn't start with the current user's AppData/Roaming/... directory
@@ -97,35 +165,51 @@ export class AccountService {
                     isTrafficProfile ? 'traffic_profiles' : 'profiles',
                     basename
                 )
-                
+
                 // Update the memory object and database
                 account.profilePath = expectedPath
                 const db = getDatabase()
                 db.update(schema.accounts)
-                  .set({ profilePath: expectedPath })
-                  .where(eq(schema.accounts.id, account.id))
-                  .run()
+                    .set({ profilePath: expectedPath })
+                    .where(eq(schema.accounts.id, account.id))
+                    .run()
                 console.log(`[AccountService] Self-healed profile path for ${account.email}`)
             }
         } catch (err) {
             console.error('[AccountService] Failed to heal profile path:', err)
         }
-        
+
         return account
     }
 
-    // Get all accounts
+    private processRow(account: Account): Account {
+        return this.hydrateAccount(this.healProfilePath(account))
+    }
+
+    // Get all accounts (main process — secrets decrypted for automation)
     async getAll(): Promise<Account[]> {
         const db = getDatabase()
         const accounts = db.select().from(schema.accounts).all()
-        return accounts.map(a => this.healProfilePath(a))
+        return accounts.map(a => this.processRow(a))
     }
 
-    // Get account by ID
+    /** Public DTO list for IPC (no password / TOTP values). */
+    async getAllPublic(): Promise<PublicAccount[]> {
+        const accounts = await this.getAll()
+        return accounts.map(a => this.toPublicAccount(a))
+    }
+
+    // Get account by ID (main process — secrets decrypted for login/automation)
     async getById(id: number): Promise<Account | undefined> {
         const db = getDatabase()
         const results = db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).all()
-        return results[0] ? this.healProfilePath(results[0]) : undefined
+        return results[0] ? this.processRow(results[0]) : undefined
+    }
+
+    /** Public DTO for IPC. */
+    async getByIdPublic(id: number): Promise<PublicAccount | undefined> {
+        const account = await this.getById(id)
+        return account ? this.toPublicAccount(account) : undefined
     }
 
     // Get active accounts (includes pending for testing - accounts that haven't been banned)
@@ -141,7 +225,7 @@ export class AccountService {
                 )
             )
             .all()
-        return accounts.map(a => this.healProfilePath(a))
+        return accounts.map(a => this.processRow(a))
     }
 
     async getActiveCount(): Promise<number> {
@@ -183,26 +267,42 @@ export class AccountService {
         return result
     }
 
-    // Create new account (supports loginType, twoFactorSecret)
+    // Create new account (supports loginType, twoFactorSecret) — secrets sealed at rest
     async create(data: NewAccount): Promise<Account> {
         const db = getDatabase()
-        const toInsert = { ...data, email: this.normalizeEmail(data.email) as any }
+        const email = (this.normalizeEmail(data.email) || data.email) as string
+        const sealedPassword = secretVault.seal(data.password)
+        const sealedTotp = data.twoFactorSecret
+            ? secretVault.seal(data.twoFactorSecret)
+            : null
+
         const result = db.insert(schema.accounts).values({
-            ...toInsert,
+            ...data,
+            email,
+            password: sealedPassword,
+            twoFactorSecret: sealedTotp,
             createdAt: new Date(),
         }).returning().get()
-        return result
+
+        return this.processRow(result)
     }
 
-    // Update account
+    // Update account — blank password does not overwrite; secrets sealed when provided
     async update(id: number, data: Partial<Account>): Promise<Account | undefined> {
         const db = getDatabase()
+        const sealed = this.sealSecretsForWrite(data)
+
+        if (Object.keys(sealed).length === 0) {
+            return this.getById(id)
+        }
+
         const result = db.update(schema.accounts)
-            .set(data)
+            .set(sealed)
             .where(eq(schema.accounts.id, id))
             .returning()
             .get()
-        return result
+
+        return result ? this.processRow(result) : undefined
     }
 
     // Delete account
@@ -282,7 +382,14 @@ export class AccountService {
     }
 
     // Import multiple accounts from CSV data (supports 2FA, loginType, recovery)
-    async importFromCSV(accounts: Array<{ email: string; password: string; recoveryEmail?: string; recoveryPhone?: string; twoFactorSecret?: string; loginType?: 'auto' | 'manual' }>): Promise<number> {
+    async importFromCSV(accounts: Array<{
+        email: string
+        password: string
+        recoveryEmail?: string
+        recoveryPhone?: string
+        twoFactorSecret?: string
+        loginType?: 'auto' | 'manual'
+    }>): Promise<number> {
         const db = getDatabase()
         let imported = 0
 
@@ -291,10 +398,12 @@ export class AccountService {
                 const email = this.normalizeEmail(acc.email) || acc.email
                 db.insert(schema.accounts).values({
                     email,
-                    password: acc.password,
+                    password: secretVault.seal(acc.password),
                     recoveryEmail: acc.recoveryEmail || null,
                     recoveryPhone: acc.recoveryPhone || null,
-                    twoFactorSecret: acc.twoFactorSecret || null,
+                    twoFactorSecret: acc.twoFactorSecret
+                        ? secretVault.seal(acc.twoFactorSecret)
+                        : null,
                     loginType: (acc.loginType === 'manual' ? 'manual' : 'auto'),
                     status: 'pending',
                     totalReviews: 0,
@@ -302,8 +411,11 @@ export class AccountService {
                 }).run()
                 imported++
             } catch (error) {
-                // Skip duplicates
-                console.log(`Skipped duplicate: ${acc.email}`)
+                if (error instanceof Error && /unique/i.test(error.message)) {
+                    console.log(`Skipped duplicate account import for email ending ${acc.email.slice(-8)}`)
+                    continue
+                }
+                throw error
             }
         }
 
@@ -327,11 +439,13 @@ export class AccountService {
                 const fingerprint = fingerprintService.generate()
 
                 const result = db.insert(schema.accounts).values({
-                    email: acc.email,
-                    password: acc.password,
+                    email: this.normalizeEmail(acc.email) || acc.email,
+                    password: secretVault.seal(acc.password),
                     recoveryEmail: acc.recoveryEmail || null,
                     recoveryPhone: acc.recoveryPhone || null,
-                    twoFactorSecret: acc.twoFactorSecret || null,
+                    twoFactorSecret: acc.twoFactorSecret
+                        ? secretVault.seal(acc.twoFactorSecret)
+                        : null,
                     fingerprintId: fingerprint.id,
                     status: 'pending',
                     totalReviews: 0,
@@ -415,15 +529,17 @@ export class AccountService {
                 if (contextId !== null) {
                     await googleAuthHandler.saveSession(contextId, profilePath)
                     try {
-                        const { browserService } = await import('../automation/BrowserService')
-                        const ctx = browserService.getContext(contextId)
+                        const { browserService: bs } = await import('../automation/BrowserService')
+                        const ctx = bs.getContext(contextId)
                         if (ctx) {
                             const ck = await ctx.cookies().catch(() => [])
                             if (ck && ck.length > 0) {
                                 await this.saveCookies(id, JSON.stringify(ck))
                             }
                         }
-                    } catch {}
+                    } catch {
+                        // ignore cookie save errors
+                    }
                 }
 
                 return { alive: true }
@@ -432,7 +548,6 @@ export class AccountService {
                 if (loginResult.error?.includes('2FA') || loginResult.error?.includes('2-Step')) {
                     await this.updateStatus(id, 'pending')
                     if (account.twoFactorSecret) {
-                        const totpCode = this.generateTOTPCode(account.twoFactorSecret)
                         return { alive: false, needs2FA: true, error: '2FA required but not yet implemented' }
                     }
                     return { alive: false, needs2FA: true, error: '2FA required but no secret stored' }
@@ -496,11 +611,6 @@ export class AccountService {
         }
 
         return { checked: pending.length, alive, dead }
-    }
-
-    // Generate TOTP code from secret (using inline implementation)
-    private generateTOTPCode(secret: string): string {
-        return generateTOTP(secret)
     }
 
     // Get statistics

@@ -9,7 +9,10 @@ import * as schema from '../database/schema'
 import { eq } from 'drizzle-orm'
 import { net } from 'electron'
 import { hfModelService } from './HFModelService'
-import { loadSettings as loadAppSettings } from '../ipc/settings'
+import {
+    loadSettings as loadAppSettings,
+    saveSetting as saveAppSetting,
+} from '../ipc/settings'
 
 // Groq API Configuration
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
@@ -36,18 +39,42 @@ class AIService {
         this.loadSettings()
     }
 
-    /**
-     * Load API key and model from database settings
-     */
+    /** Load encrypted app settings and lazily migrate the legacy SQLite key. */
     private async loadSettings(): Promise<void> {
         try {
+            const appSettings = loadAppSettings()
+            const configuredKey = typeof appSettings.groqApiKey === 'string'
+                ? appSettings.groqApiKey.trim()
+                : ''
+            const configuredModel = typeof appSettings.groqModel === 'string'
+                ? appSettings.groqModel.trim()
+                : ''
+
+            this.apiKey = configuredKey || null
+            if (configuredModel) {
+                this.aiModel = configuredModel
+            }
+
+            if (this.apiKey) return
+
             const db = getDatabase()
             const keyResult = db.select().from(schema.settings).where(eq(schema.settings.key, 'groqApiKey')).get()
-            if (keyResult) {
-                this.apiKey = keyResult.value
+            const legacyKey = keyResult?.value?.trim() || ''
+            if (!legacyKey) return
+
+            this.apiKey = legacyKey
+            try {
+                saveAppSetting('groqApiKey', legacyKey)
+                db.update(schema.settings)
+                    .set({ value: '', updatedAt: new Date() })
+                    .where(eq(schema.settings.key, 'groqApiKey'))
+                    .run()
+            } catch {
+                // Keep the legacy key usable in memory and retry migration later.
             }
+
             const modelResult = db.select().from(schema.settings).where(eq(schema.settings.key, 'groqModel')).get()
-            if (modelResult && modelResult.value) {
+            if (!configuredModel && modelResult && modelResult.value) {
                 this.aiModel = modelResult.value
             }
         } catch (error) {
@@ -60,33 +87,38 @@ class AIService {
      */
     async setApiKey(key: string): Promise<{ success: boolean; error?: string }> {
         try {
-            const db = getDatabase()
+            const normalizedKey = key.trim()
+            if (!normalizedKey) {
+                saveAppSetting('groqApiKey', '')
+                this.apiKey = null
+                this.clearLegacyApiKey()
+                return { success: true }
+            }
 
             // Test the key first
-            const testResult = await this.testApiKey(key)
+            const testResult = await this.testApiKey(normalizedKey)
             if (!testResult.success) {
                 return { success: false, error: testResult.error }
             }
 
-            // Save to database
-            const existing = db.select().from(schema.settings).where(eq(schema.settings.key, 'groqApiKey')).get()
-
-            if (existing) {
-                db.update(schema.settings)
-                    .set({ value: key, updatedAt: new Date() })
-                    .where(eq(schema.settings.key, 'groqApiKey'))
-                    .run()
-            } else {
-                db.insert(schema.settings).values({
-                    key: 'groqApiKey',
-                    value: key,
-                }).run()
-            }
-
-            this.apiKey = key
+            saveAppSetting('groqApiKey', normalizedKey)
+            this.apiKey = normalizedKey
+            this.clearLegacyApiKey()
             return { success: true }
         } catch (error: any) {
             return { success: false, error: error.message }
+        }
+    }
+
+    private clearLegacyApiKey(): void {
+        try {
+            const db = getDatabase()
+            db.update(schema.settings)
+                .set({ value: '', updatedAt: new Date() })
+                .where(eq(schema.settings.key, 'groqApiKey'))
+                .run()
+        } catch {
+            // Encrypted settings remain the source of truth.
         }
     }
 
@@ -117,9 +149,7 @@ class AIService {
      * Get API key status
      */
     async getApiKeyStatus(): Promise<{ hasKey: boolean; isValid?: boolean }> {
-        if (!this.apiKey) {
-            await this.loadSettings()
-        }
+        await this.loadSettings()
 
         if (!this.apiKey) {
             return { hasKey: false }
@@ -137,12 +167,10 @@ class AIService {
         category?: string,
         options: GenerateReviewOptions = {}
     ): Promise<{ success: boolean; review?: GeneratedReview; error?: string }> {
+        await this.loadSettings()
         if (!this.apiKey) {
-            await this.loadSettings()
-            if (!this.apiKey) {
-                // Fallback to local HF model if enabled
-                return this.generateReviewLocal(locationName, category, options)
-            }
+            // Fallback to local HF model if enabled
+            return this.generateReviewLocal(locationName, category, options)
         }
 
         const {
@@ -285,11 +313,9 @@ Only respond with the review content, no explanations.`
         text: string,
         language: 'vi' | 'en' = 'vi'
     ): Promise<{ success: boolean; improved?: string; error?: string }> {
+        await this.loadSettings()
         if (!this.apiKey) {
-            await this.loadSettings()
-            if (!this.apiKey) {
-                return { success: false, error: 'API key not configured' }
-            }
+            return { success: false, error: 'API key not configured' }
         }
 
         const prompt = language === 'vi'

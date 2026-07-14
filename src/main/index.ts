@@ -5,6 +5,7 @@ import { dataRootService } from './services/DataRootService'
 import { soakTestService } from './services/SoakTestService'
 import { automationController } from './automation/AutomationController'
 import { trafficBoostEngine } from './automation/TrafficBoostEngine'
+import { schedulerService } from './services/SchedulerService'
 
 // Keep renderer stable when the app regains focus on Windows.
 // Browser fidelity is handled by the launched Chrome contexts, not by this window.
@@ -182,7 +183,11 @@ function createWindow(): void {
 
     mainWindow.on('closed', () => {
         mainWindow = null
+        schedulerService.setMainWindow(null)
     })
+
+    // Keep scheduler notifications bound to the live BrowserWindow.
+    schedulerService.setMainWindow(mainWindow)
 }
 
 // Initialize app
@@ -204,6 +209,20 @@ app.whenReady().then(async () => {
         initDatabase()
         logBootstrap('Database initialized successfully')
 
+        // Durable review queue crash recovery (job_queue load + zombie campaign reconcile)
+        // Does not auto-start browsers; resume is deterministic via AutomationController.
+        try {
+            const { reviewRecoveryService } = await import('./automation/ReviewRecoveryService')
+            const recovery = await reviewRecoveryService.recoverOnBoot()
+            logBootstrap(
+                `[ReviewRecovery] pendingJobs=${recovery.totalPendingJobs}, ` +
+                `zombies=${recovery.zombieCampaigns.length}, ` +
+                `resumeCandidates=${recovery.pendingCampaignIds.join(',') || 'none'}`
+            )
+        } catch (recoveryError) {
+            logBootstrap('[ReviewRecovery] Boot recovery failed (non-fatal)', recoveryError)
+        }
+
         const { registerAllHandlers } = await import('./ipc')
         // Register IPC handlers
         logBootstrap('Registering IPC handlers...')
@@ -218,6 +237,25 @@ app.whenReady().then(async () => {
         // Create window
         createWindow()
         logBootstrap('Main window created')
+
+        // Wire scheduler → real automation via DI (no circular import in SchedulerService).
+        // start/resume only; schedule lastRunAt/nextRunAt advance only on runner success.
+        try {
+            const { reviewRecoveryService } = await import('./automation/ReviewRecoveryService')
+            schedulerService.setMainWindow(mainWindow)
+            schedulerService.setAutomationRunner({
+                startCampaign: (campaignId) => automationController.startCampaign(campaignId),
+                resumeCampaign: (campaignId) => automationController.resumeCampaign(campaignId),
+                hasPendingDurableJobs: async (campaignId) => {
+                    const plan = await reviewRecoveryService.getResumePlan(campaignId)
+                    return plan.canResume
+                },
+            })
+            schedulerService.start()
+            logBootstrap('Scheduler service started (automation runner wired)')
+        } catch (schedulerError) {
+            logBootstrap('Scheduler service failed to start (non-fatal)', schedulerError)
+        }
     } catch (error) {
         logBootstrap('Failed to initialize app', error)
         dialog.showErrorBox(
@@ -258,6 +296,12 @@ app.on('window-all-closed', () => {
         soakTestService.stop('app_shutdown')
     } catch (error) {
         logBootstrap('Failed to stop soak test during shutdown', error)
+    }
+
+    try {
+        schedulerService.stop()
+    } catch (error) {
+        logBootstrap('Failed to stop scheduler during shutdown', error)
     }
 
     // Close database on app quit

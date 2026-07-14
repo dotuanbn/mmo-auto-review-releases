@@ -36,6 +36,13 @@ export const accounts = sqliteTable('accounts', {
     warmupLevel: integer('warmup_level').default(0).notNull(), // 0-100
     reputationScore: integer('reputation_score').default(0).notNull(), // internal score (can be scaled)
     warmupHistory: text('warmup_history'), // JSON blob of simulated safe activities
+
+    // Phase 2 extended - per-account review style + warmup schedule
+    reviewStyleProfile: text('review_style_profile'), // JSON style profile for content variation
+    reviewStyleSeed: text('review_style_seed'), // stable seed for style generation
+    lastWarmupAt: integer('last_warmup_at', { mode: 'timestamp' }),
+    nextWarmupAt: integer('next_warmup_at', { mode: 'timestamp' }),
+    warmupSessions: integer('warmup_sessions').default(0).notNull(),
 })
 
 // Proxies table - Proxy servers for rotation
@@ -195,6 +202,10 @@ export const trafficCampaigns = sqliteTable('traffic_campaigns', {
     enabledActions: text('enabled_actions'), // JSON array of enabled action types, null = all
     targetKpi: text('target_kpi'),
     aiAutoControl: integer('ai_auto_control', { mode: 'boolean' }).default(false).notNull(), // true = AI autonomously controls all SEO actions
+    // Web SEO quality gates (dwell window + organic requirement)
+    webSeoMinDwellSeconds: integer('web_seo_min_dwell_seconds').default(45).notNull(),
+    webSeoMaxDwellSeconds: integer('web_seo_max_dwell_seconds').default(90).notNull(),
+    webSeoRequireOrganic: integer('web_seo_require_organic', { mode: 'boolean' }).default(false).notNull(),
     status: text('status', { enum: ['pending', 'running', 'paused', 'completed', 'stopped'] }).default('pending').notNull(),
     totalVisits: integer('total_visits').default(0).notNull(),
     completedVisits: integer('completed_visits').default(0).notNull(),
@@ -216,6 +227,13 @@ export const trafficLogs = sqliteTable('traffic_logs', {
     round: integer('round').default(1).notNull(), // Which loop round
     status: text('status', { enum: ['success', 'failed'] }).notNull(),
     errorMessage: text('error_message'),
+    // Web SEO quality / discovery metadata
+    discoverySource: text('discovery_source', {
+        enum: ['organic', 'direct_fallback', 'captcha_cooldown', 'unreachable'],
+    }),
+    qualityScore: integer('quality_score').default(0).notNull(),
+    countable: integer('countable', { mode: 'boolean' }).default(false).notNull(),
+    targetHost: text('target_host'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
 })
 
@@ -269,6 +287,33 @@ export type NewTrafficLog = typeof trafficLogs.$inferInsert
 export type AgentKnowledge = typeof agentKnowledge.$inferSelect
 export type NewAgentKnowledge = typeof agentKnowledge.$inferInsert
 
+// Durable automation job queue (survives app crash/restart)
+// Status 'running' = in-progress; on boot, running rows are safely requeued as pending.
+export const jobQueueEntries = sqliteTable('job_queue', {
+    id: text('id').primaryKey(),
+    campaignId: integer('campaign_id').references(() => campaigns.id),
+    type: text('type', { enum: ['review', 'traffic'] }).notNull(),
+    accountId: integer('account_id').notNull(),
+    locationId: integer('location_id').notNull(),
+    reviewText: text('review_text'),
+    rating: integer('rating'),
+    targetViews: integer('target_views'),
+    priority: integer('priority').default(0).notNull(),
+    status: text('status', {
+        enum: ['pending', 'running', 'done', 'failed', 'cancelled'],
+    }).default('pending').notNull(),
+    retryCount: integer('retry_count').default(0).notNull(),
+    maxRetries: integer('max_retries').default(3).notNull(),
+    result: text('result'),
+    error: text('error'),
+    createdAt: text('created_at').notNull(),
+    startedAt: text('started_at'),
+    completedAt: text('completed_at'),
+})
+
+export type JobQueueEntry = typeof jobQueueEntries.$inferSelect
+export type NewJobQueueEntry = typeof jobQueueEntries.$inferInsert
+
 // Automation Scripts table - Persistent script storage
 export const automationScripts = sqliteTable('automation_scripts', {
     id: integer('id').primaryKey({ autoIncrement: true }),
@@ -303,3 +348,28 @@ export const aiMetrics = sqliteTable('ai_metrics', {
 
 export type AIMetricRow = typeof aiMetrics.$inferSelect
 export type NewAIMetricRow = typeof aiMetrics.$inferInsert
+
+// CAPTCHA solve metrics — durable attempt log (no secrets/tokens/API keys)
+export const captchaMetrics = sqliteTable('captcha_metrics', {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    captchaType: text('captcha_type').notNull(), // recaptchav2 | recaptchav3 | hcaptcha | turnstile | unknown
+    provider: text('provider').notNull(), // none | 2captcha | capsolver | local-ai | unknown
+    success: integer('success', { mode: 'boolean' }).notNull(),
+    durationMs: integer('duration_ms').notNull(),
+    retryCount: integer('retry_count').default(0).notNull(),
+    errorCode: text('error_code'), // short sanitized code only — never secrets
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+})
+
+export type CaptchaMetricRow = typeof captchaMetrics.$inferSelect
+export type NewCaptchaMetricRow = typeof captchaMetrics.$inferInsert
+
+// Versioned schema migrations ledger (idempotent runner tracks applied versions)
+export const schemaMigrations = sqliteTable('schema_migrations', {
+    version: integer('version').primaryKey(),
+    name: text('name').notNull(),
+    appliedAt: integer('applied_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+})
+
+export type SchemaMigration = typeof schemaMigrations.$inferSelect
+export type NewSchemaMigration = typeof schemaMigrations.$inferInsert
