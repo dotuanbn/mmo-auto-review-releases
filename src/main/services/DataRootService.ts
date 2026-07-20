@@ -1,5 +1,5 @@
 import { app } from 'electron'
-import { cpSync, existsSync, mkdirSync, readdirSync } from 'fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, realpathSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, isAbsolute, join, relative, resolve } from 'path'
 
@@ -18,13 +18,23 @@ export function resolveSmokeDataRootOverride(
         throw new Error('MMO_SMOKE_MODE requires SMOKE_USER_DATA_DIR')
     }
 
-    const allowedRoot = resolve(tempPath, 'mmo-packaged-smoke')
+    const getRealPath = (p: string): string => {
+        try {
+            return realpathSync(p)
+        } catch {
+            return resolve(p)
+        }
+    }
+
+    const realTemp = getRealPath(tempPath)
+    const allowedRoot = resolve(realTemp, 'mmo-packaged-smoke')
     const candidate = resolve(requested)
-    const rel = relative(allowedRoot, candidate)
+    const realCandidate = getRealPath(candidate)
+    const rel = relative(allowedRoot, realCandidate)
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
         throw new Error('Smoke userData must be under the OS temp mmo-packaged-smoke root')
     }
-    return candidate
+    return realCandidate
 }
 
 function nowSuffix(): string {
