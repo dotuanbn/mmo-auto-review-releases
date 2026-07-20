@@ -30,8 +30,12 @@ export function resolveSmokeDataRootOverride(
     const allowedRoot = resolve(realTemp, 'mmo-packaged-smoke')
     const candidate = resolve(requested)
     const realCandidate = getRealPath(candidate)
-    const rel = relative(allowedRoot, realCandidate)
-    if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+
+    const parentPath = allowedRoot.toLowerCase().replace(/\\/g, '/')
+    const childPath = realCandidate.toLowerCase().replace(/\\/g, '/')
+    const isContained = childPath === parentPath || childPath.startsWith(parentPath + '/')
+
+    if (!isContained) {
         throw new Error('Smoke userData must be under the OS temp mmo-packaged-smoke root')
     }
     return realCandidate
