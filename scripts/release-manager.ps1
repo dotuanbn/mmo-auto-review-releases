@@ -181,38 +181,119 @@ function Run-Action {
 
             Ensure-GitHubAuth
 
-            $branch = git rev-parse --abbrev-ref HEAD
-            git add package.json
+            # Xac dinh nhanh phat hanh. RELEASE_BRANCH = 'main' (mac dinh tren GitHub, noi tag phai tro vao). WORK_BRANCH = nhanh hien tai (thuong 'master')
+            $RELEASE_BRANCH = 'main'
+            $WORK_BRANCH = (& git rev-parse --abbrev-ref HEAD).Trim()
+            if ([string]::IsNullOrWhiteSpace($WORK_BRANCH) -or $WORK_BRANCH -eq 'HEAD') {
+                throw 'Khong xac dinh duoc nhanh hien tai (WORK_BRANCH).'
+            }
+            Write-Host "WORK_BRANCH: $WORK_BRANCH | RELEASE_BRANCH: $RELEASE_BRANCH (DAM BAO tag luon tren main)" -ForegroundColor DarkGray
+
+            # 2. Tren WORK_BRANCH: git add package.json (va file lien quan version), commit, push
+            & git add package.json
             & git commit -m "chore(release): v$newVer"
-            & git tag "v$newVer"
-
-            Write-Host 'Kiem tra quyen push (gh auth + ls-remote origin)...' -ForegroundColor Yellow
-            & git ls-remote --exit-code origin HEAD 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) {
-                Write-Host 'Loi mang hoac khong co quyen push toi origin.' -ForegroundColor Red
-                Write-Host "Da bump + commit + tao tag local v$newVer. De xoa tag local: git tag -d v$newVer ; git reset --soft HEAD~1 (neu muon undo commit)" -ForegroundColor Yellow
-                throw 'Khong the push. Dang nhap gh roi chay lai Option 1.'
+                Write-Host 'Khong co commit moi (co the da commit truoc) hoac loi commit. Tiep tuc...' -ForegroundColor Yellow
+            }
+            & git push origin $WORK_BRANCH
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "PUSH $WORK_BRANCH THAT BAI." -ForegroundColor Red
+                throw "Khong the push nhanh lam viec $WORK_BRANCH sau commit. Kiem tra auth/mang."
             }
 
-            & git push origin $branch --tags
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host ''
-                Write-Host 'PUSH THAT BAI.' -ForegroundColor Red
-                Write-Host "Da bump version + commit + tag local: v$newVer (branch: $branch)" -ForegroundColor Yellow
-                Write-Host "De xoa tag local (neu can): git tag -d v$newVer" -ForegroundColor Yellow
-                Write-Host 'Sau khi chay "gh auth login" + "gh auth setup-git", chay lai Option 1 (hoac thu: git push origin $branch --tags).' -ForegroundColor Yellow
-                throw "Push that bai sau khi da tao tag local v$newVer."
+            if ($WORK_BRANCH -eq $RELEASE_BRANCH) {
+                Write-Host 'Dang dung tren main. Bo qua buoc merge (chi commit + tag + push main).' -ForegroundColor Yellow
+            } else {
+                # 3. Cap nhat RELEASE_BRANCH (main)
+                & git fetch origin
+                if ($LASTEXITCODE -ne 0) { throw 'git fetch origin that bai.' }
+
+                Write-Host "Checkout $RELEASE_BRANCH (se dung neu co thay doi chua commit)..." -ForegroundColor Yellow
+                & git checkout $RELEASE_BRANCH 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "LOI: Khong the checkout $RELEASE_BRANCH. Co thay doi chua luu tren nhanh do." -ForegroundColor Red
+                    Write-Host 'Hay commit hoac stash thay doi tren main truoc, sau do chay lai Option 1.' -ForegroundColor Yellow
+                    throw "Checkout $RELEASE_BRANCH that bai. Dung lai de bao toan trang thai."
+                }
+
+                # Cap nhat local main = origin/main truoc (de dam bao base sach)
+                & git merge --ff-only origin/$RELEASE_BRANCH 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "Khong the --ff-only. Dang reset local $RELEASE_BRANCH khop origin/$RELEASE_BRANCH ..." -ForegroundColor Yellow
+                    & git reset --hard origin/$RELEASE_BRANCH
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Khong the cap nhat local $RELEASE_BRANCH de khop origin."
+                    }
+                }
+
+                # Merge WORK_BRANCH vao main (dua version commit vao main)
+                $mergeMsg = "Merge branch '$WORK_BRANCH' (release v$newVer)"
+                & git merge $WORK_BRANCH -m $mergeMsg
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host ''
+                    Write-Host '!!! CONFLICT khi merge !!!' -ForegroundColor Red
+                    Write-Host 'DUNG LAI. KHONG tu y bo conflict hay tiep tuc.' -ForegroundColor Yellow
+                    Write-Host 'Huong dan giai quyet:' -ForegroundColor Yellow
+                    Write-Host "  1. Sua conflict trong file."
+                    Write-Host "  2. git add <cac file da fix>."
+                    Write-Host "  3. git commit -m `"$mergeMsg`""
+                    Write-Host "  4. git push origin $RELEASE_BRANCH"
+                    Write-Host "  5. git tag v$newVer (hoac git tag -f v$newVer neu can ghi de)"
+                    Write-Host "  6. git push origin v$newVer"
+                    Write-Host "  7. git checkout $WORK_BRANCH"
+                    Write-Host 'Script dung tai day. Tag se duoc tao tren commit cua MAIN sau khi resolve.'
+                    throw "Merge conflict giua $WORK_BRANCH va $RELEASE_BRANCH. Giai quyet thu cong."
+                }
+
+                & git push origin $RELEASE_BRANCH
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "PUSH $RELEASE_BRANCH THAT BAI sau merge." -ForegroundColor Red
+                    throw "Da merge thanh cong nhung push that bai. Hay tu push: git push origin $RELEASE_BRANCH"
+                }
             }
 
+            # 4. Tao tag TREN main (sau khi main da co version va merge). Dam bao tag luon nam tren nhanh mac dinh.
+            $tagName = "v$newVer"
+            $didForce = $false
+            & git tag $tagName 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "Tag $tagName da ton tai tren local." -ForegroundColor Yellow
+                if (Confirm-YesNo -Message "Ghi de (git tag -f $tagName) va se force push tag de tro vao main HEAD?" -DefaultYes:$false) {
+                    & git tag -f $tagName
+                    $didForce = $true
+                } else {
+                    Write-Host 'Khong ghi de tag. Se thu push tag binh thuong (co the that bai neu tro sai commit).' -ForegroundColor Yellow
+                }
+            }
+
+            # Push tag (force neu da move)
+            $pushTagArgs = @('push', 'origin', $tagName)
+            if ($didForce) { $pushTagArgs += '--force' }
+            & git @pushTagArgs
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host 'PUSH TAG THAT BAI.' -ForegroundColor Red
+                Write-Host "Tag local $tagName da tao. Thu lai: git push origin $tagName --force" -ForegroundColor Yellow
+                throw "Khong the push tag $tagName."
+            }
+
+            # 5. Quay lai WORK_BRANCH (neu khong phai main)
+            if ($WORK_BRANCH -ne $RELEASE_BRANCH) {
+                & git checkout $WORK_BRANCH 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "CANH BAO: Khong the quay lai $WORK_BRANCH. Hien dang o tren $RELEASE_BRANCH." -ForegroundColor Yellow
+                }
+            }
+
+            # 6. Thong bao hoan tat (tag luon tren main)
             Write-Host ''
             Write-Host '============================================================' -ForegroundColor Green
-            Write-Host "ĐÃ PUSH TAG v$newVer (branch: $branch)" -ForegroundColor Green
-            Write-Host 'GitHub Actions đang build Windows (nsis + portable) + macOS (dmg + zip) và publish.' -ForegroundColor Green
-            Write-Host 'Theo dõi tiến độ: tab Actions (trong repo).' -ForegroundColor Cyan
-            Write-Host 'Release (cả 2 nền tảng + latest.yml / latest-mac.yml cho auto-update) sẽ xuất hiện tại:' -ForegroundColor Cyan
+            Write-Host "DA PUSH main + TAG $tagName (tag tro vao commit cua 'main' - nhanh mac dinh)" -ForegroundColor Green
+            Write-Host 'GitHub Actions dang build Windows (nsis + portable) + macOS (dmg + zip) va publish.' -ForegroundColor Green
+            Write-Host 'Theo doi tien do: tab Actions (trong repo).' -ForegroundColor Cyan
+            Write-Host 'Release (ca 2 nen tang) se xuat hien tai:' -ForegroundColor Cyan
             Write-Host '  https://github.com/dotuanbn/mmo-auto-review-releases/releases' -ForegroundColor White
             Write-Host '============================================================' -ForegroundColor Green
-            Write-Host 'Lưu ý: Bản mac .dmg/.zip CHỈ có từ CI (macOS runner). Bản Windows local (nếu build) chỉ để test ngay.' -ForegroundColor Yellow
+            Write-Host 'Luu y: Ban mac .dmg/.zip CHI co tu CI (macOS runner). Ban Windows local (neu build) chi de test ngay.' -ForegroundColor Yellow
         }
         '2' {
             Ensure-GitHubToken

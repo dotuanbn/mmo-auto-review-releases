@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { useI18n } from '../i18n'
 import {
     Eye,
@@ -43,10 +43,119 @@ import {
     Divider,
     AlertBanner,
 } from '../components/ui/surface'
+import { TrafficAuditPanel } from '../components/traffic'
+import {
+    normalizeWebSeoTargetUrl,
+    parseWebSeoKeywords,
+    resolveWebSeoTarget,
+    type WebSeoErrorCode,
+} from '../../../shared/web-seo-contracts'
+
+/** Dwell window bounds (seconds) — matches IPC schema 10..300 */
+const WEB_SEO_DWELL_MIN_SECONDS = 10
+const WEB_SEO_DWELL_MAX_SECONDS = 300
 
 // ============================================================
 // Types
 // ============================================================
+
+type TrafficMode = 'direct' | 'organic' | 'web_seo' | 'map_search'
+type WebSeoPresetId = 'safe' | 'balanced' | 'fast'
+
+interface CreateCampaignPayload {
+    name: string
+    accountIds: number[]
+    locationIds: number[]
+    threadsCount: number
+    visitsPerLocation: number
+    delayMinSeconds: number
+    delayMaxSeconds: number
+    trafficMode: TrafficMode
+    searchKeywords?: string[]
+    maxMapScroll?: number
+    webSeoMinDwellSeconds?: number
+    webSeoMaxDwellSeconds?: number
+    webSeoRequireOrganic?: boolean
+}
+
+interface WebSeoFieldErrors {
+    websiteUrl?: string
+    keywords?: string
+    dwell?: string
+}
+
+const WEB_SEO_PRESETS: Record<WebSeoPresetId, {
+    threads: number
+    visits: number
+    delayMin: number
+    delayMax: number
+    dwellMin: number
+    dwellMax: number
+}> = {
+    safe: { threads: 1, visits: 5, delayMin: 25, delayMax: 45, dwellMin: 45, dwellMax: 75 },
+    balanced: { threads: 2, visits: 10, delayMin: 15, delayMax: 35, dwellMin: 45, dwellMax: 90 },
+    fast: { threads: 3, visits: 20, delayMin: 10, delayMax: 25, dwellMin: 35, dwellMax: 70 },
+}
+
+function clampDwellSeconds(value: number): number {
+    if (!Number.isFinite(value)) return WEB_SEO_DWELL_MIN_SECONDS
+    return Math.min(WEB_SEO_DWELL_MAX_SECONDS, Math.max(WEB_SEO_DWELL_MIN_SECONDS, Math.floor(value)))
+}
+
+/** ETA includes discovery overhead and does not multiply by accounts. */
+function estimateWebSeoEtaSeconds(
+    visits: number,
+    threads: number,
+    dwellMin: number,
+    dwellMax: number,
+    delayMin: number,
+    delayMax: number,
+): number {
+    const safeVisits = Math.max(0, visits)
+    const safeThreads = Math.max(1, threads)
+    const avgDwell = (dwellMin + dwellMax) / 2
+    const avgDelay = (delayMin + delayMax) / 2
+    const discoveryOverheadSeconds = 35
+    const perVisit = Math.max(0, avgDwell) + Math.max(0, avgDelay) + discoveryOverheadSeconds
+    return Math.ceil((safeVisits / safeThreads) * perVisit)
+}
+
+function formatEtaSeconds(totalSeconds: number): string {
+    const s = Math.max(0, Math.floor(totalSeconds))
+    const hours = Math.floor(s / 3600)
+    const minutes = Math.floor((s % 3600) / 60)
+    const seconds = s % 60
+    if (hours > 0) return `${hours}h ${minutes}m`
+    if (minutes > 0) return `${minutes}m ${seconds}s`
+    return `${seconds}s`
+}
+
+function extractLocationId(loc: unknown): number | null {
+    if (typeof loc === 'number' && Number.isInteger(loc) && loc > 0) return loc
+    if (loc && typeof loc === 'object' && 'id' in loc) {
+        const id = (loc as { id: unknown }).id
+        if (typeof id === 'number' && Number.isInteger(id) && id > 0) return id
+    }
+    return null
+}
+
+function webSeoUrlErrorKey(code: WebSeoErrorCode): string {
+    switch (code) {
+        case 'empty':
+            return 'traffic.webSeoUrlErrorEmpty'
+        case 'protocol':
+            return 'traffic.webSeoUrlErrorProtocol'
+        case 'credentials':
+            return 'traffic.webSeoUrlErrorCredentials'
+        case 'localhost':
+        case 'private':
+        case 'metadata':
+        case 'unsafe_path':
+            return 'traffic.webSeoUrlErrorUnsafe'
+        default:
+            return 'traffic.webSeoUrlErrorInvalid'
+    }
+}
 
 interface Account {
     id: number
@@ -439,6 +548,7 @@ export function Traffic() {
     const statusInterval = useRef<ReturnType<typeof setInterval> | null>(null)
     const lastThreadStateRef = useRef<Record<number, string>>({})
     const wasRunningRef = useRef(false)
+    const autoMonitorRestoredRef = useRef(false)
     const lastHeavyRuntimeFetchAtRef = useRef(0)
     const activeTabRef = useRef<'campaigns' | 'monitor' | 'reports'>('campaigns')
 
@@ -530,7 +640,7 @@ export function Traffic() {
                 const status = await api.runtime.getStatusV2()
                 applyStatus(status)
                 const now = Date.now()
-                const heavyIntervalMs = status?.isRunning ? 5000 : 15000
+                const heavyIntervalMs = (status?.isRunning || status?.isPaused) ? 5000 : 15000
                 if (now - lastHeavyRuntimeFetchAtRef.current >= heavyIntervalMs) {
                     lastHeavyRuntimeFetchAtRef.current = now
                     const [diagnostics, policy, rag, mcp] = await Promise.all([
@@ -634,7 +744,8 @@ export function Traffic() {
     }, [api.runtime, api.trafficBoost, applyStatus])
 
     useEffect(() => {
-        if (liveStatus?.isRunning) {
+        // Keep Monitor active while running OR paused (do not bounce to campaigns on pause)
+        if (liveStatus?.isRunning || liveStatus?.isPaused) {
             wasRunningRef.current = true
             return
         }
@@ -643,18 +754,20 @@ export function Traffic() {
             setActiveTab('campaigns')
             void fetchCampaigns()
         }
-    }, [liveStatus?.isRunning, fetchCampaigns])
+    }, [liveStatus?.isRunning, liveStatus?.isPaused, fetchCampaigns])
 
     // Problem 1: on renderer mount / data load, if active (running/paused) campaign, auto switch to "Giám sát trực tiếp" (monitor tab)
     // Query via IPC (liveStatus + campaigns list) to restore monitoring view; only on initial to avoid stealing user tab switches.
     useEffect(() => {
+        if (loading || autoMonitorRestoredRef.current) return
+        autoMonitorRestoredRef.current = true
         if (activeTabRef.current !== 'campaigns') return
         const hasLiveActive = !!(liveStatus && (liveStatus.isRunning || liveStatus.isPaused))
         const hasDbActive = campaigns.some(c => c.status === 'running' || c.status === 'paused')
         if (hasLiveActive || hasDbActive) {
             setActiveTab('monitor')
         }
-    }, [liveStatus, campaigns]) // runs after initial fetches; tab ref guards re-entrancy for user actions
+    }, [loading, liveStatus, campaigns])
 
     // ============================================================
     // Actions
@@ -692,6 +805,7 @@ export function Traffic() {
     const handleResumeCampaign = async () => {
         try {
             await api.trafficBoost.resume?.()
+            setActiveTab('monitor')
             // engine will set running + monitor listeners will update
         } catch (err) {
             console.error('Failed to resume campaign:', err)
@@ -802,6 +916,7 @@ export function Traffic() {
                     runtimeDiagnostics={runtimeDiagnostics}
                     ragStats={ragStats}
                     mcpHealth={mcpHealth}
+                    auditEnabled={activeTab === 'monitor'}
                     onStop={handleStopCampaign}
                     onPause={handlePauseCampaign}
                     onResume={handleResumeCampaign}
@@ -814,6 +929,7 @@ export function Traffic() {
                     campaigns={campaigns}
                     report={selectedReport}
                     reportCampaignId={reportCampaignId}
+                    auditEnabled={activeTab === 'reports'}
                     onSelectCampaign={handleViewReport}
                 />
             )}
@@ -975,6 +1091,9 @@ function CampaignsTab({ campaigns, onStart, onResume, onDelete, onDeleteMany, on
                                     {c.trafficMode === 'map_search' && (
                                         <StatusPill tone="emerald">SEO Map</StatusPill>
                                     )}
+                                    {c.trafficMode === 'web_seo' && (
+                                        <StatusPill tone="violet">{t('traffic.webSEO')}</StatusPill>
+                                    )}
                                     <StatusPill tone={getStatusTone(c.status)}>{c.status}</StatusPill>
                                 </div>
                                 <div className="flex items-center gap-2">
@@ -1089,13 +1208,14 @@ function ThreadCursorPreview({ thread, clickVersion }: {
 // Live Monitor Tab
 // ============================================================
 
-function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, onStop, onPause, onResume, onRefresh }: {
+function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, auditEnabled = true, onStop, onPause, onResume, onRefresh }: {
     status: LiveStatus | null
     actionLogs: MonitorActionLog[]
     runtimePolicy: RuntimePolicy | null
     runtimeDiagnostics: RuntimeDiagnostics | null
     ragStats: RagStats | null
     mcpHealth: McpHealth | null
+    auditEnabled?: boolean
     onStop: () => void
     onPause: () => void
     onResume: () => void
@@ -1143,9 +1263,11 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
         fetchInfo()
         const interval = setInterval(fetchInfo, 5000)
         return () => clearInterval(interval)
-    }, [status?.isRunning, effectiveMode])
+    }, [status?.isRunning, status?.isPaused, effectiveMode])
 
-    if (!status || !status.isRunning) {
+    const isMonitorActive = !!(status && (status.isRunning || status.isPaused))
+
+    if (!isMonitorActive) {
         return (
             <EmptyState
                 icon={Activity}
@@ -1172,8 +1294,11 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                 <div className="flex items-center justify-between mb-4">
                     <div>
                         <h3 className="text-[#17171f] font-semibold text-lg flex items-center gap-2">
-                            <div className="w-2.5 h-2.5 bg-emerald-500 rounded-full animate-pulse" />
+                            <div className={`w-2.5 h-2.5 rounded-full ${status.isPaused ? 'bg-amber-500' : 'bg-emerald-500 animate-pulse'}`} />
                             {status.campaignName}
+                            {status.isPaused && (
+                                <StatusPill tone="amber">{t('traffic.paused')}</StatusPill>
+                            )}
                         </h3>
                         <p className="text-[#908a9e] text-sm mt-1">
                             {t('traffic.round')} {status.currentRound} - {status.activeThreads} {t('traffic.activeThreads')}
@@ -1350,26 +1475,6 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                 {actionLogs.length === 0 ? (
                     <div className="p-6 text-center text-[#908a9e] text-sm">
                         Chua co hanh dong nao duoc ghi nhan.
-	                    </div>
-	                ) : false ? (
-	                    <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-[#17171f] text-sm font-medium">Proxy tinh dang hoat dong</span>
-                            <span className="text-xs bg-[#f4f1fa] text-[#8d74e8] px-1.5 py-0.5 rounded">Static</span>
-                        </div>
-                        <div className="flex items-center gap-3 mt-1 text-xs flex-wrap">
-                            {status?.networkState?.proxyInfo ? (
-                                <span className="text-[#17171f] font-mono">{status?.networkState?.proxyInfo}</span>
-                            ) : (
-                                <span className="text-[#5f5a6d]">Proxy pool active</span>
-                            )}
-                            {status?.networkState?.reason && (
-                                <>
-                                    <span className="text-[#908a9e]">·</span>
-                                    <span className="text-[#5f5a6d]">{status?.networkState?.reason}</span>
-                                </>
-                            )}
-                        </div>
                     </div>
                 ) : (
                     <div className="max-h-72 overflow-y-auto divide-y divide-[#e9e4f2]">
@@ -1467,6 +1572,13 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                     </div>
                 )}
             </SectionPanel>
+
+            {/* Traffic quality / failure audit — manual refresh only (no status-tick N+1) */}
+            <TrafficAuditPanel
+                campaignId={status.campaignId}
+                enabled={auditEnabled && !!status.campaignId}
+                variant="monitor"
+            />
         </div>
     )
 }
@@ -1475,10 +1587,11 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
 // Reports Tab
 // ============================================================
 
-function ReportsTab({ campaigns, report, reportCampaignId, onSelectCampaign }: {
+function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, onSelectCampaign }: {
     campaigns: Campaign[]
     report: ReportData | null
     reportCampaignId: number | null
+    auditEnabled?: boolean
     onSelectCampaign: (id: number) => void
 }) {
     const { t } = useI18n()
@@ -1518,6 +1631,15 @@ function ReportsTab({ campaigns, report, reportCampaignId, onSelectCampaign }: {
                     )}
                 </div>
             </Panel>
+
+            {/* Quality / failure audit — loads getAudit+getLogs once per campaign (cached) */}
+            {reportCampaignId != null && (
+                <TrafficAuditPanel
+                    campaignId={reportCampaignId}
+                    enabled={auditEnabled && reportCampaignId != null}
+                    variant="reports"
+                />
+            )}
 
             {/* Report Content */}
             {report ? (
@@ -1732,7 +1854,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
     accounts: Account[]
     locations: Location[]
     onClose: () => void
-    onCreate: (data: any) => Promise<void>
+    onCreate: (data: CreateCampaignPayload) => Promise<void>
 }) {
     const { t } = useI18n()
     const [name, setName] = useState('')
@@ -1742,7 +1864,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
     const [visitsPerLocation, setVisitsPerLocation] = useState(10)
     const [delayMin, setDelayMin] = useState(10)
     const [delayMax, setDelayMax] = useState(30)
-    const [trafficMode, setTrafficMode] = useState<'direct' | 'organic' | 'web_seo' | 'map_search'>('direct')
+    const [trafficMode, setTrafficMode] = useState<TrafficMode>('direct')
     const [locationKeywords, setLocationKeywords] = useState<Record<number, string>>({})
     const [creating, setCreating] = useState(false)
     // map_search specific: max cards to scroll (UI default 15, min 1; passed only relevant for mode)
@@ -1750,6 +1872,31 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
     // Web SEO specific state
     const [websiteUrl, setWebsiteUrl] = useState('')
     const [webSeoKeyword, setWebSeoKeyword] = useState('')
+    const [dwellMin, setDwellMin] = useState(WEB_SEO_PRESETS.balanced.dwellMin)
+    const [dwellMax, setDwellMax] = useState(WEB_SEO_PRESETS.balanced.dwellMax)
+    const [webSeoRequireOrganic, setWebSeoRequireOrganic] = useState(false)
+    const [activeWebSeoPreset, setActiveWebSeoPreset] = useState<WebSeoPresetId | null>(null)
+    const webSeoPresetAppliedRef = useRef(false)
+
+    const applyWebSeoPreset = useCallback((id: WebSeoPresetId) => {
+        const preset = WEB_SEO_PRESETS[id]
+        setThreadsCount(preset.threads)
+        setVisitsPerLocation(preset.visits)
+        setDelayMin(preset.delayMin)
+        setDelayMax(preset.delayMax)
+        setDwellMin(preset.dwellMin)
+        setDwellMax(preset.dwellMax)
+        setActiveWebSeoPreset(id)
+    }, [])
+
+    const selectTrafficMode = useCallback((mode: TrafficMode) => {
+        setTrafficMode(mode)
+        // First time entering web_seo: apply Balanced defaults once
+        if (mode === 'web_seo' && !webSeoPresetAppliedRef.current) {
+            webSeoPresetAppliedRef.current = true
+            applyWebSeoPreset('balanced')
+        }
+    }, [applyWebSeoPreset])
 
     const toggleAccount = (id: number) => {
         setSelectedAccounts(prev =>
@@ -1763,10 +1910,56 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
         )
     }
 
+    const webSeoFieldErrors = useMemo((): WebSeoFieldErrors => {
+        if (trafficMode !== 'web_seo') return {}
+        const errors: WebSeoFieldErrors = {}
+        const resolved = resolveWebSeoTarget(websiteUrl)
+        if (!resolved.ok) {
+            errors.websiteUrl = t(webSeoUrlErrorKey(resolved.error))
+        }
+        const keywords = parseWebSeoKeywords(webSeoKeyword)
+        if (keywords.length === 0) {
+            errors.keywords = t('traffic.webSeoKeywordsRequired')
+        }
+        const min = clampDwellSeconds(dwellMin)
+        const max = clampDwellSeconds(dwellMax)
+        if (
+            dwellMin < WEB_SEO_DWELL_MIN_SECONDS
+            || dwellMin > WEB_SEO_DWELL_MAX_SECONDS
+            || dwellMax < WEB_SEO_DWELL_MIN_SECONDS
+            || dwellMax > WEB_SEO_DWELL_MAX_SECONDS
+        ) {
+            errors.dwell = t('traffic.webSeoDwellRange')
+        } else if (max < min) {
+            errors.dwell = t('traffic.webSeoDwellOrder')
+        }
+        return errors
+    }, [trafficMode, websiteUrl, webSeoKeyword, dwellMin, dwellMax, t])
+
+    const webSeoEtaLabel = useMemo(() => {
+        if (trafficMode !== 'web_seo') return null
+        const eta = estimateWebSeoEtaSeconds(
+            visitsPerLocation,
+            threadsCount,
+            clampDwellSeconds(dwellMin),
+            Math.max(clampDwellSeconds(dwellMin), clampDwellSeconds(dwellMax)),
+            Math.max(0, delayMin),
+            Math.max(Math.max(0, delayMin), Math.max(0, delayMax)),
+        )
+        return formatEtaSeconds(eta)
+    }, [trafficMode, visitsPerLocation, threadsCount, dwellMin, dwellMax, delayMin, delayMax])
+
+    const isValid = trafficMode === 'web_seo'
+        ? (
+            Object.keys(webSeoFieldErrors).length === 0
+            && normalizeWebSeoTargetUrl(websiteUrl) !== null
+            && parseWebSeoKeywords(webSeoKeyword).length > 0
+        )
+        : selectedLocations.length > 0
+
     const handleCreate = async () => {
         if (trafficMode === 'web_seo') {
-            // Web SEO mode: need websiteUrl and keyword
-            if (!websiteUrl.trim() || !webSeoKeyword.trim()) return
+            if (!isValid) return
         } else {
             if (selectedLocations.length === 0) return
         }
@@ -1775,32 +1968,39 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
         const normalizedDelayMax = Math.max(normalizedDelayMin, Number.isFinite(delayMax) ? delayMax : normalizedDelayMin)
         setCreating(true)
         try {
-            const api = (window as any).electronAPI
+            const api = window.electronAPI
 
             if (trafficMode === 'web_seo') {
-                // Web SEO: create a virtual location from websiteUrl, save keywords
-                let targetUrl = websiteUrl.trim()
-                if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl
-                // Extract domain name for location name
-                let domainName = targetUrl
-                try { domainName = new URL(targetUrl).hostname.replace('www.', '') } catch { /* use as-is */ }
+                const targetUrl = normalizeWebSeoTargetUrl(websiteUrl)
+                const keywords = parseWebSeoKeywords(webSeoKeyword)
+                if (!targetUrl || keywords.length === 0) return
 
-                // Create/find location for this URL
-                const loc = await api.locations.add({
+                let domainName = targetUrl
+                try {
+                    domainName = new URL(targetUrl).hostname.replace(/^www\./i, '')
+                } catch {
+                    // use absolute URL as display name fallback
+                }
+
+                const existingLocation = locations.find((location) =>
+                    normalizeWebSeoTargetUrl(location.url) === targetUrl,
+                )
+                const locId = existingLocation?.id ?? extractLocationId(await api.locations.add({
                     name: domainName,
                     url: targetUrl,
                     address: targetUrl,
                     placeId: 'web_seo_' + Date.now(),
-                })
-                const locId = loc?.id || loc
-
-                // Save keywords on the location
-                const keywords = webSeoKeyword.split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean)
-                if (keywords.length > 0) {
-                    await api.locations.update(locId, {
-                        searchKeywords: JSON.stringify(keywords)
-                    })
+                }))
+                if (locId === null) {
+                    throw new Error('Failed to create web SEO location')
                 }
+
+                await api.locations.update(locId, {
+                    searchKeywords: JSON.stringify(keywords),
+                })
+
+                const minDwell = clampDwellSeconds(dwellMin)
+                const maxDwell = Math.max(minDwell, clampDwellSeconds(dwellMax))
 
                 await onCreate({
                     name: campaignName,
@@ -1810,18 +2010,21 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     visitsPerLocation,
                     delayMinSeconds: normalizedDelayMin,
                     delayMaxSeconds: normalizedDelayMax,
-                    trafficMode,
-                    maxMapScroll,
+                    trafficMode: 'web_seo',
+                    searchKeywords: keywords,
+                    webSeoMinDwellSeconds: minDwell,
+                    webSeoMaxDwellSeconds: maxDwell,
+                    webSeoRequireOrganic,
                 })
             } else {
-                // Direct / Organic mode
+                // Direct / Organic / Map — unchanged behavior
                 if (trafficMode === 'organic' || trafficMode === 'map_search') {
                     for (const locId of selectedLocations) {
                         const kw = locationKeywords[locId]
                         if (kw && kw.trim()) {
                             const keywords = kw.split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean)
                             await api.locations.update(locId, {
-                                searchKeywords: JSON.stringify(keywords)
+                                searchKeywords: JSON.stringify(keywords),
                             })
                         }
                     }
@@ -1838,36 +2041,39 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     maxMapScroll,
                 })
             }
-        } catch (error: any) {
+        } catch (error: unknown) {
             console.error('Failed to create campaign:', error)
-            alert('Failed to create campaign: ' + (error?.message || error))
+            const message = error instanceof Error ? error.message : String(error)
+            alert('Failed to create campaign: ' + message)
         } finally {
             setCreating(false)
         }
     }
 
-    const isValid = trafficMode === 'web_seo'
-        ? (websiteUrl.trim().length > 0 && webSeoKeyword.trim().length > 0)
-        : selectedLocations.length > 0
-
     return (
         <Modal open={true} onClose={onClose} title={t('traffic.createCampaign')} size="lg" footer={
-            <div className="flex items-center justify-between w-full">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 w-full">
                 <div className="text-sm text-[#908a9e]">
                     {trafficMode === 'web_seo' ? (
-                        <>
-                            {visitsPerLocation} {t('traffic.visits')} x {threadsCount} {t('traffic.threads')} ={' '}
-                            <span className="text-[#735bd6] font-semibold">
-                                {visitsPerLocation} {t('traffic.totalWebSeoVisits')}
-                            </span>
-                        </>
+                        <div className="space-y-0.5">
+                            <div>
+                                {visitsPerLocation} {t('traffic.visits')} - {threadsCount} {t('traffic.threads')} -{' '}
+                                <span className="text-[#735bd6] font-semibold">
+                                    {visitsPerLocation} {t('traffic.totalWebSeoVisits')}
+                                </span>
+                            </div>
+                            {webSeoEtaLabel && (
+                                <div className="text-xs">
+                                    {t('traffic.webSeoEta')}: <span className="font-semibold text-[#735bd6]">~{webSeoEtaLabel}</span>
+                                </div>
+                            )}
+                        </div>
                     ) : (
                         <>
-                            {(selectedAccounts.length || 1)} {selectedAccounts.length === 0 ? 'anonymous' : t('traffic.accounts')} x{' '}
                             {selectedLocations.length} {t('traffic.locationCount')} x{' '}
                             {visitsPerLocation} {t('traffic.visits')} ={' '}
                             <span className="text-[#735bd6] font-semibold">
-                                {(selectedAccounts.length || 1) * selectedLocations.length * visitsPerLocation} {t('traffic.totalVisitsCalc')}
+                                {selectedLocations.length * visitsPerLocation} {t('traffic.totalVisitsCalc')}
                             </span>
                         </>
                     )}
@@ -1901,10 +2107,11 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     {/* Traffic Mode */}
                     <div>
                         <label className="block text-sm font-semibold text-[#24222c] mb-1.5">{t('traffic.trafficMode')}</label>
-                        <div className="flex gap-2">
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
                             <button
                                 type="button"
-                                onClick={() => setTrafficMode('direct')}
+                                aria-pressed={trafficMode === 'direct'}
+                                onClick={() => selectTrafficMode('direct')}
                                 className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-full border transition-all text-sm font-semibold ${trafficMode === 'direct'
                                     ? 'bg-[#8d74e8] text-white border-[#8d74e8] shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
                                     : 'bg-white border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
@@ -1915,7 +2122,8 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             </button>
                             <button
                                 type="button"
-                                onClick={() => setTrafficMode('organic')}
+                                aria-pressed={trafficMode === 'organic'}
+                                onClick={() => selectTrafficMode('organic')}
                                 className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-full border transition-all text-sm font-semibold ${trafficMode === 'organic'
                                     ? 'bg-[#8d74e8] text-white border-[#8d74e8] shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
                                     : 'bg-white border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
@@ -1926,25 +2134,27 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             </button>
                             <button
                                 type="button"
-                                onClick={() => setTrafficMode('web_seo')}
+                                aria-pressed={trafficMode === 'web_seo'}
+                                onClick={() => selectTrafficMode('web_seo')}
                                 className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-full border transition-all text-sm font-semibold ${trafficMode === 'web_seo'
                                     ? 'bg-[#8d74e8] text-white border-[#8d74e8] shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
                                     : 'bg-white border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
                                     }`}
                             >
                                 <Search className="w-4 h-4" />
-                                {t('traffic.webSEO') || 'Web SEO'}
+                                {t('traffic.webSEO')}
                             </button>
                             <button
                                 type="button"
-                                onClick={() => setTrafficMode('map_search')}
+                                aria-pressed={trafficMode === 'map_search'}
+                                onClick={() => selectTrafficMode('map_search')}
                                 className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-full border transition-all text-sm font-semibold ${trafficMode === 'map_search'
                                     ? 'bg-[#8d74e8] text-white border-[#8d74e8] shadow-[0_14px_24px_rgba(141,116,232,0.24)]'
                                     : 'bg-white border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
                                     }`}
                             >
                                 <Search className="w-4 h-4" />
-                                {t('traffic.mapSearch') || 'SEO Map'}
+                                {t('traffic.mapSearch')}
                             </button>
                         </div>
                         <p className="text-xs text-[#908a9e] mt-1">
@@ -1953,8 +2163,8 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                 : trafficMode === 'organic'
                                     ? t('traffic.organicSearchDesc')
                                     : trafficMode === 'map_search'
-                                        ? (t('traffic.mapSearchDesc') || 'Tìm trực tiếp trên Google Maps → cuộn feed kết quả → vào map (SEO Maps)')
-                                        : t('traffic.webSEODesc') || 'Tim Google -> Website muc tieu -> Tuong tac'}
+                                        ? t('traffic.mapSearchDesc')
+                                        : t('traffic.webSEODesc')}
                         </p>
                     </div>
 
@@ -1968,7 +2178,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                 <p className="text-[#908a9e] text-sm p-2">{t('traffic.noAccountsAvailable')}</p>
                             )}
                             {selectedAccounts.length === 0 && (
-                                <p className="text-xs text-amber-600 mt-1 px-2">Khong chon tai khoan = duyet an danh (anonymous)</p>
+                                <p className="text-xs text-amber-600 mt-1 px-2">{t('traffic.anonymousBrowsingHint')}</p>
                             )}
                             {accounts.map(acc => (
                                 <label
@@ -1988,12 +2198,14 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                         {accounts.length > 0 && (
                             <div className="flex gap-2 mt-1.5">
                                 <button
+                                    type="button"
                                     onClick={() => setSelectedAccounts(accounts.map(a => a.id))}
                                     className="text-xs text-[#8d74e8] hover:text-[#735bd6] font-semibold"
                                 >
                                     {t('traffic.selectAll')}
                                 </button>
                                 <button
+                                    type="button"
                                     onClick={() => setSelectedAccounts([])}
                                     className="text-xs text-[#908a9e] hover:text-[#5f5a6d] font-semibold"
                                 >
@@ -2008,6 +2220,31 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                         <Panel tone="violet" className="space-y-4 p-4">
                             <div>
                                 <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
+                                    {t('traffic.webSeoPresets')}
+                                </label>
+                                <div className="flex gap-2">
+                                    {(['safe', 'balanced', 'fast'] as const).map((id) => (
+                                        <button
+                                            key={id}
+                                            type="button"
+                                            onClick={() => applyWebSeoPreset(id)}
+                                            className={`flex-1 px-3 py-2 rounded-full border text-xs font-semibold transition-all ${
+                                                activeWebSeoPreset === id
+                                                    ? 'bg-[#8d74e8] text-white border-[#8d74e8]'
+                                                    : 'bg-white border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
+                                            }`}
+                                        >
+                                            {id === 'safe'
+                                                ? t('traffic.webSeoPresetSafe')
+                                                : id === 'balanced'
+                                                    ? t('traffic.webSeoPresetBalanced')
+                                                    : t('traffic.webSeoPresetFast')}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
                                     {t('traffic.websiteUrl')}
                                 </label>
                                 <input
@@ -2015,8 +2252,13 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     value={websiteUrl}
                                     onChange={e => setWebsiteUrl(e.target.value)}
                                     placeholder={t('traffic.websiteUrlPlaceholder')}
-                                    className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                                    className={`w-full h-10 px-4 rounded-[16px] border bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
+                                        webSeoFieldErrors.websiteUrl ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                    }`}
                                 />
+                                {webSeoFieldErrors.websiteUrl && (
+                                    <p className="text-xs text-rose-600 mt-1">{webSeoFieldErrors.websiteUrl}</p>
+                                )}
                             </div>
                             <div>
                                 <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
@@ -2027,10 +2269,72 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     onChange={e => setWebSeoKeyword(e.target.value)}
                                     placeholder={t('traffic.webSeoKeywordPlaceholder')}
                                     rows={3}
-                                    className="w-full px-4 py-3 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] resize-none"
+                                    className={`w-full px-4 py-3 rounded-[16px] border bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] resize-none ${
+                                        webSeoFieldErrors.keywords ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                    }`}
                                 />
                                 <p className="text-xs text-[#908a9e] mt-1">{t('traffic.webSeoKeywordHint')}</p>
+                                {webSeoFieldErrors.keywords && (
+                                    <p className="text-xs text-rose-600 mt-1">{webSeoFieldErrors.keywords}</p>
+                                )}
                             </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
+                                        {t('traffic.webSeoMinDwell')}
+                                    </label>
+                                    <input
+                                        type="number"
+                                        value={dwellMin}
+                                        onChange={e => {
+                                            setActiveWebSeoPreset(null)
+                                            setDwellMin(parseInt(e.target.value, 10) || 0)
+                                        }}
+                                        min={WEB_SEO_DWELL_MIN_SECONDS}
+                                        max={WEB_SEO_DWELL_MAX_SECONDS}
+                                        className={`w-full h-10 px-4 rounded-[16px] border bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
+                                            webSeoFieldErrors.dwell ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                        }`}
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
+                                        {t('traffic.webSeoMaxDwell')}
+                                    </label>
+                                    <input
+                                        type="number"
+                                        value={dwellMax}
+                                        onChange={e => {
+                                            setActiveWebSeoPreset(null)
+                                            setDwellMax(parseInt(e.target.value, 10) || 0)
+                                        }}
+                                        min={WEB_SEO_DWELL_MIN_SECONDS}
+                                        max={WEB_SEO_DWELL_MAX_SECONDS}
+                                        className={`w-full h-10 px-4 rounded-[16px] border bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
+                                            webSeoFieldErrors.dwell ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                        }`}
+                                    />
+                                </div>
+                            </div>
+                            {webSeoFieldErrors.dwell && (
+                                <p className="text-xs text-rose-600 -mt-2">{webSeoFieldErrors.dwell}</p>
+                            )}
+                            <label className="flex items-start gap-2 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={webSeoRequireOrganic}
+                                    onChange={e => setWebSeoRequireOrganic(e.target.checked)}
+                                    className="h-4 w-4 mt-0.5 rounded accent-[#8d74e8]"
+                                />
+                                <span>
+                                    <span className="text-sm font-semibold text-[#24222c] block">
+                                        {t('traffic.webSeoRequireOrganic')}
+                                    </span>
+                                    <span className="text-xs text-[#908a9e]">
+                                        {t('traffic.webSeoRequireOrganicHint')}
+                                    </span>
+                                </span>
+                            </label>
                             <AlertBanner type="info">
                                 {t('traffic.webSeoNote')}
                             </AlertBanner>
@@ -2100,12 +2404,14 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             {locations.length > 0 && (
                                 <div className="flex gap-2 mt-1.5">
                                     <button
+                                        type="button"
                                         onClick={() => setSelectedLocations(locations.map(l => l.id))}
                                         className="text-xs text-[#8d74e8] hover:text-[#735bd6] font-medium"
                                     >
                                         {t('traffic.selectAll')}
                                     </button>
                                     <button
+                                        type="button"
                                         onClick={() => setSelectedLocations([])}
                                         className="text-xs text-[#908a9e] hover:text-[#5f5a6d]"
                                     >
@@ -2120,7 +2426,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                     {trafficMode === 'map_search' && (
                         <div>
                             <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
-                                {t('traffic.maxMapScroll') || 'Số map tối đa khi cuộn tìm'}
+                                {t('traffic.maxMapScroll')}
                             </label>
                             <input
                                 type="number"
@@ -2130,7 +2436,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                 max={100}
                                 className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
-                            <p className="text-xs text-[#908a9e] mt-0.5">Tối đa số map cuộn trong feed trước khi fallback URL trực tiếp (mặc định 15).</p>
+                            <p className="text-xs text-[#908a9e] mt-0.5">{t('traffic.maxMapScrollHint')}</p>
                         </div>
                     )}
 
@@ -2141,9 +2447,12 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             <input
                                 type="number"
                                 value={threadsCount}
-                                onChange={e => setThreadsCount(Math.max(1, parseInt(e.target.value) || 1))}
+                                onChange={e => {
+                                    if (trafficMode === 'web_seo') setActiveWebSeoPreset(null)
+                                    setThreadsCount(Math.min(32, Math.max(1, parseInt(e.target.value) || 1)))
+                                }}
                                 min={1}
-                                max={100}
+                                max={32}
                                 className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
                         </div>
@@ -2152,7 +2461,10 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             <input
                                 type="number"
                                 value={visitsPerLocation}
-                                onChange={e => setVisitsPerLocation(Math.max(1, parseInt(e.target.value) || 1))}
+                                onChange={e => {
+                                    if (trafficMode === 'web_seo') setActiveWebSeoPreset(null)
+                                    setVisitsPerLocation(Math.max(1, parseInt(e.target.value) || 1))
+                                }}
                                 min={1}
                                 className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
@@ -2166,7 +2478,10 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             <input
                                 type="number"
                                 value={delayMin}
-                                onChange={e => setDelayMin(Math.max(0, parseInt(e.target.value) || 0))}
+                                onChange={e => {
+                                    if (trafficMode === 'web_seo') setActiveWebSeoPreset(null)
+                                    setDelayMin(Math.max(0, parseInt(e.target.value) || 0))
+                                }}
                                 min={0}
                                 className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
@@ -2176,31 +2491,36 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             <input
                                 type="number"
                                 value={delayMax}
-                                onChange={e => setDelayMax(Math.max(0, parseInt(e.target.value) || 0))}
+                                onChange={e => {
+                                    if (trafficMode === 'web_seo') setActiveWebSeoPreset(null)
+                                    setDelayMax(Math.max(0, parseInt(e.target.value) || 0))
+                                }}
                                 min={0}
                                 className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
                         </div>
                     </div>
 
-                    {/* Deterministic Maps SEO Banner */}
-                    <Panel tone="cyan" className="p-4">
-                        <div className="flex items-center gap-2 mb-2">
-                            <Zap className="w-4 h-4 text-[#8d74e8]" />
-                            <span className="text-sm font-semibold text-[#17171f]">Maps SEO deterministic mode</span>
-                        </div>
-                        <p className="text-xs text-[#5f5a6d] leading-relaxed">
-                            The browser first checks which Maps actions are actually available, then executes every available KPI action:
-                            phone, website, and directions. Missing actions are skipped instead of guessed.
-                        </p>
-                        <div className="flex flex-wrap gap-2 mt-2">
-                            <Badge tone="cyan">Phone</Badge>
-                            <Badge tone="cyan">Website</Badge>
-                            <Badge tone="cyan">Directions</Badge>
-                            <Badge tone="emerald">Available-only</Badge>
-                            <Badge tone="emerald">Self-healing</Badge>
-                        </div>
-                    </Panel>
+                    {/* Deterministic Maps SEO Banner — only for map/direct/organic, not web_seo */}
+                    {trafficMode !== 'web_seo' && (
+                        <Panel tone="cyan" className="p-4">
+                            <div className="flex items-center gap-2 mb-2">
+                                <Zap className="w-4 h-4 text-[#8d74e8]" />
+                                <span className="text-sm font-semibold text-[#17171f]">Maps SEO deterministic mode</span>
+                            </div>
+                            <p className="text-xs text-[#5f5a6d] leading-relaxed">
+                                The browser first checks which Maps actions are actually available, then executes every available KPI action:
+                                phone, website, and directions. Missing actions are skipped instead of guessed.
+                            </p>
+                            <div className="flex flex-wrap gap-2 mt-2">
+                                <Badge tone="cyan">Phone</Badge>
+                                <Badge tone="cyan">Website</Badge>
+                                <Badge tone="cyan">Directions</Badge>
+                                <Badge tone="emerald">Available-only</Badge>
+                                <Badge tone="emerald">Self-healing</Badge>
+                            </div>
+                        </Panel>
+                    )}
                 </div>
         </Modal>
     )

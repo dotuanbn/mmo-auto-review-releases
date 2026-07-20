@@ -15,7 +15,7 @@
  * should eventually route through this module.
  */
 
-import { BrowserContext, Page } from 'playwright'
+import type { BrowserContext, CDPSession, Page } from 'playwright'
 import { BrowserFingerprint } from '../services/FingerprintService'
 import { writeAgenticLog } from '../utils/agenticLog'
 
@@ -26,6 +26,18 @@ export interface StealthOptions {
     fingerprint?: BrowserFingerprint
     /** Future: pass per-account behavior profile for fatigue / mood simulation */
     behaviorProfile?: any
+}
+
+interface UserAgentMetadata {
+    brands: Array<{ brand: string; version: string }>
+    fullVersionList: Array<{ brand: string; version: string }>
+    fullVersion: string
+    platform: string
+    platformVersion: string
+    architecture: string
+    model: string
+    mobile: boolean
+    bitness: string
 }
 
 const DEFAULT_LEVEL: StealthLevel = 'high'
@@ -53,7 +65,7 @@ export async function applyStealth(context: BrowserContext, opts: StealthOptions
     await applyJSInitScripts(context, opts)
 
     // 2. CDP-level patches (more powerful for certain signals)
-    await applyCDPPatches(context, level)
+    await applyCDPPatches(context, level, opts)
 
     log('Stealth patches applied successfully')
 }
@@ -71,7 +83,7 @@ export async function applyStealthToPage(page: Page, opts: StealthOptions = {}):
     // Best-effort CDP on the page
     try {
         const cdp = await page.context().newCDPSession(page)
-        await applyPageCDP(cdp, level)
+        await applyPageCDP(cdp, level, opts)
         await cdp.detach().catch(() => {})
     } catch (e) {
         // Non-fatal in some contexts
@@ -104,6 +116,7 @@ function buildScriptArgs(opts: StealthOptions) {
                   webglRenderer: fp.webgl.renderer,
                   canvasNoise: fp.canvasNoise,
                   audioNoise: fp.audioNoise,
+                  clientHints: fp.clientHints || null,
               }
             : null,
     }
@@ -185,7 +198,107 @@ function stealthInitScript(args: any) {
         }
     } catch {}
 
+    // === 2b. Client Hints (Sec-CH-UA) ===
+    try {
+        if (fp?.clientHints) {
+            const ch = fp.clientHints
+            const brands = ch.secChUa.split(', ').map((b: string) => {
+                const match = b.match(/"(.+)";v="(.+)"/)
+                return match ? { brand: match[1], version: match[2] } : null
+            }).filter(Boolean)
+
+            Object.defineProperty(navigator, 'userAgentData', {
+                get: () => ({
+                    brands: brands,
+                    mobile: false,
+                    platform: ch.secChUaPlatform.replace(/"/g, ''),
+                    getHighEntropyValues: (_hints: string[]) => Promise.resolve({
+                        brands: brands,
+                        mobile: false,
+                        platform: ch.secChUaPlatform.replace(/"/g, ''),
+                        platformVersion: '15.0.0',
+                        architecture: 'x86',
+                        bitness: '64',
+                        model: '',
+                        uaFullVersion: ch.secChUaFullVersion.replace(/"/g, ''),
+                        // Not_A Brand must keep its own short version, not Chrome full version
+                        fullVersionList: brands.map((b: { brand: string; version: string }) => ({
+                            brand: b.brand,
+                            version: /not.?a.?brand/i.test(b.brand)
+                                ? `${b.version}.0.0.0`
+                                : ch.secChUaFullVersion.replace(/"/g, ''),
+                        })),
+                    }),
+                }),
+                configurable: true,
+            })
+        }
+    } catch {}
+
+    // === 2c. window.chrome (required when not relying on legacy applyStealthScripts) ===
+    try {
+        const chromeWindow = window as Window & { chrome?: { runtime?: unknown } }
+        if (!chromeWindow.chrome?.runtime) {
+            const chromeObj = {
+                runtime: {
+                    connect: function () {
+                        return {
+                            onMessage: { addListener: function () {} },
+                            postMessage: function () {},
+                        }
+                    },
+                    sendMessage: function () {},
+                    onMessage: { addListener: function () {} },
+                    id: undefined as string | undefined,
+                },
+                loadTimes: function () {
+                    return {
+                        commitLoadTime: Date.now() / 1000 - Math.random() * 2,
+                        finishDocumentLoadTime: Date.now() / 1000 - Math.random(),
+                        finishLoadTime: Date.now() / 1000,
+                        firstPaintAfterLoadTime: 0,
+                        firstPaintTime: Date.now() / 1000 - Math.random() * 3,
+                        navigationType: 'Other',
+                        npnNegotiatedProtocol: 'h2',
+                        requestTime: Date.now() / 1000 - Math.random() * 5,
+                        startLoadTime: Date.now() / 1000 - Math.random() * 5,
+                        wasAlternateProtocolAvailable: false,
+                        wasFetchedViaSpdy: true,
+                        wasNpnNegotiated: true,
+                    }
+                },
+                csi: function () {
+                    return {
+                        startE: Date.now(),
+                        onloadT: Date.now() + Math.floor(Math.random() * 500),
+                        pageT: Math.random() * 5000,
+                        tran: 15,
+                    }
+                },
+                app: {
+                    isInstalled: false,
+                    InstallState: {
+                        DISABLED: 'disabled',
+                        INSTALLED: 'installed',
+                        NOT_INSTALLED: 'not_installed',
+                    },
+                    RunningState: {
+                        CANNOT_RUN: 'cannot_run',
+                        READY_TO_RUN: 'ready_to_run',
+                        RUNNING: 'running',
+                    },
+                },
+            }
+            Object.defineProperty(window, 'chrome', {
+                get: () => chromeObj,
+                configurable: true,
+            })
+        }
+    } catch {}
+
     // === 3. Permissions API (very important for Google) ===
+    // Keep state as 'prompt' to match real Chrome before user interaction.
+    // Do NOT grant via CDP (that would return 'granted' and conflict with this spoof).
     try {
         if (navigator.permissions && navigator.permissions.query) {
             const origQuery = navigator.permissions.query.bind(navigator.permissions)
@@ -332,38 +445,85 @@ function stealthInitScript(args: any) {
         } catch {}
     }
 
-    // Mark that stealth ran (useful for debugging)
-    try {
-        ;(window as any).__mmor_stealth_applied = true
-        ;(window as any).__mmor_stealth_level = level
-    } catch {}
+    // Intentionally no debug markers on window (anti-bot scanners flag custom globals).
 }
 
 // ============================================================
 // CDP Patches (stronger than pure JS for some signals)
 // ============================================================
 
-async function applyCDPPatches(context: BrowserContext, level: StealthLevel) {
+function buildUserAgentMetadata(fp?: BrowserFingerprint | null): UserAgentMetadata | undefined {
+    if (!fp?.userAgent) return undefined
+    const ch = fp.clientHints
+    const majorMatch = fp.userAgent.match(/Chrome\/(\d+)/)
+    const major = majorMatch?.[1] ?? '131'
+    const fullVersion = ch?.secChUaFullVersion?.replace(/"/g, '') || `${major}.0.0.0`
+    const platform = fp.userAgent.includes('Macintosh') ? 'macOS' : 'Windows'
+    const brands = ch?.secChUa
+        ? ch.secChUa.split(', ').map((b) => {
+              const m = b.match(/"(.+)";v="(.+)"/)
+              return m ? { brand: m[1], version: m[2] } : null
+          }).filter((x): x is { brand: string; version: string } => !!x)
+        : [
+              { brand: 'Chromium', version: major },
+              { brand: 'Google Chrome', version: major },
+              { brand: 'Not_A Brand', version: '24' },
+          ]
+
+    return {
+        brands,
+        fullVersionList: brands.map((b) => ({
+            brand: b.brand,
+            version: /not.?a.?brand/i.test(b.brand) ? `${b.version}.0.0.0` : fullVersion,
+        })),
+        fullVersion,
+        platform,
+        platformVersion: platform === 'Windows' ? '15.0.0' : '14.0.0',
+        architecture: 'x86',
+        model: '',
+        mobile: false,
+        bitness: '64',
+    }
+}
+
+async function applyCDPPatches(context: BrowserContext, level: StealthLevel, opts: StealthOptions = {}) {
     if (level === 'off' || level === 'low') return
+
+    const fingerprint = opts.fingerprint
+    const userAgent =
+        fingerprint?.userAgent ||
+        (await context.pages()[0]?.evaluate(() => navigator.userAgent).catch(() => '')) ||
+        ''
+    const acceptLanguage = fingerprint?.languages?.length
+        ? fingerprint.languages.map((l, i) => (i === 0 ? l : `${l};q=${Math.max(0.1, 1 - i * 0.1).toFixed(1)}`)).join(',')
+        : 'en-US,en;q=0.9,vi;q=0.8'
+    const userAgentMetadata = buildUserAgentMetadata(fingerprint || null)
 
     // We apply CDP on the first page that appears (and future pages via context event)
     const applyToPage = async (page: Page) => {
         try {
             const cdp = await context.newCDPSession(page)
 
-            // Remove webdriver flag at CDP level
-            await cdp.send('Emulation.setUserAgentOverride', {
-                userAgent: await page.evaluate(() => navigator.userAgent),
-                acceptLanguage: 'en-US,en;q=0.9,vi;q=0.8',
-            }).catch(() => {})
+            // Align HTTP UA + Client Hints metadata with fingerprint pool
+            const ua =
+                userAgent ||
+                (await page.evaluate(() => navigator.userAgent).catch(() => ''))
+            if (ua) {
+                // CDP protocol supports userAgentMetadata; Playwright types lag behind.
+                await cdp
+                    .send(
+                        'Emulation.setUserAgentOverride',
+                        {
+                            userAgent: ua,
+                            acceptLanguage,
+                            ...(userAgentMetadata ? { userAgentMetadata } : {}),
+                        } as never,
+                    )
+                    .catch(() => {})
+            }
 
-            // Hardware concurrency override (when we have consistent value)
-            // Note: Playwright 1.4x+ supports it via context options; we keep it here for older paths
-
-            // Permissions
-            await cdp.send('Browser.grantPermissions', {
-                permissions: ['geolocation', 'notifications'],
-            }).catch(() => {})
+            // Do NOT grant geolocation/notifications here — JS Permissions spoof returns 'prompt'.
+            // Granting via CDP would create a granted vs prompt mismatch detectors can use.
 
             await cdp.detach().catch(() => {})
         } catch (e) {
@@ -382,19 +542,29 @@ async function applyCDPPatches(context: BrowserContext, level: StealthLevel) {
     })
 }
 
-async function applyPageCDP(cdp: any, level: StealthLevel) {
+async function applyPageCDP(cdp: CDPSession, level: StealthLevel, opts: StealthOptions = {}) {
     if (level === 'off' || level === 'low') return
     try {
-        await cdp.send('Emulation.setUserAgentOverride', {
-            userAgent: await cdp.send('Runtime.evaluate', { expression: 'navigator.userAgent' }).then((r: any) => r.result.value),
-        }).catch(() => {})
+        const fingerprint = opts.fingerprint
+        const evaluated = await cdp
+            .send('Runtime.evaluate', { expression: 'navigator.userAgent' })
+            .catch(() => null)
+        const evaluatedUa = evaluated?.result.value
+        const ua = fingerprint?.userAgent || (typeof evaluatedUa === 'string' ? evaluatedUa : '')
+        if (!ua) return
+        const meta = buildUserAgentMetadata(fingerprint || null)
+        await cdp
+            .send('Emulation.setUserAgentOverride', {
+                userAgent: ua,
+                ...(meta ? { userAgentMetadata: meta } : {}),
+            })
+            .catch(() => {})
     } catch {}
 }
 
 export const stealthPatcher = {
     applyStealth,
     applyStealthToPage,
-    StealthLevel: {} as any, // for type import convenience
 }
 
 /** Default stealth level used across the app (Phase 1 foundation) */

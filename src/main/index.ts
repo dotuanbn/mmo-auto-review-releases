@@ -2,9 +2,13 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { join } from 'path'
 import { appendFileSync, existsSync, mkdirSync } from 'fs'
 import { dataRootService } from './services/DataRootService'
-import { soakTestService } from './services/SoakTestService'
-import { automationController } from './automation/AutomationController'
-import { trafficBoostEngine } from './automation/TrafficBoostEngine'
+
+type RuntimeServices = {
+    soakTestService: typeof import('./services/SoakTestService')['soakTestService']
+    automationController: typeof import('./automation/AutomationController')['automationController']
+    trafficBoostEngine: typeof import('./automation/TrafficBoostEngine')['trafficBoostEngine']
+    schedulerService: typeof import('./services/SchedulerService')['schedulerService']
+}
 
 // Keep renderer stable when the app regains focus on Windows.
 // Browser fidelity is handled by the launched Chrome contexts, not by this window.
@@ -18,6 +22,7 @@ let closeDatabaseRef: (() => void) | null = null
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 let rendererRecoveryAttempts = 0
 let lastMainWindowBlurAt = 0
+let runtimeServices: RuntimeServices | null = null
 
 function openExternalUrl(url: string): Promise<void> {
     const parsed = new URL(url)
@@ -88,7 +93,10 @@ function reloadRenderer(reason: string): void {
 }
 
 function hasActiveAutomationWindowWork(): boolean {
-    return automationController.isRunning() || trafficBoostEngine.isRunning()
+    return Boolean(
+        runtimeServices?.automationController.isRunning() ||
+        runtimeServices?.trafficBoostEngine.isRunning(),
+    )
 }
 
 function createWindow(): void {
@@ -182,7 +190,11 @@ function createWindow(): void {
 
     mainWindow.on('closed', () => {
         mainWindow = null
+        runtimeServices?.schedulerService.setMainWindow(null)
     })
+
+    // Keep scheduler notifications bound to the live BrowserWindow.
+    runtimeServices?.schedulerService.setMainWindow(mainWindow)
 }
 
 // Initialize app
@@ -204,6 +216,38 @@ app.whenReady().then(async () => {
         initDatabase()
         logBootstrap('Database initialized successfully')
 
+        const [soakModule, automationModule, trafficModule, schedulerModule] = await Promise.all([
+            import('./services/SoakTestService'),
+            import('./automation/AutomationController'),
+            import('./automation/TrafficBoostEngine'),
+            import('./services/SchedulerService'),
+        ])
+        runtimeServices = {
+            soakTestService: soakModule.soakTestService,
+            automationController: automationModule.automationController,
+            trafficBoostEngine: trafficModule.trafficBoostEngine,
+            schedulerService: schedulerModule.schedulerService,
+        }
+        const {
+            soakTestService,
+            automationController,
+            schedulerService,
+        } = runtimeServices
+
+        // Durable review queue crash recovery (job_queue load + zombie campaign reconcile)
+        // Does not auto-start browsers; resume is deterministic via AutomationController.
+        try {
+            const { reviewRecoveryService } = await import('./automation/ReviewRecoveryService')
+            const recovery = await reviewRecoveryService.recoverOnBoot()
+            logBootstrap(
+                `[ReviewRecovery] pendingJobs=${recovery.totalPendingJobs}, ` +
+                `zombies=${recovery.zombieCampaigns.length}, ` +
+                `resumeCandidates=${recovery.pendingCampaignIds.join(',') || 'none'}`
+            )
+        } catch (recoveryError) {
+            logBootstrap('[ReviewRecovery] Boot recovery failed (non-fatal)', recoveryError)
+        }
+
         const { registerAllHandlers } = await import('./ipc')
         // Register IPC handlers
         logBootstrap('Registering IPC handlers...')
@@ -218,6 +262,25 @@ app.whenReady().then(async () => {
         // Create window
         createWindow()
         logBootstrap('Main window created')
+
+        // Wire scheduler → real automation via DI (no circular import in SchedulerService).
+        // start/resume only; schedule lastRunAt/nextRunAt advance only on runner success.
+        try {
+            const { reviewRecoveryService } = await import('./automation/ReviewRecoveryService')
+            schedulerService.setMainWindow(mainWindow)
+            schedulerService.setAutomationRunner({
+                startCampaign: (campaignId) => automationController.startCampaign(campaignId),
+                resumeCampaign: (campaignId) => automationController.resumeCampaign(campaignId),
+                hasPendingDurableJobs: async (campaignId) => {
+                    const plan = await reviewRecoveryService.getResumePlan(campaignId)
+                    return plan.canResume
+                },
+            })
+            schedulerService.start()
+            logBootstrap('Scheduler service started (automation runner wired)')
+        } catch (schedulerError) {
+            logBootstrap('Scheduler service failed to start (non-fatal)', schedulerError)
+        }
     } catch (error) {
         logBootstrap('Failed to initialize app', error)
         dialog.showErrorBox(
@@ -237,7 +300,7 @@ if (!gotSingleInstanceLock) {
             focusMainWindow()
             return
         }
-        createWindow()
+        if (runtimeServices) createWindow()
     })
 }
 
@@ -255,9 +318,15 @@ process.on('uncaughtException', (error) => {
 
 app.on('window-all-closed', () => {
     try {
-        soakTestService.stop('app_shutdown')
+        runtimeServices?.soakTestService.stop('app_shutdown')
     } catch (error) {
         logBootstrap('Failed to stop soak test during shutdown', error)
+    }
+
+    try {
+        runtimeServices?.schedulerService.stop()
+    } catch (error) {
+        logBootstrap('Failed to stop scheduler during shutdown', error)
     }
 
     // Close database on app quit
@@ -272,7 +341,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+    if (runtimeServices && BrowserWindow.getAllWindows().length === 0) {
         createWindow()
     }
 })

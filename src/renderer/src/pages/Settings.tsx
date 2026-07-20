@@ -42,6 +42,9 @@ import {
     AlertBanner,
 } from '../components/ui/surface'
 import { useTheme } from '../contexts/ThemeContext'
+import { SETTINGS_SECRET_MASK } from '../../../shared/types'
+import { CaptchaMetricsPanel } from '../components/captcha'
+import { BackupRestorePanel, ComplianceAuditPanel } from '../components/backup'
 
 interface AppSettings {
     // Browser
@@ -67,6 +70,10 @@ interface AppSettings {
     defaultRating: number
     includePhotos: boolean
     autoGenerateReview: boolean
+    enforceAccountWarmup: boolean
+    enablePerAccountReviewStyle: boolean
+    /** Opt-in only; never auto-on just because Ollama is online */
+    enableAgenticReview: boolean
     manualReviewSubmit: boolean
     allowAutoSubmitOnTrustedHosts: boolean
     trustedAutoSubmitHosts: string
@@ -118,6 +125,8 @@ interface AppSettings {
     // CAPTCHA Solver
     captchaSolverProvider: 'none' | '2captcha' | 'capsolver' | 'local-ai'
     captchaSolverApiKey: string
+    captchaSolverFallbackProvider: 'none' | '2captcha' | 'capsolver' | 'local-ai'
+    captchaSolverFallbackApiKey: string
 
     // In-house AI (Hugging Face)
     hfModelEnabled: boolean
@@ -148,6 +157,9 @@ const DEFAULTS: AppSettings = {
     defaultRating: 5,
     includePhotos: false,
     autoGenerateReview: true,
+    enforceAccountWarmup: false,
+    enablePerAccountReviewStyle: false,
+    enableAgenticReview: false,
     manualReviewSubmit: true,
     allowAutoSubmitOnTrustedHosts: true,
     trustedAutoSubmitHosts: 'localhost,127.0.0.1',
@@ -189,6 +201,8 @@ const DEFAULTS: AppSettings = {
     // CAPTCHA Solver
     captchaSolverProvider: 'none',
     captchaSolverApiKey: '',
+    captchaSolverFallbackProvider: 'none',
+    captchaSolverFallbackApiKey: '',
 
     // In-house AI (Hugging Face)
     hfModelEnabled: false,
@@ -293,7 +307,8 @@ export function Settings() {
     const handleSave = async () => {
         try {
             setSaving(true)
-            await window.electronAPI.settings.saveAll(settings)
+            // Secret fields: mask = keep prior, '' = clear, other = replace+encrypt (main enforces).
+            const saved = await window.electronAPI.settings.saveAll(settings)
             if (window.electronAPI.runtime?.updatePolicy) {
                 await window.electronAPI.runtime.updatePolicy({
                     captchaMode: settings.captchaMode,
@@ -314,7 +329,10 @@ export function Settings() {
                     ragDedupeWindowMinutes: settings.ragDedupeWindowMinutes,
                 })
             }
-            setOriginalSettings({ ...settings })
+            // Re-hydrate from masked public view so secret inputs stay as mask, not raw.
+            const next = saved ? { ...DEFAULTS, ...saved } as AppSettings : { ...settings }
+            setSettings(next)
+            setOriginalSettings(next)
             setHasChanges(false)
             showMsg('success', t('settings.saved'))
         } catch (error) {
@@ -366,14 +384,23 @@ export function Settings() {
         }
     }
 
+    /** True when the field holds a real user-entered secret (not empty / not IPC mask). */
+    const isEditableSecret = (value: string): boolean =>
+        value.trim().length > 0 && value !== SETTINGS_SECRET_MASK
+
     // Proxy API test (calls fproxy:testApi via main; no full key ever logged/returned to UI)
     const handleTestProxyApi = async () => {
-        const key = (settings as any).fproxyApiKey
-        if (!key || !key.trim()) return
+        // When only mask is shown, test uses the key already configured in main (fproxy:testApi).
+        // When user typed a new key, save first so main has the plaintext then test.
         setProxyApiTesting(true)
         setProxyApiStatus('idle')
         setProxyApiResult('')
         try {
+            if (isEditableSecret(settings.fproxyApiKey)) {
+                await window.electronAPI.settings.saveAll({ fproxyApiKey: settings.fproxyApiKey })
+            } else if (!settings.fproxyApiKey || settings.fproxyApiKey === '') {
+                return
+            }
             const res = await window.electronAPI.fproxy?.testApi?.()
             if (res?.success) {
                 setProxyApiStatus('success')
@@ -384,16 +411,18 @@ export function Settings() {
                 setProxyApiStatus('error')
                 setProxyApiResult(res?.message ? t('settings.testFailed') + ': ' + res.message : t('settings.testFailed'))
             }
-        } catch (e: any) {
+        } catch (e: unknown) {
             setProxyApiStatus('error')
-            setProxyApiResult((e?.message || 'Lỗi kết nối').slice(0, 120))
+            const msg = e instanceof Error ? e.message : 'Lỗi kết nối'
+            setProxyApiResult(msg.slice(0, 120))
         } finally {
             setProxyApiTesting(false)
         }
     }
 
     const handleTestApiKey = async () => {
-        if (!settings.groqApiKey.trim()) return
+        // Only test a newly typed key — mask is not the real secret.
+        if (!isEditableSecret(settings.groqApiKey)) return
         try {
             setApiTesting(true)
             setApiStatus('idle')
@@ -654,8 +683,8 @@ export function Settings() {
                         <div>
                             <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.provider')}</label>
                             <Select
-                                value={(settings as any).captchaSolverProvider || 'none'}
-                                onChange={(v) => update('captchaSolverProvider' as any, v)}
+                                value={settings.captchaSolverProvider || 'none'}
+                                onChange={(v) => update('captchaSolverProvider', v as AppSettings['captchaSolverProvider'])}
                                 options={[
                                     { value: 'none', label: 'Off' },
                                     { value: '2captcha', label: '2Captcha' },
@@ -666,13 +695,58 @@ export function Settings() {
                         </div>
                         <div>
                             <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.apiKey')}</label>
-                            <input type="password" value={(settings as any).captchaSolverApiKey || ''} onChange={(e) => update('captchaSolverApiKey' as any, e.target.value)} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="API key..." disabled={(settings as any).captchaSolverProvider === 'none'} />
+                            <input
+                                type="password"
+                                value={settings.captchaSolverApiKey || ''}
+                                onChange={(e) => update('captchaSolverApiKey', e.target.value)}
+                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
+                                placeholder={settings.captchaSolverApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'API key...'}
+                                disabled={settings.captchaSolverProvider === 'none'}
+                                autoComplete="off"
+                            />
                         </div>
                     </div>
-                    {(settings as any).captchaSolverProvider !== 'none' && (
-                        <p className="text-xs text-amber-600">{t('settings.solverWarning').replace('{provider}', (settings as any).captchaSolverProvider)}</p>
+                    {settings.captchaSolverProvider !== 'none' && (
+                        <p className="text-xs text-amber-600">{t('settings.solverWarning').replace('{provider}', settings.captchaSolverProvider)}</p>
                     )}
                 </div>
+
+                {/* Fallback CAPTCHA Solver — only when primary is enabled */}
+                {settings.captchaSolverProvider !== 'none' && (
+                    <>
+                        <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.captchaFallbackProvider')}</div>
+                        <div className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5 space-y-3">
+                            <p className="text-xs text-[#908a9e]">{t('settings.captchaFallbackProviderDesc')}</p>
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.captchaFallbackProvider')}</label>
+                                    <Select
+                                        value={settings.captchaSolverFallbackProvider || 'none'}
+                                        onChange={(v) => update('captchaSolverFallbackProvider', v as AppSettings['captchaSolverFallbackProvider'])}
+                                        options={[
+                                            { value: 'none', label: 'Off' },
+                                            { value: '2captcha', label: '2Captcha' },
+                                            { value: 'capsolver', label: 'CapSolver' },
+                                        ]}
+                                        className="w-full"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.captchaFallbackApiKey')}</label>
+                                    <input
+                                        type="password"
+                                        value={settings.captchaSolverFallbackApiKey || ''}
+                                        onChange={(e) => update('captchaSolverFallbackApiKey', e.target.value)}
+                                        className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
+                                        placeholder={settings.captchaSolverFallbackApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'API key...'}
+                                        disabled={settings.captchaSolverFallbackProvider === 'none'}
+                                        autoComplete="off"
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    </>
+                )}
 
                 {/* Proxy */}
                 <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.proxy')}</div>
@@ -681,8 +755,20 @@ export function Settings() {
                 </FormRow>
                 <FormRow icon={<Key className="h-4 w-4 text-cyan-600" />} label={t('settings.fproxyApiKey')} description={t('settings.fproxyApiKeyDesc')}>
                     <div className="flex gap-2 w-full max-w-md">
-                        <input type="password" value={(settings as any).fproxyApiKey || ''} onChange={(e) => update('fproxyApiKey' as any, e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="fproxy.me key" />
-                        <PrimaryButton icon={proxyApiTesting ? RefreshCw : TestTube2} onClick={handleTestProxyApi} disabled={!((settings as any).fproxyApiKey || '').trim() || proxyApiTesting} className={proxyApiTesting ? '[&_svg]:animate-spin' : ''}>{t('settings.test')}</PrimaryButton>
+                        <input
+                            type="password"
+                            value={settings.fproxyApiKey || ''}
+                            onChange={(e) => update('fproxyApiKey', e.target.value)}
+                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
+                            placeholder={settings.fproxyApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'fproxy.me key'}
+                            autoComplete="off"
+                        />
+                        <PrimaryButton
+                            icon={proxyApiTesting ? RefreshCw : TestTube2}
+                            onClick={handleTestProxyApi}
+                            disabled={(!settings.fproxyApiKey.trim() && settings.fproxyApiKey !== SETTINGS_SECRET_MASK) || proxyApiTesting}
+                            className={proxyApiTesting ? '[&_svg]:animate-spin' : ''}
+                        >{t('settings.test')}</PrimaryButton>
                     </div>
                 </FormRow>
                 {proxyApiStatus !== 'idle' && (
@@ -702,14 +788,29 @@ export function Settings() {
                 )}
             </SectionPanel>
 
+            {/* CAPTCHA Metrics Dashboard (public DTO only) */}
+            <CaptchaMetricsPanel />
+
             {/* 3. AI & REVIEW */}
             <SectionPanel icon={Bot} title={t('settings.ai')} tone="violet">
                 {/* Groq */}
                 <div className="space-y-2 rounded-[18px] border border-[#ece7f5] bg-[#f9f7fe] p-3.5">
                     <div className="flex items-center gap-2 text-sm font-medium"><Key className="h-4 w-4 text-[#735bd6]" />{t('settings.groq')}</div>
                     <div className="flex gap-2">
-                        <input type="password" value={settings.groqApiKey} onChange={(e) => update('groqApiKey', e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="gsk_..." />
-                        <PrimaryButton icon={apiTesting ? RefreshCw : TestTube2} onClick={handleTestApiKey} disabled={!settings.groqApiKey || apiTesting} className={apiTesting ? '[&_svg]:animate-spin' : ''}>{t('settings.test')}</PrimaryButton>
+                        <input
+                            type="password"
+                            value={settings.groqApiKey}
+                            onChange={(e) => update('groqApiKey', e.target.value)}
+                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
+                            placeholder={settings.groqApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'gsk_...'}
+                            autoComplete="off"
+                        />
+                        <PrimaryButton
+                            icon={apiTesting ? RefreshCw : TestTube2}
+                            onClick={handleTestApiKey}
+                            disabled={!isEditableSecret(settings.groqApiKey) || apiTesting}
+                            className={apiTesting ? '[&_svg]:animate-spin' : ''}
+                        >{t('settings.test')}</PrimaryButton>
                     </div>
                     {apiStatus !== 'idle' && (
                         <AlertBanner type={apiStatus === 'valid' ? 'success' : 'error'}>
@@ -761,6 +862,15 @@ export function Settings() {
                     </FormRow>
                     <FormRow icon={<Bot className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.autoGenerateReview')} description={t('settings.autoGenerateReviewDesc')}>
                         <DSToggle checked={settings.autoGenerateReview} onChange={() => update('autoGenerateReview', !settings.autoGenerateReview)} />
+                    </FormRow>
+                    <FormRow icon={<Shield className="h-4 w-4 text-amber-500" />} label={t('settings.enforceAccountWarmup')} description={t('settings.enforceAccountWarmupDesc')}>
+                        <DSToggle checked={settings.enforceAccountWarmup} onChange={() => update('enforceAccountWarmup', !settings.enforceAccountWarmup)} />
+                    </FormRow>
+                    <FormRow icon={<FileText className="h-4 w-4 text-cyan-500" />} label={t('settings.enablePerAccountReviewStyle')} description={t('settings.enablePerAccountReviewStyleDesc')}>
+                        <DSToggle checked={settings.enablePerAccountReviewStyle} onChange={() => update('enablePerAccountReviewStyle', !settings.enablePerAccountReviewStyle)} />
+                    </FormRow>
+                    <FormRow icon={<Cpu className="h-4 w-4 text-violet-500" />} label={t('settings.enableAgenticReview')} description={t('settings.enableAgenticReviewDesc')}>
+                        <DSToggle checked={settings.enableAgenticReview} onChange={() => update('enableAgenticReview', !settings.enableAgenticReview)} />
                     </FormRow>
                     <FormRow icon={<Languages className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.defaultReviewLanguage')} description={t('settings.defaultReviewLanguageDesc')}>
                         <Select value={settings.defaultReviewLanguage} onChange={(v) => update('defaultReviewLanguage', v as 'vi'|'en')} options={[
@@ -847,6 +957,10 @@ export function Settings() {
                 </div>
             </SectionPanel>
 
+            {/* Backup / Restore + Compliance audit history (public DTO only) */}
+            <BackupRestorePanel />
+            <ComplianceAuditPanel />
+
             {/* 6. GIỚI THIỆU / ABOUT */}
             <SectionPanel icon={Info} title={t('settings.appAbout')} tone="slate">
                 {/* Update mode + controls (end-to-end via updates IPC + UpdateService) */}
@@ -857,7 +971,7 @@ export function Settings() {
                             <div className="text-xs text-[#6f697c]">{t('settings.updateModeDesc')}</div>
                         </div>
                         <Select
-                            value={(settings as any).updateMode || 'manual'}
+                            value={settings.updateMode || 'manual'}
                             onChange={(v) => update('updateMode' as any, v as 'auto' | 'manual')}
                             options={[
                                 { value: 'manual', label: t('settings.updateModeManual') },

@@ -1,5 +1,15 @@
 # Project QA Log
 
+Last updated: 2026-06-xx (release-manager Option1 fix for main branch)
+
+## 2026-06-xx (Release Manager Option 1: fix tag/commit on 'main' not 'master')
+- User: scripts/release-manager.ps1 (called by Release-Manager.bat) Option 1 was doing version bump + commit/tag/push on current WORK branch (master) + --tags. Wrong: GitHub default is 'main', history uses "Merge branch 'master'", tags must land on main HEAD for correct release/CI.
+- Only edited Option 1 git flow (kept bump choice, `npm version ... --no-git-tag-version`, local build optional, Ensure-GitHubAuth fully intact). No other options, no build/CI, no other files.
+- New flow (per spec): RELEASE_BRANCH='main', WORK_BRANCH=current; on WORK: add package.json + chore(release) commit + push WORK; (if != main: fetch + checkout main [clear error stop if dirty] + merge --ff-only/reset to origin/main + merge WORK with msg "Merge branch '..' (release vX.Y.Z)" [on conflict: stop+print manual steps, NO auto-resolve, leave merge state] + push main); tag vX.Y.Z on current (main) HEAD (prompt/force -f if exists) + push (force opt); checkout back WORK if needed; success msg emphasizes "DA PUSH main + TAG ... (tag tren 'main')".
+- Safety: every git op checks $LASTEXITCODE, throws descriptive (no-accent VN added text), stops without hiding state. Special case when already on main (skip merge).
+- Verification: self read full script + context/qa first; manual git branch confirmed master in env; used targeted search_replace; temp parser helper; final `powershell ... Parser::ParseInput` -> PARSE_OK. No other modules impacted.
+- Recorded per Antigravity memory policy + user "TU DOC file va SUA" + short final output constraint. 1 file edited.
+
 Last updated: 2026-06-xx
 
 ## 2026-06-xx (Fix keyword concat bug on reopen form for organic/map_search)
@@ -273,3 +283,22 @@ Last updated: 2026-06-xx
 - Files: settings.ts, UpdateService.ts, FProxyService.ts, fproxy.ts, preload/index.ts, Settings.tsx, en.json, vi.json.
 - Verification: `npm run typecheck` PASS (0), `npm run gate:quick` PASS (type+lint 0). No full keys logged, ~10s timeout, strict, no layer mix, defaults safe, prior autoUpdate field untouched for compat.
 - Per SOP/Antigravity + user short-final constraint. Recorded.
+
+## 2026-07-13 (Production hardening + 7-Grok parallel review)
+
+- [architecture] Durable Review queue now uses atomic claim, immutable terminal states, boot recovery, per-account concurrency, and fail-closed loading.
+- [security] Added review submission intent (`submitting/success/unconfirmed`) to prevent crash double-post; Agentic Review is opt-in and never falls back after submit; auth is strict before posting.
+- [security] Settings/API/account/proxy secrets are encrypted with `safeStorage`; renderer receives safe DTOs or masks. IPC and profile filesystem paths are runtime-validated and guarded.
+- [database] Init is fail-closed with WAL, `integrity_check`, bounded pre-migration snapshots, migration error propagation, and retry-safe singleton publication.
+- [ui] Warmup now shows blocked/throttled/ready tiers; recovery banner exposes pending campaigns and manual Resume; Scheduler invokes real automation with backoff.
+- [testing] Final verification: `gate:quick` PASS; 516/516 tests PASS; Vite production build PASS; Electron feature smoke 17/17 PASS, 0 page errors, 0 console errors. Output: `output/electron-feature-smoke/2026-07-13T18-12-09-338Z`.
+- [deploy] Remaining release work: packaged win-unpacked/NSIS smoke, CI release dependency on quality gates, signing/asar/native-module matrix.
+
+## 2026-07-14 (Website SEO hardening + 7-Grok implementation/review)
+
+- [architecture] Reworked Web SEO into source-aware Google discovery -> verified landing -> safe site browse -> quality assessment; direct fallback is never mislabeled organic.
+- [security] Added public URL, mapped-IPv6/rebinding-host, unsafe path, redirect, popup, and same-site guards; removed cart/checkout/form/chat/phone/payment/external action paths.
+- [database] Added migration v2 and structured Web SEO campaign/log fields for dwell, organic policy, discovery source, numeric quality, countable, and target host.
+- [ui] Added Safe/Balanced/Fast presets, URL/keyword/dwell validation, ETA, reuse of matching website locations, Web SEO badge, responsive mode controls, and paused Runtime V2 handling.
+- [testing] Final verification: `gate:quick` PASS; 558/558 tests PASS; Vite production build PASS; Electron feature smoke 18/18 PASS, 0 page errors, 0 console errors. Output: `output/electron-feature-smoke/2026-07-14T09-33-28-081Z`.
+- [remaining] Live Google SERP/CAPTCHA/proxy behavior requires disposable credentials and opt-in smoke; durable per-visit Traffic atomic claim/recovery is still backlog.

@@ -40,9 +40,27 @@ import {
     Badge,
 } from '../components/ui/surface'
 import type { Tone } from '../components/ui/surface'
+import {
+    ProxyRuntimePreflightButton,
+    ProxyPreflightResultPanel,
+    type ProxyRuntimePreflightResult,
+} from '../components/proxy'
+import type {
+    AccountImportPayload,
+    AccountUpdatePayload,
+    PublicAccount,
+} from '../../../shared/account-contracts'
+import {
+    WarmupStatusCell,
+    type WarmupActivityType,
+} from '../components/accounts'
 
 type Tab = 'accounts' | 'proxies'
 type LoginStatus = 'idle' | 'logging_in' | 'success' | 'failed'
+type EditableAccount = PublicAccount & {
+    password: string
+    twoFactorSecret: string
+}
 
 export function Accounts() {
     const { t } = useI18n()
@@ -80,13 +98,15 @@ function AccountsTab() {
     const {
         accounts, stats, loading, error,
         fetchAccounts, fetchStats, addAccount, deleteAccount, updateAccount,
-        importAccounts, testLogin, checkLiveDie, checkAllPending
+        importAccounts, testLogin, checkLiveDie, checkAllPending,
+        warmupStatuses, warmupLoading, warmupError, warmupActionLoading, warmupApiAvailable,
+        fetchWarmupStatuses, startWarmup, cancelWarmup,
     } = useAccountStore()
     const [selectedIds, setSelectedIds] = useState<Set<number | string>>(new Set())
     const [showAddModal, setShowAddModal] = useState(false)
     const [showImportModal, setShowImportModal] = useState(false)
     const [showEditModal, setShowEditModal] = useState(false)
-    const [editingAccount, setEditingAccount] = useState<any>(null)
+    const [editingAccount, setEditingAccount] = useState<EditableAccount | null>(null)
     const [searchQuery, setSearchQuery] = useState('')
     const [newAccount, setNewAccount] = useState({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' as 'auto' | 'manual' })
     const [importText, setImportText] = useState('')
@@ -106,7 +126,18 @@ function AccountsTab() {
     useEffect(() => {
         fetchAccounts()
         fetchStats()
+        void fetchWarmupStatuses()
     }, [])
+
+    // Poll batch statuses while any warmup is running (single getAllStatuses, no N+1).
+    useEffect(() => {
+        const hasRunning = Object.values(warmupStatuses).some((s) => s.state === 'running')
+        if (!hasRunning || !warmupApiAvailable) return
+        const timer = window.setInterval(() => {
+            void fetchWarmupStatuses()
+        }, 4000)
+        return () => window.clearInterval(timer)
+    }, [warmupStatuses, warmupApiAvailable, fetchWarmupStatuses])
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
@@ -146,7 +177,7 @@ function AccountsTab() {
     const handleAddAccount = async () => {
         if (!newAccount.email || !newAccount.password) return
         const payload = { ...newAccount, email: normalizeEmail(newAccount.email) }
-        const created: any = await addAccount(payload as any)
+        const created = await addAccount(payload)
         setNewAccount({ email: '', password: '', recoveryEmail: '', recoveryPhone: '', twoFactorSecret: '', loginType: 'auto' })
         setShowAddModal(false)
 
@@ -224,30 +255,52 @@ function AccountsTab() {
     const handleImport = async () => {
         if (!importText.trim()) return
         const lines = importText.split('\n').filter(l => l.trim())
-        const accountsToImport: any[] = []
+        const accountsToImport: AccountImportPayload[] = []
         let hasHeader = false
         const first = lines[0]?.toLowerCase() || ''
         if (first.includes('email') && first.includes('pass')) { hasHeader = true }
 
+        const header = hasHeader
+            ? lines[0].split(/[:|,;\t]/).map(value => value.trim().toLowerCase())
+            : []
+        const headerIndex = (...names: string[]) => header.findIndex(value => names.includes(value))
+
         for (let i = hasHeader ? 1 : 0; i < lines.length; i++) {
             const line = lines[i]
-            // Support header-aware or delimited: , ; : | tab ; also allow "email,pass,2fa,login"
-            const parts = line.split(/[:|,;\t]/).map(p => p.trim()).filter(Boolean)
+            const parts = line.split(/[:|,;\t]/).map(p => p.trim())
             if (parts.length < 2) continue
-            const entry: any = {
-                email: normalizeEmail(parts[0]),  // normalize here for import CSV too
-                password: parts[1],
-                recoveryEmail: parts[2] || undefined,
-                twoFactorSecret: parts[3] || undefined,
-                loginType: 'auto' as const,
+
+            const read = (index: number) => index >= 0 ? parts[index]?.trim() || undefined : undefined
+            const email = hasHeader ? read(headerIndex('email', 'gmail')) : read(0)
+            const password = hasHeader ? read(headerIndex('password', 'pass', 'pwd')) : read(1)
+            if (!email || !password) continue
+
+            const entry: AccountImportPayload = {
+                email: normalizeEmail(email),
+                password,
             }
-            // Detect if 4th/5th looks like login type
-            const last = (parts[4] || parts[3] || '').toLowerCase()
-            if (last === 'manual' || last === 'auto') {
-                entry.loginType = last as 'auto' | 'manual'
-                if (parts[3] && last !== parts[3].toLowerCase()) entry.twoFactorSecret = parts[3]
+
+            if (hasHeader) {
+                entry.recoveryEmail = read(headerIndex('recoveryemail', 'recovery_email'))
+                entry.recoveryPhone = read(headerIndex('recoveryphone', 'recovery_phone'))
+                entry.twoFactorSecret = read(headerIndex('2fa', '2fa_secret', 'totp', 'twofactorsecret'))
+                const loginType = read(headerIndex('login_type', 'logintype'))?.toLowerCase()
+                if (loginType === 'auto' || loginType === 'manual') entry.loginType = loginType
+            } else {
+                const third = read(2)
+                const fourth = read(3)?.toLowerCase()
+                const fifth = read(4)?.toLowerCase()
+                const isLegacyRecoveryLayout = Boolean(third?.includes('@') && read(3) && fifth)
+                if (isLegacyRecoveryLayout) {
+                    entry.recoveryEmail = third
+                    entry.twoFactorSecret = read(3)
+                    if (fifth === 'auto' || fifth === 'manual') entry.loginType = fifth
+                } else {
+                    entry.twoFactorSecret = third
+                    if (fourth === 'auto' || fourth === 'manual') entry.loginType = fourth
+                }
             }
-            if (entry.email && entry.password) accountsToImport.push(entry)
+            accountsToImport.push(entry)
         }
 
         const count = await importAccounts(accountsToImport)
@@ -265,23 +318,26 @@ function AccountsTab() {
         setSelectedIds(new Set())
     }
 
-    const handleEdit = (account: any) => {
-        setEditingAccount({ ...account })
+    const handleEdit = (account: PublicAccount) => {
+        setEditingAccount({ ...account, password: '', twoFactorSecret: '' })
         setShowEditModal(true)
         closeDropdown()
     }
 
     const handleSaveEdit = async () => {
         if (!editingAccount) return
-        await updateAccount(editingAccount.id, {
+        const update: AccountUpdatePayload = {
             email: editingAccount.email,
-            password: editingAccount.password,
             recoveryEmail: editingAccount.recoveryEmail,
             recoveryPhone: editingAccount.recoveryPhone,
-            twoFactorSecret: editingAccount.twoFactorSecret,
             loginType: editingAccount.loginType,
             status: editingAccount.status,
-        })
+        }
+        if (editingAccount.password.trim()) update.password = editingAccount.password
+        if (editingAccount.twoFactorSecret.trim()) {
+            update.twoFactorSecret = editingAccount.twoFactorSecret
+        }
+        await updateAccount(editingAccount.id, update)
         setShowEditModal(false)
         setEditingAccount(null)
     }
@@ -378,6 +434,14 @@ function AccountsTab() {
         setCheckingAll(false)
     }
 
+    const handleStartWarmup = (accountId: number, activityType: WarmupActivityType) => {
+        void startWarmup(accountId, { activityType })
+    }
+
+    const handleCancelWarmup = (accountId: number) => {
+        void cancelWarmup(accountId)
+    }
+
     const statusToneMap: Record<string, Tone> = {
         active: 'emerald',
         banned: 'rose',
@@ -461,6 +525,21 @@ function AccountsTab() {
             render: (account: any) => <span className="font-medium text-[#17171f]">{account.totalReviews}</span>,
         },
         {
+            key: 'warmup',
+            header: t('accounts.warmup.column', 'Warmup'),
+            render: (account: PublicAccount) => (
+                <WarmupStatusCell
+                    account={account}
+                    status={warmupStatuses[account.id]}
+                    apiAvailable={warmupApiAvailable}
+                    actionLoading={Boolean(warmupActionLoading[account.id])}
+                    t={t}
+                    onStart={handleStartWarmup}
+                    onCancel={handleCancelWarmup}
+                />
+            ),
+        },
+        {
             key: 'lastUsed',
             header: t('accounts.lastUsed'),
             render: (account: any) => {
@@ -532,12 +611,24 @@ function AccountsTab() {
                 <PrimaryButton icon={UserPlus} onClick={() => setShowAddModal(true)}>
                     {t('accounts.addAccount')}
                 </PrimaryButton>
-                <IconButton icon={RefreshCw} label={t('common.refresh')} onClick={() => fetchAccounts()}
-                    className={loading ? '[&_svg]:animate-spin' : ''} />
+                <IconButton
+                    icon={RefreshCw}
+                    label={t('common.refresh')}
+                    onClick={() => {
+                        void fetchAccounts()
+                        void fetchWarmupStatuses()
+                    }}
+                    className={loading || warmupLoading ? '[&_svg]:animate-spin' : ''}
+                />
             </Toolbar>
 
             {/* Error */}
             {error && <AlertBanner type="error" title={error} />}
+            {warmupError && (
+                <AlertBanner type="error" title={t('accounts.warmup.error', 'Warmup error')}>
+                    {warmupError}
+                </AlertBanner>
+            )}
 
             {/* Table */}
             <DataTable
@@ -692,7 +783,7 @@ function AccountsTab() {
                     onClick={(e) => e.stopPropagation()}
                 >
                     {(() => {
-                        const account = accounts.find((a: any) => a.id === openDropdown)
+                        const account = accounts.find((a) => a.id === openDropdown)
                         if (!account) return null
                         const isLogging = loginStates[account.id]?.status === 'logging_in'
                         return (
@@ -747,11 +838,20 @@ function ProxiesTab() {
     const [searchQuery, setSearchQuery] = useState('')
     const [newProxy, setNewProxy] = useState({ host: '', port: '', username: '', password: '', type: 'http' as const })
     const [importText, setImportText] = useState('')
+    const [runtimeResults, setRuntimeResults] = useState<Record<number, ProxyRuntimePreflightResult>>({})
+    const [runtimeFocusId, setRuntimeFocusId] = useState<number | null>(null)
 
     useEffect(() => {
         fetchProxies()
         fetchStats()
     }, [])
+
+    const handleRuntimeResult = (proxyId: number, result: ProxyRuntimePreflightResult) => {
+        setRuntimeResults((prev) => ({ ...prev, [proxyId]: result }))
+        setRuntimeFocusId(proxyId)
+        void fetchProxies()
+        void fetchStats()
+    }
 
     const filteredProxies = proxies.filter(proxy =>
         proxy.host.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -832,16 +932,33 @@ function ProxiesTab() {
         {
             key: 'actions',
             header: t('common.actions'),
-            width: '100px',
+            width: '160px',
             align: 'center' as const,
-            render: (proxy: any) => (
+            render: (proxy: { id: number }) => (
                 <div className="flex items-center justify-center gap-1">
-                    <IconButton icon={Zap} label={t('proxies.checkProxy')} onClick={() => checkProxy(proxy.id)} />
+                    <IconButton
+                        icon={Zap}
+                        label={t('proxies.checkProxy')}
+                        onClick={() => {
+                            void checkProxy(proxy.id)
+                        }}
+                    />
+                    <ProxyRuntimePreflightButton
+                        proxyId={proxy.id}
+                        label="Runtime preflight"
+                        onResult={(result) => handleRuntimeResult(proxy.id, result)}
+                    />
                     <IconButton icon={Trash2} label={t('common.delete')} onClick={() => deleteProxy(proxy.id)} />
                 </div>
             ),
         },
     ]
+
+    const focusedRuntimeResult =
+        runtimeFocusId !== null ? runtimeResults[runtimeFocusId] ?? null : null
+    const focusedProxy = runtimeFocusId !== null
+        ? proxies.find((p) => p.id === runtimeFocusId)
+        : undefined
 
     return (
         <>
@@ -881,6 +998,20 @@ function ProxiesTab() {
 
             {/* Error */}
             {error && <AlertBanner type="error" title={error} />}
+
+            {/* Runtime-parity preflight result (Playwright + ProxyBridge path) */}
+            {focusedRuntimeResult && (
+                <ProxyPreflightResultPanel
+                    result={focusedRuntimeResult}
+                    proxyLabel={
+                        focusedProxy
+                            ? `${focusedProxy.host}:${focusedProxy.port}`
+                            : runtimeFocusId != null
+                                ? `#${runtimeFocusId}`
+                                : undefined
+                    }
+                />
+            )}
 
             {/* Table */}
             <DataTable

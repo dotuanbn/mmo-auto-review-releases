@@ -15,6 +15,7 @@ import {
     getReviewSubmissionDecision,
     requestManualReviewSubmissionApproval,
 } from '../services/ComplianceService'
+import { googleMapsReviewHandler } from './GoogleMapsReviewHandler'
 
 export interface AgentAction {
     thought: string
@@ -22,6 +23,166 @@ export interface AgentAction {
     element_id?: number
     value?: string
 }
+
+export interface AgenticReviewResult {
+    success: boolean
+    error?: string
+    /**
+     * When true (default on soft failure), controller may fall back to linear postReview.
+     * MUST be false once a submit-like click was attempted (double-post safety).
+     */
+    allowLinearFallback?: boolean
+    /**
+     * True after a submit/post-like element was successfully clicked.
+     * Controllers must treat unconfirmed + submitAttempted as non-retryable for linear submit.
+     */
+    submitAttempted?: boolean
+}
+
+/**
+ * Pure policy: linear fallback only when we are certain submit was never clicked.
+ */
+export function allowAgenticLinearFallback(submitAttempted: boolean): boolean {
+    return submitAttempted !== true
+}
+
+export function buildAgenticSuccessResult(submitAttempted: boolean): AgenticReviewResult {
+    return {
+        success: true,
+        submitAttempted,
+        allowLinearFallback: false,
+    }
+}
+
+export function buildAgenticFailureResult(
+    error: string,
+    submitAttempted: boolean,
+): AgenticReviewResult {
+    return {
+        success: false,
+        error,
+        submitAttempted,
+        allowLinearFallback: allowAgenticLinearFallback(submitAttempted),
+    }
+}
+
+/**
+ * Minimal probe shape for submit-element classification (testable pure policy).
+ * Mirrors the fields used from ObservedElementSummary.
+ */
+export interface SubmitElementProbe {
+    tagName?: string
+    textContent?: string
+    ariaLabel?: string
+    title?: string
+    placeholder?: string
+    role?: string
+    type?: string
+}
+
+/**
+ * Normalize label text: NFD strip diacritics, map Vietnamese đ→d,
+ * lower-case, collapse whitespace.
+ * (Đ/đ do not decompose under NFD; must replace explicitly.)
+ */
+export function normalizeSubmitLabelText(value?: string): string {
+    if (!value) {
+        return ''
+    }
+
+    return value
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/đ/gi, 'd')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim()
+}
+
+/**
+ * Submit controls must be actionable (button / submit input / role=button|link).
+ * Plain text nodes or non-interactive tags are never treated as submit.
+ */
+export function hasSubmitControlContext(probe: SubmitElementProbe): boolean {
+    const tag = (probe.tagName || '').toLowerCase()
+    const role = normalizeSubmitLabelText(probe.role)
+    const type = normalizeSubmitLabelText(probe.type)
+
+    if (type === 'submit') {
+        return true
+    }
+    if (tag === 'button') {
+        return true
+    }
+    if (tag === 'input' && (type === 'button' || type === 'submit' || type === 'image')) {
+        return true
+    }
+    if (role === 'button' || role === 'link' || role === 'menuitem') {
+        return true
+    }
+    // Anchor styled as CTA is common on Maps web UI
+    if (tag === 'a') {
+        return true
+    }
+
+    return false
+}
+
+/**
+ * Pure isSubmitElement policy (shared by handler + corpus tests).
+ *
+ * - Requires button/submit/role context (not bare text).
+ * - Uses word/token boundaries — no bare substring match for gui/dang
+ *   (avoids guide, pending-ish noise, postal, etc.).
+ * - Excludes sign-in / login labels that contain "dang" (đăng nhập).
+ * - Does not use placeholder alone as submit evidence.
+ */
+export function isSubmitElementSummary(probe?: SubmitElementProbe | null): boolean {
+    if (!probe) {
+        return false
+    }
+
+    if (!hasSubmitControlContext(probe)) {
+        return false
+    }
+
+    // Labels only — exclude placeholder (often "post your thoughts" on textareas).
+    const label = normalizeSubmitLabelText(
+        [probe.textContent, probe.ariaLabel, probe.title, probe.type]
+            .filter((part): part is string => typeof part === 'string' && part.length > 0)
+            .join(' '),
+    )
+
+    if (!label) {
+        return false
+    }
+
+    // Sign-in / login must never count as review submit (VI "đăng nhập" → "dang nhap").
+    if (/\b(dang nhap|sign in|log in|login|sign up|create account|tao tai khoan)\b/.test(label)) {
+        return false
+    }
+
+    // EN whole-word tokens
+    if (/\b(post|submit|publish)\b/.test(label)) {
+        return true
+    }
+
+    // VI multi-word completion phrases (normalized, no diacritics)
+    if (/\b(hoan tat|xac nhan)\b/.test(label)) {
+        return true
+    }
+
+    // VI single-token "đăng"/"gửi" only as whole words — never bare substring.
+    // e.g. "guide" must NOT match "gui"; "dang nhap" already excluded above.
+    if (/\b(dang|gui)\b/.test(label)) {
+        return true
+    }
+
+    return false
+}
+
+// Re-export pure gate for callers that already import this module
+export { shouldUseAgenticReview } from '../services/ReviewService'
 
 export class AgenticReviewHandler {
     private MAX_STEPS = 20
@@ -269,34 +430,8 @@ export class AgenticReviewHandler {
         return summaries.find(summary => summary.id === elementId)
     }
 
-    private normalizedText(value?: string): string {
-        if (!value) {
-            return ''
-        }
-
-        return value
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .toLowerCase()
-            .replace(/\s+/g, ' ')
-            .trim()
-    }
-
     private isSubmitElement(summary?: ObservedElementSummary): boolean {
-        if (!summary) {
-            return false
-        }
-
-        const text = this.normalizedText([
-            summary.textContent,
-            summary.ariaLabel,
-            summary.title,
-            summary.placeholder,
-            summary.role,
-            summary.type,
-        ].filter(Boolean).join(' '))
-
-        return /(post|submit|publish|dang|gui|hoan tat|xac nhan)/i.test(text)
+        return isSubmitElementSummary(summary)
     }
 
     async performReview(
@@ -308,12 +443,23 @@ export class AgenticReviewHandler {
         campaignId: number,
         threadId: number,
         shouldStopCheck: () => boolean
-    ): Promise<{ success: boolean; error?: string }> {
+    ): Promise<AgenticReviewResult> {
+        /** Once true, linear fallback is forbidden (double-post safety). */
+        let submitAttempted = false
+
         try {
+            if (shouldStopCheck()) {
+                return buildAgenticFailureResult('Campaign stopped by user', submitAttempted)
+            }
+
             this.log(`T${threadId}: Navigating to ${locationUrl}`)
             await page.goto(locationUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
             await this.preparePage(page, threadId)
             await this.delay(3000, 5000)
+
+            if (shouldStopCheck()) {
+                return buildAgenticFailureResult('Campaign stopped by user', submitAttempted)
+            }
 
             const complianceSettings = loadSettings()
             const submitDecision = getReviewSubmissionDecision(locationUrl, complianceSettings)
@@ -412,12 +558,37 @@ Rules:
                 this.sendStatusToUI(campaignId, 50, `T${threadId}: Agent Act: ${actionData.action} - ${this.sanitizeForStatus(actionData.thought, 140)}`)
 
                 if (actionData.action === 'finish') {
-                    this.log(`T${threadId}: Agent completed goal successfully.`)
-                    return { success: true }
+                    // Never trust LLM finish alone — require positive verification signals.
+                    await this.delay(800, 1400)
+                    const verification = await googleMapsReviewHandler.verifyReviewSubmitted(page)
+                    if (verification.success && submitAttempted) {
+                        this.log(`T${threadId}: Agent finish verified (submission confirmed).`)
+                        return buildAgenticSuccessResult(submitAttempted)
+                    }
+                    if (verification.success) {
+                        return {
+                            success: false,
+                            error: 'Existing review UI detected without a submit in this session',
+                            submitAttempted: true,
+                            allowLinearFallback: false,
+                        }
+                    }
+                    const canFallback = allowAgenticLinearFallback(submitAttempted)
+                    this.log(
+                        `T${threadId}: Agent finish NOT verified: ${verification.error || 'unknown'}. ` +
+                        `submitAttempted=${submitAttempted}, allowLinearFallback=${canFallback}.`,
+                    )
+                    return buildAgenticFailureResult(
+                        verification.error || 'Agent finish without verified submission',
+                        submitAttempted,
+                    )
                 }
 
                 if (actionData.action === 'fail') {
-                    return { success: false, error: `Agent declared failure: ${actionData.thought}` }
+                    return buildAgenticFailureResult(
+                        `Agent declared failure: ${actionData.thought}`,
+                        submitAttempted,
+                    )
                 }
 
                 if (actionData.action === 'wait') {
@@ -435,21 +606,65 @@ Rules:
                 if (actionData.element_id !== undefined && elementIds.has(actionData.element_id)) {
                     try {
                         const targetSummary = this.getSummaryById(summaries, actionData.element_id)
-                        if (actionData.action === 'click' && this.isSubmitElement(targetSummary) && !submitDecision.allowed) {
-                            const manualMsg = buildManualSubmitMessage(locationUrl, complianceSettings)
-                            this.log(`T${threadId}: Waiting manual approval before submit: ${submitDecision.reason}`)
-                            this.sendStatusToUI(campaignId, 95, `T${threadId}: ${manualMsg} Waiting for approval...`)
-                            const manualResult = await requestManualReviewSubmissionApproval({
-                                locationUrl,
-                                locationName,
-                                campaignId,
-                                threadId,
-                                reason: submitDecision.reason,
-                            })
-                            if (!manualResult.approved) {
-                                return { success: false, error: `${manualMsg} (reason: ${manualResult.reason})` }
+                        if (actionData.action === 'click' && this.isSubmitElement(targetSummary)) {
+                            // After a prior submit click, never click submit again (double-post).
+                            if (submitAttempted) {
+                                this.log(`T${threadId}: Skipping re-click of submit-like element (already attempted).`)
+                                await this.delay(800, 1400)
+                                const reverify = await googleMapsReviewHandler.verifyReviewSubmitted(page)
+                                if (reverify.success) {
+                                    return buildAgenticSuccessResult(true)
+                                }
+                                return buildAgenticFailureResult(
+                                    reverify.error || 'Submit already attempted; submission unconfirmed',
+                                    true,
+                                )
                             }
-                            this.sendStatusToUI(campaignId, 96, `T${threadId}: Manual approval received. Continuing submit...`)
+
+                            if (shouldStopCheck()) {
+                                return buildAgenticFailureResult('Campaign stopped by user', submitAttempted)
+                            }
+                            if (!submitDecision.allowed) {
+                                const manualMsg = buildManualSubmitMessage(locationUrl, complianceSettings)
+                                this.log(`T${threadId}: Waiting manual approval before submit: ${submitDecision.reason}`)
+                                this.sendStatusToUI(campaignId, 95, `T${threadId}: ${manualMsg} Waiting for approval...`)
+                                const manualResult = await requestManualReviewSubmissionApproval({
+                                    locationUrl,
+                                    locationName,
+                                    campaignId,
+                                    threadId,
+                                    reason: submitDecision.reason,
+                                })
+                                if (!manualResult.approved) {
+                                    return buildAgenticFailureResult(
+                                        `${manualMsg} (reason: ${manualResult.reason})`,
+                                        submitAttempted,
+                                    )
+                                }
+                                this.sendStatusToUI(campaignId, 96, `T${threadId}: Manual approval received. Continuing submit...`)
+                            }
+                            if (shouldStopCheck()) {
+                                return buildAgenticFailureResult('Campaign stopped by user', submitAttempted)
+                            }
+
+                            // Mark immediately before click so any partial post blocks linear fallback.
+                            submitAttempted = true
+                            await this.clickObservedElement(page, actionData.element_id, threadId)
+                            this.log(`T${threadId}: Submit-like element clicked; verifying immediately.`)
+                            await this.delay(800, 1400)
+                            const postClickVerify = await googleMapsReviewHandler.verifyReviewSubmitted(page)
+                            if (postClickVerify.success) {
+                                this.log(`T${threadId}: Submit verified after click.`)
+                                return buildAgenticSuccessResult(true)
+                            }
+                            // Unconfirmed after submit click — never allow linear re-submit.
+                            this.log(
+                                `T${threadId}: Submit clicked but unverified: ${postClickVerify.error || 'unknown'}`,
+                            )
+                            return buildAgenticFailureResult(
+                                postClickVerify.error || 'Submit clicked but submission unconfirmed',
+                                true,
+                            )
                         }
 
                         if (actionData.action === 'click') {
@@ -463,6 +678,14 @@ Rules:
                         const errorMessage = this.formatError(error)
                         this.log(`T${threadId}: Action execution failed on element ${actionData.element_id}: ${errorMessage}`)
                         this.sendStatusToUI(campaignId, 50, `T${threadId}: Action failed on element ${actionData.element_id}: ${this.sanitizeForStatus(errorMessage, 150)}`)
+
+                        // If submit was already marked, surface unconfirmed failure (no linear fallback).
+                        if (submitAttempted) {
+                            return buildAgenticFailureResult(
+                                `Submit attempted then action failed: ${errorMessage}`,
+                                true,
+                            )
+                        }
 
                         if (this.shouldRecoverOverlay(errorMessage)) {
                             const recovered = await this.recoverFromUnexpectedOverlay(page, threadId)
@@ -483,14 +706,17 @@ Rules:
             }
 
             if (shouldStopCheck()) {
-                return { success: false, error: 'Campaign stopped by user' }
+                return buildAgenticFailureResult('Campaign stopped by user', submitAttempted)
             }
 
-            return { success: false, error: 'Maximum agent steps reached without finishing.' }
+            return buildAgenticFailureResult(
+                'Maximum agent steps reached without finishing.',
+                submitAttempted,
+            )
         } catch (error) {
             const errorMsg = this.formatError(error)
             this.log(`T${threadId}: Error: ${errorMsg}`)
-            return { success: false, error: errorMsg }
+            return buildAgenticFailureResult(errorMsg, submitAttempted)
         }
     }
 }

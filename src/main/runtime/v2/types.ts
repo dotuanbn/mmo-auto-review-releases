@@ -23,6 +23,7 @@ export interface RuntimeThreadStatusV2 {
 export interface RuntimeStatusV2 {
     version: 'v2'
     isRunning: boolean
+    isPaused?: boolean
     campaignId: number | null
     campaignName: string
     currentRound: number

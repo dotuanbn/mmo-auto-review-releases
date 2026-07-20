@@ -1,25 +1,39 @@
+/**
+ * Web SEO organic browse flow — fail-closed target resolution, SERP discovery,
+ * single direct fallback, read-only same-site actions, canonical quality scoring.
+ */
+
 import { Page } from 'playwright'
 import { HumanBehavior } from './HumanBehavior'
-import { VietnameseDataGenerator } from './VietnameseDataGenerator'
 import { DOMUtils, ObservedElementSummary } from './DOMUtils'
 import { contextualInterruptionResolver, ContextualInterruptionResolveResult } from './ContextualInterruptionResolver'
 import { moveCursor, clickCursor } from './BrowserCursorOverlay'
 import { captchaSolverService } from '../services/CaptchaSolverService'
+import {
+    type WebSeoFlowConfig,
+    type WebSeoFlowResult,
+    type WebSeoActionRecord,
+    type WebSeoErrorCode,
+    type WebSeoDiscoverySource,
+    type WebSeoSiteType,
+    resolveWebSeoTarget,
+    isSameWebSeoSite,
+    extractWebSeoDestination,
+    buildWebSeoFallbackUrls,
+    createEmptyWebSeoFlowResult,
+} from '../../shared/web-seo-contracts'
+import {
+    classifyWebSeoSite,
+    buildWebSeoActionPlan,
+    isWebSeoSafeActionId,
+    type WebSeoSafeActionId,
+} from './web-seo/WebSeoActionPolicy'
+import { assessWebSeoQuality } from './web-seo/WebSeoQualityPolicy'
+import { CaptchaDetector } from '../../shared/captcha/CaptchaDetector'
 
-export interface SeoFlowConfig {
-    keyword: string
-    targetDomain: string
-    minTimeOnPageSeconds: number
-    maxTimeOnPageSeconds: number
-    captchaStrategy?: 'auto_skip' | 'manual'
-}
-
-export interface SeoFlowResult {
-    success: boolean
-    foundWebsite: boolean
-    actionsPerformed: { action: string; success: boolean }[]
-    message: string
-}
+/** TrafficBoostEngine compile aliases (stable public names). */
+export type SeoFlowConfig = WebSeoFlowConfig
+export type SeoFlowResult = WebSeoFlowResult
 
 export type StatusCallback = (status: {
     action: string
@@ -27,32 +41,111 @@ export type StatusCallback = (status: {
     message?: string
 }) => void
 
+type CaptchaStrategy = NonNullable<WebSeoFlowConfig['captchaStrategy']>
+
+type FlowRuntime = {
+    targetUrl: string
+    targetHost: string
+    deadlineAt?: number
+    shouldStop?: () => boolean
+    captchaStrategy: CaptchaStrategy
+    safeHomeUrl: string
+}
+
+function clampDwellSeconds(value: number, floor = 10, ceiling = 300): number {
+    if (!Number.isFinite(value)) return floor
+    return Math.max(floor, Math.min(ceiling, Math.round(value)))
+}
+
+function unknownErrorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message
+    if (typeof error === 'string') return error
+    if (error == null) return 'Unknown error'
+    try {
+        return String(error)
+    } catch {
+        return 'Unknown error'
+    }
+}
+
+function hostFromUrl(url: string): string {
+    try {
+        return new URL(url).hostname.replace(/^www\./i, '').toLowerCase()
+    } catch {
+        return ''
+    }
+}
+
+function safeUrlForLog(url: string): string {
+    try {
+        const parsed = new URL(url)
+        return `${parsed.protocol}//${parsed.host}${parsed.pathname}`
+    } catch {
+        return '[invalid-url]'
+    }
+}
+
+function isDangerousInteractiveTarget(label: string, href: string): boolean {
+    const signal = `${label} ${href}`.toLowerCase()
+    return /(add.?to.?cart|buy now|mua ngay|checkout|payment|thanh toan|place order|dat hang|sign in|login|register|signup|submit)/i.test(signal)
+}
+
 export class WebSeoFlow {
     private onStatus: StatusCallback
-    private actionsLog: { action: string; success: boolean }[] = []
+    private actionsLog: WebSeoActionRecord[] = []
+    private runtime: FlowRuntime | null = null
 
     constructor(onStatus?: StatusCallback) {
         this.onStatus = onStatus || (() => { })
     }
 
-    private report(action: string, success: boolean, message?: string) {
-        this.onStatus({ action, success, message })
-        this.actionsLog.push({ action, success })
+    private report(
+        action: string,
+        success: boolean,
+        detail?: string,
+        durationMs?: number,
+    ): void {
+        const record: WebSeoActionRecord = { action, success }
+        if (detail) record.detail = detail
+        if (typeof durationMs === 'number' && Number.isFinite(durationMs)) {
+            record.durationMs = Math.max(0, Math.round(durationMs))
+        }
+        this.onStatus({ action, success, message: detail })
+        this.actionsLog.push(record)
+    }
+
+    private isCancelled(): boolean {
+        const rt = this.runtime
+        if (!rt) return false
+        if (typeof rt.shouldStop === 'function') {
+            try {
+                if (rt.shouldStop()) return true
+            } catch {
+                // ignore shouldStop errors
+            }
+        }
+        if (typeof rt.deadlineAt === 'number' && Number.isFinite(rt.deadlineAt)) {
+            if (Date.now() >= rt.deadlineAt) return true
+        }
+        return false
+    }
+
+    private remainingMs(): number {
+        const rt = this.runtime
+        if (!rt || typeof rt.deadlineAt !== 'number' || !Number.isFinite(rt.deadlineAt)) {
+            return Number.POSITIVE_INFINITY
+        }
+        return Math.max(0, rt.deadlineAt - Date.now())
     }
 
     private async cleanupExtraTabs(activePage: Page, reason: string): Promise<void> {
-        if (activePage.isClosed()) {
-            return
-        }
+        if (activePage.isClosed()) return
 
         const pages = activePage.context().pages()
         let closedCount = 0
 
         for (const tab of pages) {
-            if (tab === activePage || tab.isClosed()) {
-                continue
-            }
-
+            if (tab === activePage || tab.isClosed()) continue
             try {
                 await tab.close({ runBeforeUnload: false })
                 closedCount++
@@ -128,6 +221,8 @@ export class WebSeoFlow {
     }
 
     private async resolveBlockingPrompt(page: Page, reason: string): Promise<boolean> {
+        if (this.isCancelled()) return false
+
         const sharedRecovery = await contextualInterruptionResolver.resolve(page, {
             reason: `web_seo_${reason}`,
             useLlmFallback: false,
@@ -137,6 +232,7 @@ export class WebSeoFlow {
             campaignType: 'web_seo',
             domain: page.url(),
         }).catch((): ContextualInterruptionResolveResult => ({ handled: false }))
+
         if (sharedRecovery.handled) {
             this.report('prompt_resolved', true, `${reason}: resolved by shared context resolver (${sharedRecovery.via || 'unknown'})`)
             return true
@@ -160,9 +256,7 @@ export class WebSeoFlow {
             .filter(summary => {
                 const tag = (summary.tagName || '').toLowerCase()
                 const role = (summary.role || '').toLowerCase()
-                if (tag === 'input' || tag === 'textarea' || tag === 'select') {
-                    return false
-                }
+                if (tag === 'input' || tag === 'textarea' || tag === 'select') return false
                 return tag === 'button' || tag === 'a' || role === 'button' || role === 'link' || role === 'menuitem'
             })
             .map(summary => ({
@@ -194,164 +288,399 @@ export class WebSeoFlow {
         return false
     }
 
-    async execute(page: Page, config: SeoFlowConfig): Promise<SeoFlowResult> {
-        const result: SeoFlowResult = {
-            success: false,
-            foundWebsite: false,
-            actionsPerformed: [],
-            message: ''
+    private verifyPageHost(page: Page, target: string): boolean {
+        if (page.isClosed()) return false
+        try {
+            return isSameWebSeoSite(page.url(), target)
+        } catch {
+            return false
+        }
+    }
+
+    private async ensureSameSite(page: Page, target: string, actionId: string): Promise<boolean> {
+        if (this.verifyPageHost(page, target)) return true
+
+        this.report(actionId, false, 'Left target site — recovering')
+        try {
+            await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => { })
+            await HumanBehavior.randomDelay(300, 700)
+            if (this.verifyPageHost(page, target)) {
+                await this.cleanupExtraTabs(page, `same_site_recover_${actionId}`)
+                return false
+            }
+        } catch {
+            // fall through to safe home
         }
 
+        const home = this.runtime?.safeHomeUrl || target
         try {
-            await HumanBehavior.randomDelay(1000, 2000)
+            await page.goto(home, { waitUntil: 'domcontentloaded', timeout: 15000 })
+            await HumanBehavior.randomDelay(400, 900)
+        } catch {
+            // recovery failed
+        }
+        await this.cleanupExtraTabs(page, `same_site_goto_${actionId}`)
+        return false
+    }
+
+    // ==================== PUBLIC API ====================
+
+    async execute(page: Page, config: WebSeoFlowConfig): Promise<WebSeoFlowResult> {
+        this.actionsLog = []
+        const startedAt = Date.now()
+        const result = createEmptyWebSeoFlowResult()
+        const minDwell = clampDwellSeconds(config.minTimeOnPageSeconds)
+        const maxDwell = clampDwellSeconds(
+            Math.max(config.minTimeOnPageSeconds, config.maxTimeOnPageSeconds),
+            minDwell,
+            300,
+        )
+
+        const resolved = resolveWebSeoTarget(config.targetDomain)
+        if (!resolved.ok) {
+            result.errorCode = resolved.error
+            result.message = `Invalid target: ${resolved.error}`
+            result.actionsPerformed = [...this.actionsLog]
+            result.durationSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+            return result
+        }
+
+        this.runtime = {
+            targetUrl: resolved.url,
+            targetHost: resolved.host,
+            deadlineAt: config.deadlineAt,
+            shouldStop: config.shouldStop,
+            captchaStrategy: config.captchaStrategy || 'manual',
+            safeHomeUrl: resolved.url,
+        }
+
+        let discoverySource: WebSeoDiscoverySource = 'unreachable'
+        let organicHit = false
+        let hostVerified = false
+        let foundWebsite = false
+        let siteType: WebSeoSiteType = 'generic'
+        let errorCode: WebSeoErrorCode | undefined
+        let interrupted = false
+        let onSiteStartedAt: number | null = null
+
+        try {
+            if (this.isCancelled()) {
+                interrupted = true
+                result.success = false
+                result.errorCode = 'cancelled'
+                result.message = 'Cancelled before start'
+                result.actionsPerformed = [...this.actionsLog]
+                result.durationSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+                result.qualityScore = 0
+                result.countable = false
+                return result
+            }
+
+            await HumanBehavior.randomDelay(800, 1600)
             await this.cleanupExtraTabs(page, 'execute_start')
             await this.resolveBlockingPrompt(page, 'execute_start')
 
-            let reachedWebsite = false
-            const captchaStrategy = config.captchaStrategy || 'manual'
+            const captchaStrategy = this.runtime.captchaStrategy
 
-            // 1. Try searching on Google first
+            // 1) Google search
             this.report('search', true, `Searching: ${config.keyword}`)
-            const searchSuccess = await this.searchOnGoogle(page, config.keyword, captchaStrategy)
+            const searchOk = await this.searchOnGoogle(page, config.keyword, captchaStrategy)
 
-            if (searchSuccess) {
-                // 2. Try to find and click target domain in search results
-                this.report('find_website', true, `Looking for: ${config.targetDomain}`)
-                const found = await this.findAndClickTargetWebsite(page, config.targetDomain, captchaStrategy)
-                if (found) {
-                    result.foundWebsite = true
-                    reachedWebsite = true
-                    this.report('browse', true, 'Website found via Google! Browsing...')
-                    await this.cleanupExtraTabs(page, 'after_find_target')
+            // 2) SERP target click + host verify
+            if (searchOk && !this.isCancelled()) {
+                this.report('find_website', true, `Looking for: ${resolved.host}`)
+                const found = await this.findAndClickTargetWebsite(page, resolved.url, captchaStrategy)
+                if (found && this.verifyPageHost(page, resolved.url)) {
+                    organicHit = true
+                    hostVerified = true
+                    foundWebsite = true
+                    discoverySource = 'organic'
+                    onSiteStartedAt = Date.now()
+                    this.runtime.safeHomeUrl = page.url()
+                    this.report('browse', true, 'Website found via Google SERP')
+                    await this.cleanupExtraTabs(page, 'after_organic_hit')
+                } else if (found && !this.verifyPageHost(page, resolved.url)) {
+                    this.report('host_mismatch', false, 'SERP click landed off-target')
+                    errorCode = 'host_mismatch'
                 }
             }
 
-            // 3. FALLBACK: If search failed (CAPTCHA) or website not found,
-            //    navigate directly to the target URL
-            if (!reachedWebsite) {
-                this.report('fallback_direct', true, `Navigating directly to ${config.targetDomain}...`)
-                try {
-                    const targetUrl = config.targetDomain.startsWith('http')
-                        ? config.targetDomain
-                        : `https://${config.targetDomain}`
-                    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 })
-                    await HumanBehavior.randomDelay(3000, 6000)
-                    reachedWebsite = true
-                    result.foundWebsite = true
-                    this.report('fallback_success', true, 'Reached website via direct URL')
-                    await this.cleanupExtraTabs(page, 'fallback_direct')
-                } catch (navError) {
-                    // Try with www prefix
-                    try {
-                        const wwwUrl = `https://www.${config.targetDomain.replace(/^(https?:\/\/)?(www\.)?/, '')}`
-                        await page.goto(wwwUrl, { waitUntil: 'domcontentloaded', timeout: 20000 })
-                        await HumanBehavior.randomDelay(3000, 6000)
-                        reachedWebsite = true
-                        result.foundWebsite = true
-                        this.report('fallback_www', true, 'Reached website via www URL')
-                        await this.cleanupExtraTabs(page, 'fallback_www')
-                    } catch {
-                        this.report('fallback_failed', false, 'Could not reach website at all')
+            // 3) Direct fallback (once) — blocked when requireOrganic
+            if (!foundWebsite && !this.isCancelled()) {
+                if (config.requireOrganic) {
+                    errorCode = 'organic_required'
+                    this.report('organic_required', false, 'Direct fallback disabled (requireOrganic)')
+                } else {
+                    const fallbackOk = await this.tryDirectFallback(page, resolved.url)
+                    if (fallbackOk) {
+                        hostVerified = true
+                        foundWebsite = true
+                        discoverySource = 'direct_fallback'
+                        organicHit = false
+                        errorCode = undefined
+                        onSiteStartedAt = Date.now()
+                        this.runtime.safeHomeUrl = page.url()
+                    } else if (!errorCode) {
+                        errorCode = 'unreachable'
                     }
                 }
             }
 
-            // 4. Perform realistic browsing actions on the website
-            if (reachedWebsite) {
-                const browseSuccess = await this.browseWebsiteLikeRealUser(page, config)
-                result.success = browseSuccess
-                result.actionsPerformed = this.actionsLog
-                result.message = 'SEO flow completed successfully'
-            } else {
-                result.actionsPerformed = this.actionsLog
-                result.message = 'Could not reach website via search or direct URL'
+            if (this.isCancelled() && !foundWebsite) {
+                interrupted = true
+                errorCode = errorCode || 'cancelled'
             }
 
-            return result
+            // 4) Browse when on target
+            if (foundWebsite && hostVerified && !page.isClosed()) {
+                siteType = await this.classifyCurrentPage(page)
+                const browseOk = await this.runBrowsePlan(page, config, siteType, minDwell, maxDwell)
+                if (this.isCancelled()) interrupted = true
 
-        } catch (error: any) {
-            console.error('Error in WebSeoFlow:', error)
-            result.actionsPerformed = this.actionsLog
-            result.message = error?.message || 'Unknown error'
+                const onSiteDurationSeconds = Math.max(
+                    0,
+                    Math.round((Date.now() - (onSiteStartedAt ?? Date.now())) / 1000),
+                )
+                const meaningfulActions = this.actionsLog.filter((action) =>
+                    isWebSeoSafeActionId(action.action),
+                )
+
+                const quality = assessWebSeoQuality({
+                    discoverySource,
+                    organicHit,
+                    hostVerified,
+                    durationSeconds: onSiteDurationSeconds,
+                    minTimeOnPageSeconds: minDwell,
+                    actionsPerformed: meaningfulActions,
+                    requireOrganic: Boolean(config.requireOrganic),
+                    siteType,
+                    interrupted,
+                })
+
+                result.success = browseOk && foundWebsite && hostVerified && !interrupted
+                result.foundWebsite = true
+                result.organicHit = organicHit
+                result.discoverySource = discoverySource
+                result.hostVerified = hostVerified
+                result.finalUrl = page.isClosed() ? '' : page.url()
+                result.siteType = siteType
+                result.actionsPerformed = [...this.actionsLog]
+                result.durationSeconds = onSiteDurationSeconds
+                result.qualityScore = quality.qualityScore
+                result.countable = result.success && quality.countable
+                result.message = result.success
+                    ? (result.countable
+                        ? 'SEO flow completed successfully'
+                        : 'SEO flow completed but did not meet the quality gate')
+                    : 'SEO browsing did not complete'
+                if (errorCode) result.errorCode = errorCode
+                return result
+            }
+
+            // Unreachable / organic_required path
+            result.success = false
+            result.foundWebsite = foundWebsite
+            result.organicHit = organicHit
+            result.discoverySource = discoverySource
+            result.hostVerified = hostVerified
+            result.finalUrl = page.isClosed() ? '' : page.url()
+            result.siteType = siteType
+            result.actionsPerformed = [...this.actionsLog]
+            result.durationSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+            result.qualityScore = 0
+            result.countable = false
+            result.errorCode = errorCode
+                || (config.requireOrganic && !organicHit ? 'organic_required' : 'unreachable')
+            result.message = result.errorCode === 'organic_required'
+                ? 'Organic hit required but not found'
+                : result.errorCode === 'cancelled'
+                    ? 'Cancelled before reaching target'
+                    : 'Could not reach website via search or direct URL'
             return result
+        } catch (error: unknown) {
+            console.error('Error in WebSeoFlow:', error)
+            result.success = false
+            result.foundWebsite = foundWebsite
+            result.organicHit = organicHit
+            result.discoverySource = discoverySource
+            result.hostVerified = hostVerified
+            result.finalUrl = page.isClosed() ? '' : (() => {
+                try { return page.url() } catch { return '' }
+            })()
+            result.siteType = siteType
+            result.actionsPerformed = [...this.actionsLog]
+            result.durationSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+            result.qualityScore = 0
+            result.countable = false
+            result.errorCode = errorCode || 'unknown'
+            result.message = unknownErrorMessage(error)
+            return result
+        } finally {
+            this.runtime = null
+        }
+    }
+
+    /**
+     * Public typed browse path for captcha-cooldown engine.
+     * Returns boolean success for cooldown accounting.
+     */
+    async browseWebsiteLikeRealUser(page: Page, config: WebSeoFlowConfig): Promise<boolean> {
+        this.actionsLog = []
+        const resolved = resolveWebSeoTarget(config.targetDomain)
+        if (!resolved.ok) {
+            this.report('browse_invalid_target', false, `Invalid target: ${resolved.error}`)
+            return false
+        }
+
+        const prevRuntime = this.runtime
+        this.runtime = {
+            targetUrl: resolved.url,
+            targetHost: resolved.host,
+            deadlineAt: config.deadlineAt,
+            shouldStop: config.shouldStop,
+            captchaStrategy: config.captchaStrategy || 'manual',
+            safeHomeUrl: page.isClosed() ? resolved.url : (this.verifyPageHost(page, resolved.url) ? page.url() : resolved.url),
+        }
+
+        try {
+            if (page.isClosed()) return false
+            if (!this.verifyPageHost(page, resolved.url)) {
+                try {
+                    await page.goto(resolved.url, { waitUntil: 'domcontentloaded', timeout: 20000 })
+                } catch {
+                    return false
+                }
+                if (!this.verifyPageHost(page, resolved.url)) return false
+            }
+
+            const minDwell = clampDwellSeconds(config.minTimeOnPageSeconds)
+            const maxDwell = clampDwellSeconds(
+                Math.max(config.minTimeOnPageSeconds, config.maxTimeOnPageSeconds),
+                minDwell,
+                300,
+            )
+            const siteType = await this.classifyCurrentPage(page)
+            return await this.runBrowsePlan(page, config, siteType, minDwell, maxDwell)
+        } catch (error: unknown) {
+            console.error('Error in browseWebsiteLikeRealUser:', error)
+            return false
+        } finally {
+            this.runtime = prevRuntime
         }
     }
 
     // ==================== CAPTCHA HANDLING ====================
 
+    private isCaptchaOrConsentUrl(url: string): boolean {
+        return CaptchaDetector.isCaptchaUrl(url) || (url || '').toLowerCase().includes('consent.google')
+    }
+
+    private async hasVisibleCaptchaChallenge(page: Page): Promise<boolean> {
+        return CaptchaDetector.isCaptchaPage(page)
+    }
+
+    private async tryDismissGoogleConsent(page: Page): Promise<boolean> {
+        try {
+            const acceptBtn = await page.$(
+                'button[id*="accept"], button[id="L2AGLb"], button[aria-label*="Accept"], button:has-text("Accept"), button:has-text("I agree")',
+            )
+            if (acceptBtn) {
+                await acceptBtn.click()
+                await HumanBehavior.randomDelay(1000, 2500)
+                return true
+            }
+        } catch {
+            // ignore
+        }
+        return false
+    }
+
     private async detectAndHandleCaptcha(
         page: Page,
-        strategy: 'auto_skip' | 'manual'
+        strategy: CaptchaStrategy,
     ): Promise<boolean> {
         try {
-            const url = page.url()
-            // Check if redirected to Google sorry/captcha page
-            if (url.includes('google.com/sorry') || url.includes('ipv4.google.com/sorry') || url.includes('consent.google')) {
-                // === TRY AUTO-SOLVE FIRST ===
-                this.report('captcha_auto_solve_attempt', true, 'Trying to auto-solve CAPTCHA via API...')
-                const solved = await captchaSolverService.solveCaptchaOnPage(page)
-                if (solved) {
-                    await HumanBehavior.randomDelay(1500, 3000)
-                    const stillBlocked = url.includes('google.com/sorry') || url.includes('ipv4.google.com/sorry')
-                    const currentUrl = page.url()
-                    if (!currentUrl.includes('google.com/sorry') && !currentUrl.includes('ipv4.google.com/sorry')) {
-                        this.report('captcha_auto_solved', true, 'CAPTCHA solved automatically via API!')
-                        return true
-                    }
+            if (this.isCancelled()) return false
+
+            let currentUrl = page.url()
+
+            // Consent page first (live URL)
+            if (currentUrl.toLowerCase().includes('consent.google') && !currentUrl.includes('/sorry')) {
+                const dismissed = await this.tryDismissGoogleConsent(page)
+                currentUrl = page.url()
+                if (dismissed && !this.isCaptchaOrConsentUrl(currentUrl)) {
+                    this.report('consent_dismissed', true, 'Google consent dismissed')
+                    return true
                 }
+                // Still on consent/sorry — continue into captcha path
+            }
 
-                // === FALLBACK TO OLD BEHAVIOR ===
-                // Check if a CAPTCHA solver provider is actually configured
-                const { loadSettings: loadCaptchaSettings } = await import('../ipc/settings')
-                const captchaSettings = loadCaptchaSettings()
-                const hasCaptchaProvider = captchaSettings.captchaSolverProvider && captchaSettings.captchaSolverProvider !== 'none' && captchaSettings.captchaSolverApiKey
+            if (!this.isCaptchaOrConsentUrl(currentUrl)) {
+                // Ignore passive reCAPTCHA widgets; only a visible challenge with matching text blocks.
+                if (!(await this.hasVisibleCaptchaChallenge(page))) return true
+            }
 
-                if (strategy === 'auto_skip' || !hasCaptchaProvider) {
-                    // No provider configured OR auto_skip mode → skip manual wait, go directly to target
-                    const reason = !hasCaptchaProvider
-                        ? 'No CAPTCHA solver configured. Skipping manual solve, navigating directly.'
-                        : 'Auto-solve failed. Google CAPTCHA detected. Auto-skip current search flow.'
-                    this.report('captcha_auto_skip', false, reason)
-                    return false
-                }
-
-                // Provider IS configured but solve failed → wait for manual resolution
-                this.report('captcha_detected', false, 'Google CAPTCHA detected. Please solve manually in the browser window.')
-                const start = Date.now()
-                const timeoutMs = 180_000
-
-                while (Date.now() - start < timeoutMs) {
-                    await HumanBehavior.randomDelay(2000, 3000)
-                    const current = page.url()
-                    const stillBlocked = current.includes('google.com/sorry')
-                        || current.includes('ipv4.google.com/sorry')
-                        || current.includes('consent.google')
-
-                    const hasRecaptcha = await page.locator('iframe[src*="recaptcha"], div.g-recaptcha').count().catch(() => 0)
-                    if (!stillBlocked && hasRecaptcha === 0) {
-                        this.report('captcha_solved_manual', true, 'Manual CAPTCHA verification completed')
-                        await HumanBehavior.randomDelay(1500, 2500)
-                        return true
-                    }
-                }
-
-                this.report('captcha_failed', false, 'CAPTCHA was not solved within timeout window')
+            if (strategy === 'auto_skip') {
+                this.report('captcha_auto_skip', false, 'Google CAPTCHA detected. Auto-skip search flow.')
                 return false
             }
 
-            // Check for consent page
-            if (url.includes('consent.google')) {
-                const acceptBtn = await page.$('button[id*="accept"], button[aria-label*="Accept"], button:has-text("Accept"), button:has-text("I agree")')
-                if (acceptBtn) {
-                    await acceptBtn.click()
-                    await HumanBehavior.randomDelay(2000, 4000)
+            let hasCaptchaProvider = false
+            try {
+                const { loadSettings: loadCaptchaSettings } = await import('../ipc/settings')
+                const captchaSettings = loadCaptchaSettings()
+                hasCaptchaProvider = Boolean(
+                    captchaSettings.captchaSolverProvider
+                    && captchaSettings.captchaSolverProvider !== 'none'
+                    && captchaSettings.captchaSolverApiKey,
+                )
+            } catch {
+                hasCaptchaProvider = false
+            }
+
+            if (!hasCaptchaProvider) {
+                this.report('captcha_auto_skip', false, 'No CAPTCHA solver configured. Skipping manual solve.')
+                return false
+            }
+
+            // Auto-solve attempt for interactive/manual mode only.
+            this.report('captcha_auto_solve_attempt', true, 'Trying to auto-solve CAPTCHA via API...')
+            const solved = await captchaSolverService.solveCaptchaOnPage(page)
+            if (solved) {
+                await HumanBehavior.randomDelay(1500, 3000)
+                const afterSolveUrl = page.url()
+                if (!this.isCaptchaOrConsentUrl(afterSolveUrl) && !(await this.hasVisibleCaptchaChallenge(page))) {
+                    this.report('captcha_auto_solved', true, 'CAPTCHA solved automatically via API')
                     return true
                 }
             }
 
-            return true // No CAPTCHA detected
-        } catch {
-            return true // Assume no CAPTCHA on error
+            // Manual poll — deadline / shouldStop win
+            this.report('captcha_detected', false, 'Google CAPTCHA detected. Please solve manually.')
+            const start = Date.now()
+            const timeoutMs = Math.min(180_000, this.remainingMs())
+
+            while (Date.now() - start < timeoutMs) {
+                if (this.isCancelled()) {
+                    this.report('captcha_cancelled', false, 'CAPTCHA wait cancelled by deadline/stop')
+                    return false
+                }
+                await HumanBehavior.randomDelay(2000, 3000)
+                const live = page.url()
+                const stillBlocked = this.isCaptchaOrConsentUrl(live)
+                if (!stillBlocked && !(await this.hasVisibleCaptchaChallenge(page))) {
+                    this.report('captcha_solved_manual', true, 'Manual CAPTCHA verification completed')
+                    await HumanBehavior.randomDelay(1500, 2500)
+                    return true
+                }
+            }
+
+            this.report('captcha_failed', false, 'CAPTCHA was not solved within timeout window')
+            return false
+        } catch (error: unknown) {
+            // Fail-closed: treat captcha handling errors as blocked
+            this.report('captcha_error', false, unknownErrorMessage(error))
+            return false
         }
     }
 
@@ -360,82 +689,67 @@ export class WebSeoFlow {
     private async searchOnGoogle(
         page: Page,
         keyword: string,
-        captchaStrategy: 'auto_skip' | 'manual'
+        captchaStrategy: CaptchaStrategy,
     ): Promise<boolean> {
         try {
+            if (this.isCancelled()) return false
+
             await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 15000 })
-            await HumanBehavior.randomDelay(1000, 3000)
+            await HumanBehavior.randomDelay(1000, 2500)
+            if (this.isCancelled()) return false
+
             await this.resolveBlockingPrompt(page, 'search_google_landing')
-
-            // Handle consent/cookie popup
-            try {
-                const acceptBtn = await page.$('button[id*="accept"], button[id="L2AGLb"], button:has-text("Accept"), button:has-text("I agree")')
-                if (acceptBtn) {
-                    await acceptBtn.click()
-                    await HumanBehavior.randomDelay(1000, 2000)
-                }
-            } catch { /* no consent popup */ }
-
+            await this.tryDismissGoogleConsent(page)
             await this.resolveBlockingPrompt(page, 'search_google_post_consent')
 
-            // Check for CAPTCHA before searching
             const captchaOk = await this.detectAndHandleCaptcha(page, captchaStrategy)
-            if (!captchaOk) return false
+            if (!captchaOk || this.isCancelled()) return false
 
-            // Type the keyword like a human
             const searchBox = await page.$('textarea[name="q"], input[name="q"]')
-            if (searchBox) {
-                await HumanBehavior.humanType(page, 'textarea[name="q"], input[name="q"]', keyword)
-                await HumanBehavior.randomDelay(500, 1500)
-                await Promise.all([
-                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { }),
-                    page.keyboard.press('Enter')
-                ])
-                await HumanBehavior.randomDelay(2000, 4000)
-                await this.resolveBlockingPrompt(page, 'search_results_loaded')
+            if (!searchBox) return false
 
-                // Check for CAPTCHA after search
-                const captchaOkAfterSearch = await this.detectAndHandleCaptcha(page, captchaStrategy)
-                if (!captchaOkAfterSearch) return false
+            await HumanBehavior.humanType(page, 'textarea[name="q"], input[name="q"]', keyword)
+            await HumanBehavior.randomDelay(500, 1200)
+            if (this.isCancelled()) return false
 
-                return true
-            }
-            return false
-        } catch (e) {
-            console.error('Error searching on Google:', e)
+            await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { }),
+                page.keyboard.press('Enter'),
+            ])
+            await HumanBehavior.randomDelay(2000, 3500)
+            if (this.isCancelled()) return false
+
+            await this.resolveBlockingPrompt(page, 'search_results_loaded')
+            const captchaOkAfter = await this.detectAndHandleCaptcha(page, captchaStrategy)
+            return captchaOkAfter && !this.isCancelled()
+        } catch (error: unknown) {
+            console.error('Error searching on Google:', error)
             return false
         }
     }
 
-    // ==================== FIND & CLICK TARGET WEBSITE ====================
+    // ==================== FIND & CLICK TARGET ====================
 
     private async findAndClickTargetWebsite(
         page: Page,
-        targetDomain: string,
-        captchaStrategy: 'auto_skip' | 'manual'
+        targetUrl: string,
+        captchaStrategy: CaptchaStrategy,
     ): Promise<boolean> {
         const MAX_PAGES = 3
-
-        const normalizedTarget = targetDomain
-            .replace(/^(https?:\/\/)?(www\.)?/, '')
-            .replace(/\/$/, '')
-            .toLowerCase()
+        const baseUrl = page.url()
 
         for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
+            if (this.isCancelled()) return false
             await this.resolveBlockingPrompt(page, `find_target_page_${pageNum}`)
 
-            // Check for CAPTCHA on search results page
             const captchaOk = await this.detectAndHandleCaptcha(page, captchaStrategy)
-            if (!captchaOk) {
-                return false
-            }
+            if (!captchaOk) return false
+            if (this.isCancelled()) return false
 
-            // Slowly scroll down to look at results
             await HumanBehavior.randomScroll(page, 2)
-            await HumanBehavior.randomDelay(500, 1500)
+            await HumanBehavior.randomDelay(500, 1200)
 
-            // Collect ALL links from search results
-            const resultLinks = await page.evaluate((target) => {
+            const rawLinks = await page.evaluate(() => {
                 const selectors = [
                     '#search a[href]',
                     'div.g a[href]',
@@ -443,91 +757,48 @@ export class WebSeoFlow {
                     'div[data-sokoban-container] a[href]',
                     '.yuRUbf a[href]',
                 ]
-
-                const allLinks: { href: string; index: number; text: string }[] = []
+                const allLinks: { href: string; text: string }[] = []
                 const seen = new Set<string>()
-
                 for (const sel of selectors) {
-                    const elements = document.querySelectorAll(sel)
-                    elements.forEach((el, idx) => {
+                    document.querySelectorAll(sel).forEach((el) => {
                         const anchor = el as HTMLAnchorElement
                         const href = anchor.href
-                        if (href && !seen.has(href) && !href.includes('google.com') && !href.includes('webcache')) {
-                            seen.add(href)
-                            allLinks.push({
-                                href,
-                                index: idx,
-                                text: anchor.textContent?.substring(0, 100) || ''
-                            })
-                        }
+                        if (!href || seen.has(href)) return
+                        seen.add(href)
+                        allLinks.push({
+                            href,
+                            text: (anchor.textContent || '').substring(0, 100),
+                        })
                     })
                 }
+                return allLinks
+            }).catch(() => [] as { href: string; text: string }[])
 
-                const normalizedTarget = target.toLowerCase()
-                for (const link of allLinks) {
-                    try {
-                        const url = new URL(link.href)
-                        const linkDomain = url.hostname.replace(/^www\./, '').toLowerCase()
-                        if (linkDomain === normalizedTarget || linkDomain.endsWith('.' + normalizedTarget)) {
-                            return { found: true, href: link.href, text: link.text }
-                        }
-                    } catch { /* skip invalid URLs */ }
+            let match: { href: string; dest: string; text: string } | null = null
+            for (const link of rawLinks) {
+                const dest = extractWebSeoDestination(link.href, baseUrl || page.url())
+                if (!dest) continue
+                if (isSameWebSeoSite(dest, targetUrl)) {
+                    match = { href: link.href, dest, text: link.text }
+                    break
                 }
-
-                return { found: false, href: '', text: '' }
-            }, normalizedTarget)
-
-            if (resultLinks.found) {
-                this.report('found_result', true, `Found: "${resultLinks.text}"`)
-
-                const targetLink = await page.$(`a[href="${resultLinks.href}"]`)
-                if (targetLink) {
-                    await targetLink.scrollIntoViewIfNeeded()
-                    await HumanBehavior.randomDelay(500, 1000)
-                    await targetLink.hover()
-                    await HumanBehavior.randomDelay(300, 800)
-                    await targetLink.evaluate((node) => {
-                        const anchor = node as HTMLAnchorElement
-                        if (anchor && anchor.tagName === 'A') {
-                            anchor.target = '_self'
-                            anchor.rel = 'noreferrer'
-                        }
-                    }).catch(() => { })
-
-                    const [popupPage] = await Promise.all([
-                        page.context().waitForEvent('page', { timeout: 4000 }).catch(() => null),
-                        Promise.all([
-                            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => { }),
-                            targetLink.click()
-                        ])
-                    ])
-
-                    if (popupPage && !popupPage.isClosed()) {
-                        await popupPage.close({ runBeforeUnload: false }).catch(() => { })
-                    }
-                    await this.cleanupExtraTabs(page, 'after_target_click')
-                    await HumanBehavior.randomDelay(3000, 6000)
-                    return true
-                }
-
-                try {
-                    await page.goto(resultLinks.href, { waitUntil: 'domcontentloaded', timeout: 20000 })
-                    await HumanBehavior.randomDelay(3000, 6000)
-                    await this.cleanupExtraTabs(page, 'fallback_goto_target')
-                    return true
-                } catch { /* failed */ }
             }
 
-            // Not found on this page, go to next
+            if (match) {
+                this.report('found_result', true, `Found: "${match.text || match.dest}"`)
+                const clicked = await this.clickSerpResult(page, match.href, match.dest, targetUrl)
+                if (clicked) return true
+            }
+
             const nextButton = await page.$('a#pnnext, a[aria-label="Next"]')
-            if (nextButton && pageNum < MAX_PAGES) {
+            if (nextButton && pageNum < MAX_PAGES && !this.isCancelled()) {
                 this.report('next_page', true, `Page ${pageNum}: not found, going next...`)
-                await nextButton.hover()
+                await nextButton.hover().catch(() => { })
                 await Promise.all([
-                    page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => { }),
-                    nextButton.click()
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { }),
+                    nextButton.click(),
                 ])
-                await HumanBehavior.randomDelay(2000, 4000)
+                await HumanBehavior.randomDelay(2000, 3500)
             } else {
                 break
             }
@@ -536,915 +807,680 @@ export class WebSeoFlow {
         return false
     }
 
-    // ==================== BROWSE WEBSITE LIKE REAL USER ====================
-
-    browseWebsiteLikeRealUser(page: Page, config: SeoFlowConfig): Promise<boolean> {
-        return this._doBrowse(page, config)
-    }
-
-    private async _doBrowse(page: Page, config: SeoFlowConfig): Promise<boolean> {
-        const timeToSpendMs = Math.floor(
-            Math.random() * (config.maxTimeOnPageSeconds - config.minTimeOnPageSeconds + 1) + config.minTimeOnPageSeconds
-        ) * 1000
-
-        const minTime = Math.max(timeToSpendMs, 30000)
-        const startTime = Date.now()
-
-        // All possible actions with weights (higher = more common)
-        const weightedActions: { fn: () => Promise<void>; weight: number }[] = [
-            { fn: () => this.actionScrollReadContent(page), weight: 5 },
-            { fn: () => this.actionViewImages(page), weight: 4 },
-            { fn: () => this.actionClickProductImageGallery(page), weight: 3 },
-            { fn: () => this.actionHoverElements(page), weight: 3 },
-            { fn: () => this.actionClickInternalLink(page, config.targetDomain), weight: 4 },
-            { fn: () => this.actionCheckContactInfo(page), weight: 3 },
-            { fn: () => this.actionReadProductDetails(page), weight: 4 },
-            { fn: () => this.actionScrollToFooter(page), weight: 2 },
-            { fn: () => this.actionViewSocialLinks(page), weight: 2 },
-            { fn: () => this.actionCheckPricing(page), weight: 4 },
-            { fn: () => this.actionRandomMouseMovement(page), weight: 3 },
-            { fn: () => this.actionScrollUpDown(page), weight: 4 },
-            { fn: () => this.actionClickMenuNav(page), weight: 3 },
-            { fn: () => this.actionAddToCart(page), weight: 3 },
-            { fn: () => this.actionFillCheckoutForm(page, config.targetDomain), weight: 2 },
-            { fn: () => this.actionSearchOnSite(page, config.keyword), weight: 3 },
-            { fn: () => this.actionClickProductTabs(page), weight: 3 },
-            { fn: () => this.actionBrowseCategories(page), weight: 3 },
-            { fn: () => this.actionViewRelatedProducts(page), weight: 3 },
-            { fn: () => this.actionReadReviews(page), weight: 3 },
-            { fn: () => this.actionSelectProductVariant(page), weight: 2 },
-            { fn: () => this.actionViewBreadcrumb(page), weight: 2 },
-            { fn: () => this.actionHoverShareButtons(page), weight: 1 },
-            { fn: () => this.actionZoomImage(page), weight: 2 },
-            // NEW: More diverse actions
-            { fn: () => this.actionClickZaloMessenger(page), weight: 3 },
-            { fn: () => this.actionClickPhoneNumber(page), weight: 3 },
-            { fn: () => this.actionClickImageToOpen(page), weight: 3 },
-            { fn: () => this.actionViewPolicyPages(page), weight: 2 },
-            { fn: () => this.actionClickBannerSlider(page), weight: 2 },
-            { fn: () => this.actionExpandAccordionFAQ(page), weight: 2 },
-            { fn: () => this.actionScrollToSpecificSection(page), weight: 3 },
-            { fn: () => this.actionClickVideoPlay(page), weight: 2 },
-            { fn: () => this.actionResizeAndScroll(page), weight: 1 },
-            { fn: () => this.actionHighlightText(page), weight: 2 },
-        ]
-
-        // Build weighted list
-        const actionPool: (() => Promise<void>)[] = []
-        for (const wa of weightedActions) {
-            for (let i = 0; i < wa.weight; i++) actionPool.push(wa.fn)
-        }
-
+    private async clickSerpResult(
+        page: Page,
+        href: string,
+        dest: string,
+        targetUrl: string,
+    ): Promise<boolean> {
         try {
-            let actionsDone = 0
-            const maxActions = Math.floor(Math.random() * 10) + 10 // 10-19 actions (more diverse)
-
-            while (Date.now() - startTime < minTime && actionsDone < maxActions) {
-                await this.resolveBlockingPrompt(page, `browse_loop_${actionsDone + 1}`)
-                const actionFn = actionPool[Math.floor(Math.random() * actionPool.length)]
-                try { await actionFn() } catch { /* ignore */ }
-                await this.cleanupExtraTabs(page, `browse_action_${actionsDone + 1}`)
-                actionsDone++
-                await HumanBehavior.randomDelay(1500, 4000)
+            // Prefer selector match on original href
+            let targetLink = await page.$(`a[href="${href}"]`)
+            if (!targetLink) {
+                // Fallback: any anchor whose extracted dest matches
+                const anchors = await page.$$('a[href]')
+                for (const a of anchors) {
+                    const h = await a.evaluate((n) => (n as HTMLAnchorElement).href).catch(() => '')
+                    if (!h) continue
+                    const d = extractWebSeoDestination(h, page.url())
+                    if (d && isSameWebSeoSite(d, targetUrl)) {
+                        targetLink = a
+                        break
+                    }
+                }
             }
 
-            // Sometimes scroll back to top before leaving
-            if (Math.random() > 0.4) {
-                await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }))
-                await HumanBehavior.randomDelay(1000, 2000)
+            if (targetLink) {
+                await targetLink.scrollIntoViewIfNeeded().catch(() => { })
+                await HumanBehavior.randomDelay(400, 900)
+                await targetLink.hover().catch(() => { })
+                await HumanBehavior.randomDelay(250, 600)
+                await targetLink.evaluate((node) => {
+                    const anchor = node as HTMLAnchorElement
+                    if (anchor && anchor.tagName === 'A') {
+                        anchor.target = '_self'
+                        anchor.rel = 'noreferrer'
+                    }
+                }).catch(() => { })
+
+                const [popupPage] = await Promise.all([
+                    page.context().waitForEvent('page', { timeout: 4000 }).catch(() => null),
+                    Promise.all([
+                        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => { }),
+                        targetLink.click(),
+                    ]),
+                ])
+
+                if (popupPage && !popupPage.isClosed()) {
+                    await popupPage.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { })
+                    const popupUrl = popupPage.url()
+                    if (isSameWebSeoSite(popupUrl, targetUrl)) {
+                        // Navigate original page to popup URL, then close popup
+                        await page.goto(popupUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(async () => {
+                            await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => { })
+                        })
+                        await popupPage.close({ runBeforeUnload: false }).catch(() => { })
+                    } else {
+                        // Off-site popup — close only
+                        await popupPage.close({ runBeforeUnload: false }).catch(() => { })
+                    }
+                }
+
+                await this.cleanupExtraTabs(page, 'after_target_click')
+                await HumanBehavior.randomDelay(2000, 4000)
+
+                if (this.verifyPageHost(page, targetUrl)) return true
+
+                // If still on Google, try direct dest navigation
+                if (!this.verifyPageHost(page, targetUrl)) {
+                    await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 20000 })
+                    await HumanBehavior.randomDelay(2000, 4000)
+                    await this.cleanupExtraTabs(page, 'serp_goto_dest')
+                    return this.verifyPageHost(page, targetUrl)
+                }
+                return true
             }
 
-            this.report('browse_complete', true, `Done: ${Math.round((Date.now() - startTime) / 1000)}s, ${actionsDone} actions`)
-            return true
-        } catch (e) {
-            console.error('Error browsing website:', e)
+            // Last resort: goto unwrapped destination
+            await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 20000 })
+            await HumanBehavior.randomDelay(2000, 4000)
+            await this.cleanupExtraTabs(page, 'fallback_goto_target')
+            return this.verifyPageHost(page, targetUrl)
+        } catch (error: unknown) {
+            this.report('serp_click_error', false, unknownErrorMessage(error))
             return false
         }
     }
 
-    // ==================== BASIC BROWSING ACTIONS ====================
+    // ==================== DIRECT FALLBACK (single path) ====================
 
-    private async actionScrollReadContent(page: Page) {
-        this.report('scroll_read', true, 'Reading page content...')
-        const count = Math.floor(Math.random() * 4) + 2
-        for (let i = 0; i < count; i++) {
-            await page.evaluate(() => window.scrollBy({ top: 150 + Math.random() * 350, behavior: 'smooth' }))
-            await HumanBehavior.randomDelay(2000, 5000)
+    private async tryDirectFallback(page: Page, targetUrl: string): Promise<boolean> {
+        const urls = buildWebSeoFallbackUrls(targetUrl)
+        if (urls.length === 0) {
+            this.report('fallback_failed', false, 'No safe fallback URLs')
+            return false
+        }
+
+        this.report('fallback_direct', true, `Navigating directly to ${hostFromUrl(targetUrl) || targetUrl}`)
+
+        for (const url of urls) {
+            if (this.isCancelled()) return false
+            try {
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 })
+                await HumanBehavior.randomDelay(2000, 4000)
+                await this.cleanupExtraTabs(page, 'fallback_direct')
+                if (this.verifyPageHost(page, targetUrl)) {
+                    this.report('fallback_success', true, `Reached via ${url}`)
+                    return true
+                }
+                this.report('fallback_host_mismatch', false, `Landed off-target: ${safeUrlForLog(page.url())}`)
+            } catch {
+                // try next variant
+            }
+        }
+
+        this.report('fallback_failed', false, 'Could not reach website via direct URL')
+        return false
+    }
+
+    // ==================== CLASSIFY + BROWSE PLAN ====================
+
+    private async classifyCurrentPage(page: Page): Promise<WebSeoSiteType> {
+        try {
+            const sample = await page.evaluate(() => {
+                const title = document.title || ''
+                const body = (document.body?.innerText || '').slice(0, 2500)
+                const hints: string[] = []
+                document.querySelectorAll('[itemtype], [class*="product"], [class*="price"], article, .blog').forEach((el) => {
+                    const cls = (el as HTMLElement).className
+                    if (typeof cls === 'string' && cls) hints.push(cls.slice(0, 80))
+                    const itemtype = el.getAttribute('itemtype')
+                    if (itemtype) hints.push(itemtype)
+                })
+                return { title, body, hints: hints.slice(0, 20) }
+            })
+            return classifyWebSeoSite({
+                url: page.url(),
+                title: sample.title,
+                textSample: sample.body,
+                htmlHints: sample.hints,
+            })
+        } catch {
+            return classifyWebSeoSite({ url: page.url() })
         }
     }
 
-    private async actionScrollUpDown(page: Page) {
-        this.report('scroll_updown', true, 'Scrolling up and down...')
-        await page.evaluate(() => window.scrollBy({ top: 400 + Math.random() * 500, behavior: 'smooth' }))
-        await HumanBehavior.randomDelay(1000, 2000)
-        await page.evaluate(() => window.scrollBy({ top: -(200 + Math.random() * 300), behavior: 'smooth' }))
-        await HumanBehavior.randomDelay(1500, 3000)
-        await page.evaluate(() => window.scrollBy({ top: 200 + Math.random() * 300, behavior: 'smooth' }))
-        await HumanBehavior.randomDelay(1000, 2000)
+    private async runBrowsePlan(
+        page: Page,
+        config: WebSeoFlowConfig,
+        siteType: WebSeoSiteType,
+        minDwell: number,
+        maxDwell: number,
+    ): Promise<boolean> {
+        const target = this.runtime?.targetUrl || config.targetDomain
+        const dwellSeconds = Math.floor(Math.random() * (maxDwell - minDwell + 1)) + minDwell
+        let timeBudgetMs = dwellSeconds * 1000
+
+        // Deadline wins over dwell
+        const remaining = this.remainingMs()
+        if (Number.isFinite(remaining)) {
+            timeBudgetMs = Math.min(timeBudgetMs, remaining)
+        }
+
+        const startTime = Date.now()
+        const maxActions = Math.min(16, Math.max(6, Math.floor(timeBudgetMs / 4000) + 4))
+        const plan = buildWebSeoActionPlan(siteType, {
+            maxActions,
+            keyword: config.keyword,
+            targetHost: this.runtime?.targetHost,
+        })
+
+        // Deduplicate plan (policy already unique; defense in depth)
+        const seen = new Set<WebSeoSafeActionId>()
+        const uniquePlan: WebSeoSafeActionId[] = []
+        for (const id of plan) {
+            if (seen.has(id)) continue
+            seen.add(id)
+            uniquePlan.push(id)
+        }
+
+        let actionsDone = 0
+        try {
+            for (const actionId of uniquePlan) {
+                if (this.isCancelled()) break
+                if (Date.now() - startTime >= timeBudgetMs) break
+                if (page.isClosed()) break
+
+                await this.resolveBlockingPrompt(page, `browse_${actionId}`)
+                if (this.isCancelled()) break
+
+                const actionStart = Date.now()
+                let ok = true
+                try {
+                    await this.runSafeAction(page, actionId, target)
+                } catch {
+                    ok = false
+                }
+
+                // Same-site guard after every action
+                const stillOnSite = await this.ensureSameSite(page, target, actionId)
+                if (!stillOnSite && !this.verifyPageHost(page, target)) {
+                    ok = false
+                } else if (!this.verifyPageHost(page, target)) {
+                    ok = false
+                }
+
+                const durationMs = Date.now() - actionStart
+                // Update last log entry duration if report was called inside action
+                if (this.actionsLog.length > 0) {
+                    const last = this.actionsLog[this.actionsLog.length - 1]
+                    if (last.action === actionId || last.action.startsWith(actionId)) {
+                        last.durationMs = durationMs
+                        if (!ok) last.success = false
+                    } else {
+                        this.report(actionId, ok, ok ? undefined : 'action failed or left site', durationMs)
+                    }
+                } else {
+                    this.report(actionId, ok, undefined, durationMs)
+                }
+
+                await this.cleanupExtraTabs(page, `browse_action_${actionId}`)
+                actionsDone++
+                if (this.isCancelled()) break
+                await HumanBehavior.randomDelay(800, 2000)
+            }
+
+            // Keep a real on-site dwell window even when site-specific actions finish quickly.
+            while (!this.isCancelled() && !page.isClosed() && Date.now() - startTime < timeBudgetMs) {
+                const remainingBudget = timeBudgetMs - (Date.now() - startTime)
+                if (remainingBudget <= 0) break
+                if (Math.random() > 0.55) {
+                    await page.evaluate(() => window.scrollBy({
+                        top: 80 + Math.random() * 180,
+                        behavior: 'smooth',
+                    })).catch(() => { })
+                }
+                const pauseMs = Math.min(remainingBudget, 900 + Math.floor(Math.random() * 1100))
+                await new Promise((resolve) => setTimeout(resolve, pauseMs))
+            }
+
+            if (!this.isCancelled() && Math.random() > 0.4 && !page.isClosed()) {
+                await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' })).catch(() => { })
+                await HumanBehavior.randomDelay(600, 1200)
+            }
+
+            const elapsed = Math.round((Date.now() - startTime) / 1000)
+            const completed = !this.isCancelled() && actionsDone > 0 && this.verifyPageHost(page, target)
+            this.report('browse_complete', completed, `Done: ${elapsed}s, ${actionsDone} actions`)
+            return completed
+        } catch (error: unknown) {
+            console.error('Error browsing website:', error)
+            return false
+        }
     }
 
-    private async actionRandomMouseMovement(page: Page) {
+    // ==================== SAFE READ-ONLY ACTIONS ====================
+
+    private async runSafeAction(page: Page, actionId: WebSeoSafeActionId, target: string): Promise<void> {
+        switch (actionId) {
+            case 'scroll_read':
+                return this.actionScrollReadContent(page)
+            case 'scroll_updown':
+                return this.actionScrollUpDown(page)
+            case 'mouse_move':
+                return this.actionRandomMouseMovement(page)
+            case 'view_images':
+                return this.actionViewImages(page)
+            case 'gallery_browse':
+                return this.actionClickProductImageGallery(page)
+            case 'hover_elements':
+                return this.actionHoverElements(page)
+            case 'read_details':
+                return this.actionReadProductDetails(page)
+            case 'check_price':
+                return this.actionCheckPricing(page)
+            case 'product_tabs':
+                return this.actionClickProductTabs(page)
+            case 'read_reviews':
+                return this.actionReadReviews(page)
+            case 'expand_faq':
+                return this.actionExpandAccordionFAQ(page)
+            case 'scroll_section':
+                return this.actionScrollToSpecificSection(page)
+            case 'view_breadcrumb':
+                return this.actionViewBreadcrumb(page)
+            case 'view_policy':
+                return this.actionViewPolicyPages(page, target)
+            case 'click_internal':
+                return this.actionClickInternalLink(page, target)
+            case 'view_footer':
+                return this.actionScrollToFooter(page)
+            case 'zoom_image':
+                return this.actionZoomImage(page)
+            case 'highlight_text':
+                return this.actionHighlightText(page)
+            case 'related_hover':
+                return this.actionViewRelatedProductsHover(page)
+            case 'view_social':
+                return this.actionViewSocialLinks(page)
+            case 'view_menu':
+                return this.actionViewMenuNav(page)
+            case 'resize_scroll':
+                return this.actionResizeAndScroll(page)
+            default: {
+                // Exhaustive guard — never run unknown / dangerous actions
+                const _never: never = actionId
+                void _never
+                this.report('unknown_action', false, `Skipped unsafe/unknown action`)
+            }
+        }
+    }
+
+    private async actionScrollReadContent(page: Page): Promise<void> {
+        this.report('scroll_read', true, 'Reading page content...')
+        const count = Math.floor(Math.random() * 4) + 2
+        for (let i = 0; i < count; i++) {
+            if (this.isCancelled()) return
+            await page.evaluate(() => window.scrollBy({ top: 150 + Math.random() * 350, behavior: 'smooth' }))
+            await HumanBehavior.randomDelay(1200, 2800)
+        }
+    }
+
+    private async actionScrollUpDown(page: Page): Promise<void> {
+        this.report('scroll_updown', true, 'Scrolling up and down...')
+        await page.evaluate(() => window.scrollBy({ top: 400 + Math.random() * 500, behavior: 'smooth' }))
+        await HumanBehavior.randomDelay(800, 1500)
+        await page.evaluate(() => window.scrollBy({ top: -(200 + Math.random() * 300), behavior: 'smooth' }))
+        await HumanBehavior.randomDelay(800, 1500)
+        await page.evaluate(() => window.scrollBy({ top: 200 + Math.random() * 300, behavior: 'smooth' }))
+        await HumanBehavior.randomDelay(600, 1200)
+    }
+
+    private async actionRandomMouseMovement(page: Page): Promise<void> {
         this.report('mouse_move', true, 'Moving mouse naturally...')
         try {
             const vp = page.viewportSize()
-            if (vp) {
-                for (let i = 0; i < 4; i++) {
-                    const mx = Math.floor(Math.random() * vp.width)
-                    const my = Math.floor(Math.random() * vp.height)
-                    await moveCursor(page, mx, my)
-                    await page.mouse.move(
-                        mx,
-                        my,
-                        { steps: 10 + Math.floor(Math.random() * 20) }
-                    )
-                    await HumanBehavior.randomDelay(200, 600)
-                }
+            if (!vp) return
+            for (let i = 0; i < 4; i++) {
+                if (this.isCancelled()) return
+                const mx = Math.floor(Math.random() * vp.width)
+                const my = Math.floor(Math.random() * vp.height)
+                await moveCursor(page, mx, my)
+                await page.mouse.move(mx, my, { steps: 10 + Math.floor(Math.random() * 20) })
+                await HumanBehavior.randomDelay(150, 400)
             }
-        } catch { /* ignore */ }
+        } catch {
+            // ignore
+        }
     }
 
-    private async actionScrollToFooter(page: Page) {
+    private async actionScrollToFooter(page: Page): Promise<void> {
         this.report('view_footer', true, 'Viewing footer section...')
         await page.evaluate(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }))
-        await HumanBehavior.randomDelay(2000, 4000)
+        await HumanBehavior.randomDelay(1500, 3000)
         const links = await page.$$('footer a')
         if (links.length > 0) {
             const l = links[Math.floor(Math.random() * Math.min(links.length, 5))]
             await l.hover().catch(() => { })
-            await HumanBehavior.randomDelay(500, 1500)
+            await HumanBehavior.randomDelay(400, 1000)
         }
     }
 
-    // ==================== IMAGE & MEDIA ACTIONS ====================
-
-    private async actionViewImages(page: Page) {
-        this.report('view_images', true, 'Viewing product images...')
+    private async actionViewImages(page: Page): Promise<void> {
+        this.report('view_images', true, 'Viewing images...')
         const sels = [
             '.product-image img', '.gallery img', '.swiper-slide img',
-            '.product-gallery img', '.thumbnail img', '.product img',
-            'figure img', '.owl-item img', '.slick-slide img', 'img[alt]',
+            '.product-gallery img', '.thumbnail img', 'figure img', 'img[alt]',
         ]
         for (const sel of sels) {
             const imgs = await page.$$(sel)
-            if (imgs.length > 0) {
-                const img = imgs[Math.floor(Math.random() * Math.min(imgs.length, 5))]
-                await img.scrollIntoViewIfNeeded().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                await img.hover().catch(() => { })
-                await HumanBehavior.randomDelay(1000, 2000)
-                return
-            }
+            if (imgs.length === 0) continue
+            const img = imgs[Math.floor(Math.random() * Math.min(imgs.length, 5))]
+            await img.scrollIntoViewIfNeeded().catch(() => { })
+            await HumanBehavior.randomDelay(400, 900)
+            await img.hover().catch(() => { })
+            await HumanBehavior.randomDelay(800, 1600)
+            return
         }
     }
 
-    private async actionClickProductImageGallery(page: Page) {
-        this.report('gallery_click', true, 'Browsing image gallery...')
+    private async actionClickProductImageGallery(page: Page): Promise<void> {
+        this.report('gallery_browse', true, 'Browsing image gallery...')
         const thumbSels = [
             '.thumbnail img', '.product-thumbnails img', '.slick-dots li',
             '.swiper-pagination-bullet', '.owl-dot', '.gallery-thumb img',
-            '.product-gallery-thumb img', '[data-thumb] img',
         ]
         for (const sel of thumbSels) {
             const thumbs = await page.$$(sel)
-            if (thumbs.length >= 2) {
-                const count = Math.min(thumbs.length, 3 + Math.floor(Math.random() * 3))
-                for (let i = 0; i < count; i++) {
-                    await thumbs[i].click().catch(() => { })
-                    await HumanBehavior.randomDelay(1000, 2500)
-                }
-                return
+            if (thumbs.length < 2) continue
+            const count = Math.min(thumbs.length, 3)
+            for (let i = 0; i < count; i++) {
+                if (this.isCancelled()) return
+                await thumbs[i].click().catch(() => { })
+                await HumanBehavior.randomDelay(700, 1500)
             }
+            return
         }
-        const navBtns = await page.$$('.swiper-button-next, .slick-next, .owl-next, .gallery-next, [class*="next"]')
+        const navBtns = await page.$$('.swiper-button-next, .slick-next, .owl-next, .gallery-next')
         if (navBtns.length > 0) {
-            const clicks = Math.floor(Math.random() * 3) + 2
-            for (let i = 0; i < clicks; i++) {
-                await navBtns[0].click().catch(() => { })
-                await HumanBehavior.randomDelay(1000, 2000)
-            }
+            await navBtns[0].click().catch(() => { })
+            await HumanBehavior.randomDelay(700, 1400)
         }
     }
 
-    private async actionZoomImage(page: Page) {
-        this.report('zoom_image', true, 'Zooming product image...')
+    private async actionZoomImage(page: Page): Promise<void> {
+        this.report('zoom_image', true, 'Inspecting product image...')
         const imgSels = ['.product-image img', '.main-image img', '.product img', 'figure img']
         for (const sel of imgSels) {
             const img = await page.$(sel)
-            if (img) {
-                await img.scrollIntoViewIfNeeded().catch(() => { })
-                await img.hover().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                await img.click().catch(() => { })
-                await HumanBehavior.randomDelay(2000, 4000)
-
-                // Try deeper image interaction: zoom + pan + next image
-                const focusedImage = await page.$('.fancybox-image, .lightbox img, .mfp-img, .modal img, [role="dialog"] img')
-                const imageForInteraction = focusedImage || img
-                const box = await imageForInteraction.boundingBox().catch(() => null)
-                if (box) {
-                    const centerX = box.x + box.width / 2
-                    const centerY = box.y + box.height / 2
-                    await moveCursor(page, centerX, centerY)
-                    await page.mouse.move(centerX, centerY).catch(() => { })
-                    await HumanBehavior.randomDelay(200, 450)
-                    await page.mouse.wheel(0, -240).catch(() => { })
-                    await HumanBehavior.randomDelay(350, 700)
-                    await page.mouse.down().catch(() => { })
-                    await page.mouse.move(
-                        centerX + (Math.random() > 0.5 ? 120 : -120),
-                        centerY + (Math.random() > 0.5 ? 80 : -80),
-                        { steps: 10 }
-                    ).catch(() => { })
-                    await page.mouse.up().catch(() => { })
-                    await HumanBehavior.randomDelay(400, 800)
-                    await page.mouse.wheel(0, 220).catch(() => { })
-                    await HumanBehavior.randomDelay(300, 650)
-                }
-
-                await page.$('.swiper-button-next, .slick-next, .owl-next, .gallery-next, [aria-label*="Next"]')
-                    .then(btn => btn?.click().catch(() => { }))
-                    .catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-
-                const close = await page.$('.close, .lightbox-close, [aria-label="Close"], .fancybox-close, .modal-close, button[data-dismiss="modal"], .mfp-close')
-                if (close) await close.click().catch(() => { })
-                await page.keyboard.press('Escape').catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                return
+            if (!img) continue
+            await img.scrollIntoViewIfNeeded().catch(() => { })
+            await img.hover().catch(() => { })
+            await HumanBehavior.randomDelay(400, 800)
+            // Hover-only zoom simulation — avoid external lightbox navigation
+            const box = await img.boundingBox().catch(() => null)
+            if (box) {
+                const centerX = box.x + box.width / 2
+                const centerY = box.y + box.height / 2
+                await moveCursor(page, centerX, centerY)
+                await page.mouse.move(centerX, centerY).catch(() => { })
+                await page.mouse.wheel(0, -180).catch(() => { })
+                await HumanBehavior.randomDelay(400, 800)
+                await page.mouse.wheel(0, 160).catch(() => { })
             }
+            return
         }
     }
 
-    private async actionClickImageToOpen(page: Page) {
-        this.report('click_image', true, 'Clicking image to view full size...')
-        const sels = [
-            'a[href*=".jpg"]', 'a[href*=".png"]', 'a[href*=".webp"]',
-            '.product-image a', '.gallery a', 'figure a',
-            'a[data-fancybox]', 'a[data-lightbox]', 'a[rel="lightbox"]',
-            '.fancybox', '.lightbox', '[data-magnify]',
-        ]
-        for (const sel of sels) {
-            const el = await page.$(sel)
-            if (el && await el.isVisible().catch(() => false)) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await el.hover().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                await el.click().catch(() => { })
-                await HumanBehavior.randomDelay(2000, 5000)
-                // Close lightbox/modal
-                const closeBtn = await page.$('.fancybox-close, .lightbox-close, .mfp-close, .close, [aria-label="Close"], .modal-close, button[data-dismiss="modal"]')
-                if (closeBtn) await closeBtn.click().catch(() => { })
-                // Also try pressing Escape
-                await page.keyboard.press('Escape').catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                return
-            }
-        }
-    }
-
-    private async actionClickVideoPlay(page: Page) {
-        this.report('click_video', true, 'Watching video...')
-        const sels = [
-            'video', 'iframe[src*="youtube"]', 'iframe[src*="vimeo"]',
-            '.video-play', '.play-button', '[class*="video"]',
-            'a[href*="youtube.com"]', 'a[href*="youtu.be"]',
-        ]
-        for (const sel of sels) {
-            const el = await page.$(sel)
-            if (el && await el.isVisible().catch(() => false)) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                await el.click().catch(() => { })
-                // Watch for a bit
-                await HumanBehavior.randomDelay(5000, 10000)
-                return
-            }
-        }
-    }
-
-    // ==================== PRODUCT INTERACTION ACTIONS ====================
-
-    private async actionReadProductDetails(page: Page) {
-        this.report('read_product', true, 'Reading product details...')
+    private async actionReadProductDetails(page: Page): Promise<void> {
+        this.report('read_details', true, 'Reading details...')
         const sels = [
             '.product-description', '.product-detail', '.product-info',
-            '.product-content', '.description', '.chi-tiet', '.mo-ta',
-            '.tab-content', '#product-description', 'article', '.entry-content',
+            '.description', '.chi-tiet', '.mo-ta', 'article', '.entry-content',
         ]
         for (const sel of sels) {
             const el = await page.$(sel)
-            if (el) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await HumanBehavior.randomDelay(1000, 2000)
-                for (let i = 0; i < 4; i++) {
-                    await page.evaluate(() => window.scrollBy({ top: 180, behavior: 'smooth' }))
-                    await HumanBehavior.randomDelay(1500, 3500)
-                }
-                return
+            if (!el) continue
+            await el.scrollIntoViewIfNeeded().catch(() => { })
+            await HumanBehavior.randomDelay(800, 1500)
+            for (let i = 0; i < 3; i++) {
+                if (this.isCancelled()) return
+                await page.evaluate(() => window.scrollBy({ top: 180, behavior: 'smooth' }))
+                await HumanBehavior.randomDelay(1000, 2200)
             }
+            return
         }
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < 2; i++) {
             await page.evaluate(() => window.scrollBy({ top: 250, behavior: 'smooth' }))
-            await HumanBehavior.randomDelay(2000, 4000)
+            await HumanBehavior.randomDelay(1000, 2000)
         }
     }
 
-    private async actionCheckPricing(page: Page) {
-        this.report('check_price', true, 'Checking product price...')
+    private async actionCheckPricing(page: Page): Promise<void> {
+        this.report('check_price', true, 'Checking price...')
         const sels = [
             '.price', '.product-price', '.gia', '.current-price', '.sale-price',
             '[class*="price"]', '[class*="gia"]',
-            '.add-to-cart', '.mua-ngay', '.buy-now', '.dat-hang',
-            'button[class*="cart"]', 'button[class*="buy"]', 'button[class*="mua"]',
         ]
         for (const sel of sels) {
             const el = await page.$(sel)
-            if (el) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                await el.hover().catch(() => { })
-                await HumanBehavior.randomDelay(1500, 3000)
-                return
-            }
+            if (!el) continue
+            await el.scrollIntoViewIfNeeded().catch(() => { })
+            await el.hover().catch(() => { })
+            await HumanBehavior.randomDelay(1000, 2000)
+            return
         }
     }
 
-    private async actionSelectProductVariant(page: Page) {
-        this.report('select_variant', true, 'Selecting product variant...')
-        const variantSels = [
-            '.color-option', '.size-option', '.variant-option',
-            '.product-variants label', '.swatch-element', '[data-variant]',
-            'select[name*="variant"]', 'select[name*="size"]', 'select[name*="color"]',
-            '.product-option input[type="radio"]',
-        ]
-        for (const sel of variantSels) {
-            const options = await page.$$(sel)
-            if (options.length >= 2) {
-                const opt = options[Math.floor(Math.random() * options.length)]
-                await opt.scrollIntoViewIfNeeded().catch(() => { })
-                await opt.click().catch(() => { })
-                await HumanBehavior.randomDelay(1000, 2000)
-                this.report('variant_selected', true, 'Variant selected')
-                return
-            }
-        }
-    }
-
-    private async actionClickProductTabs(page: Page) {
+    private async actionClickProductTabs(page: Page): Promise<void> {
         this.report('product_tabs', true, 'Viewing product tabs...')
         const tabSels = [
             '.product-tabs a', '.tab-link', '.nav-tabs a', '.tab-title',
-            '[role="tab"]', '.tabs a', '.product-tab',
+            '[role="tab"]', '.tabs a',
         ]
         for (const sel of tabSels) {
             const tabs = await page.$$(sel)
-            if (tabs.length >= 2) {
-                const count = Math.min(tabs.length, 2 + Math.floor(Math.random() * 2))
-                for (let i = 0; i < count; i++) {
-                    const tab = tabs[Math.floor(Math.random() * tabs.length)]
-                    await tab.scrollIntoViewIfNeeded().catch(() => { })
-                    await tab.click().catch(() => { })
-                    await HumanBehavior.randomDelay(2000, 4000)
-                    await page.evaluate(() => window.scrollBy({ top: 150, behavior: 'smooth' }))
-                    await HumanBehavior.randomDelay(1500, 3000)
-                }
-                return
+            if (tabs.length < 2) continue
+            const count = Math.min(tabs.length, 2)
+            for (let i = 0; i < count; i++) {
+                if (this.isCancelled()) return
+                const tab = tabs[Math.floor(Math.random() * tabs.length)]
+                const signal = await tab.evaluate((node) => ({
+                    label: (node.textContent || '').trim(),
+                    href: node instanceof HTMLAnchorElement ? node.href : '',
+                })).catch(() => ({ label: '', href: '' }))
+                if (isDangerousInteractiveTarget(signal.label, signal.href)) continue
+                await tab.scrollIntoViewIfNeeded().catch(() => { })
+                await tab.click().catch(() => { })
+                await HumanBehavior.randomDelay(1200, 2400)
             }
+            return
         }
     }
 
-    private async actionReadReviews(page: Page) {
-        this.report('read_reviews', true, 'Reading product reviews...')
+    private async actionReadReviews(page: Page): Promise<void> {
+        this.report('read_reviews', true, 'Reading reviews...')
         const reviewSels = [
             '.reviews', '.product-reviews', '.customer-reviews',
-            '#reviews', '.comment-list', '.review-list', '.danh-gia',
-            '[id*="review"]', '[class*="review"]',
+            '#reviews', '.comment-list', '.danh-gia', '[class*="review"]',
         ]
         for (const sel of reviewSels) {
             const el = await page.$(sel)
-            if (el) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
+            if (!el) continue
+            await el.scrollIntoViewIfNeeded().catch(() => { })
+            await HumanBehavior.randomDelay(800, 1600)
+            for (let i = 0; i < 2; i++) {
+                await page.evaluate(() => window.scrollBy({ top: 180, behavior: 'smooth' }))
                 await HumanBehavior.randomDelay(1000, 2000)
-                for (let i = 0; i < 3; i++) {
-                    await page.evaluate(() => window.scrollBy({ top: 200, behavior: 'smooth' }))
-                    await HumanBehavior.randomDelay(2000, 4000)
-                }
-                return
             }
+            return
         }
     }
 
-    private async actionViewRelatedProducts(page: Page) {
-        this.report('related_products', true, 'Viewing related products...')
-        const sels = [
-            '.related-products a', '.product-related a', '.upsell a',
-            '.san-pham-lien-quan a', '[class*="related"] a', '[class*="similar"] a',
-            '.recently-viewed a', '.also-like a',
-        ]
-        for (const sel of sels) {
-            const items = await page.$$(sel)
-            if (items.length > 0) {
-                const item = items[Math.floor(Math.random() * Math.min(items.length, 5))]
-                await item.scrollIntoViewIfNeeded().catch(() => { })
-                await item.hover().catch(() => { })
-                await HumanBehavior.randomDelay(1500, 3000)
-                if (Math.random() > 0.5) {
-                    await Promise.all([
-                        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
-                        item.click()
-                    ]).catch(() => { })
-                    await HumanBehavior.randomDelay(3000, 5000)
-                }
-                return
-            }
-        }
-    }
-
-    private async actionExpandAccordionFAQ(page: Page) {
-        this.report('expand_faq', true, 'Reading FAQ / Accordion...')
+    private async actionExpandAccordionFAQ(page: Page): Promise<void> {
+        this.report('expand_faq', true, 'Reading FAQ / accordion...')
         const sels = [
             '.accordion-header', '.faq-question', '.collapse-header',
-            '[data-toggle="collapse"]', '.accordion-button', '.faq-item',
-            'details summary', '.question', '[class*="accordion"]',
+            '[data-toggle="collapse"]', '.accordion-button', 'details summary',
         ]
         for (const sel of sels) {
             const items = await page.$$(sel)
-            if (items.length > 0) {
-                const count = Math.min(items.length, 2 + Math.floor(Math.random() * 2))
-                for (let i = 0; i < count; i++) {
-                    const item = items[Math.floor(Math.random() * items.length)]
-                    await item.scrollIntoViewIfNeeded().catch(() => { })
-                    await item.click().catch(() => { })
-                    await HumanBehavior.randomDelay(2000, 4000)
-                    await page.evaluate(() => window.scrollBy({ top: 100, behavior: 'smooth' }))
-                    await HumanBehavior.randomDelay(1500, 3000)
-                }
-                return
+            if (items.length === 0) continue
+            const count = Math.min(items.length, 2)
+            for (let i = 0; i < count; i++) {
+                if (this.isCancelled()) return
+                const item = items[Math.floor(Math.random() * items.length)]
+                const signal = await item.evaluate((node) => ({
+                    label: (node.textContent || '').trim(),
+                    href: node instanceof HTMLAnchorElement ? node.href : '',
+                })).catch(() => ({ label: '', href: '' }))
+                if (isDangerousInteractiveTarget(signal.label, signal.href)) continue
+                await item.scrollIntoViewIfNeeded().catch(() => { })
+                await item.click().catch(() => { })
+                await HumanBehavior.randomDelay(1000, 2000)
             }
+            return
         }
     }
 
-    private async actionHighlightText(page: Page) {
+    private async actionHighlightText(page: Page): Promise<void> {
         this.report('highlight_text', true, 'Selecting text to read...')
         try {
             const paragraphs = await page.$$('p, .description, .product-content, article')
-            if (paragraphs.length > 0) {
-                const p = paragraphs[Math.floor(Math.random() * Math.min(paragraphs.length, 5))]
-                await p.scrollIntoViewIfNeeded().catch(() => { })
-                const box = await p.boundingBox()
-                if (box) {
-                    // Simulate text selection by clicking and dragging
-                    await moveCursor(page, box.x + 10, box.y + box.height / 2)
-                    await page.mouse.move(box.x + 10, box.y + box.height / 2)
-                    await page.mouse.down()
-                    await page.mouse.move(box.x + Math.min(box.width * 0.6, 250), box.y + box.height / 2, { steps: 15 })
-                    await HumanBehavior.randomDelay(1000, 2000)
-                    await page.mouse.up()
-                    await HumanBehavior.randomDelay(1500, 3000)
-                    // Click elsewhere to deselect
-                    await clickCursor(page, box.x + box.width / 2, box.y + box.height + 20)
-                    await page.mouse.click(box.x + box.width / 2, box.y + box.height + 20)
-                }
-            }
-        } catch { /* ignore */ }
+            if (paragraphs.length === 0) return
+            const p = paragraphs[Math.floor(Math.random() * Math.min(paragraphs.length, 5))]
+            await p.scrollIntoViewIfNeeded().catch(() => { })
+            const box = await p.boundingBox()
+            if (!box) return
+            await moveCursor(page, box.x + 10, box.y + box.height / 2)
+            await page.mouse.move(box.x + 10, box.y + box.height / 2)
+            await page.mouse.down()
+            await page.mouse.move(box.x + Math.min(box.width * 0.6, 250), box.y + box.height / 2, { steps: 12 })
+            await HumanBehavior.randomDelay(600, 1200)
+            await page.mouse.up()
+            await HumanBehavior.randomDelay(600, 1200)
+            await clickCursor(page, box.x + box.width / 2, box.y + box.height + 16).catch(() => { })
+            await page.mouse.click(box.x + box.width / 2, box.y + box.height + 16).catch(() => { })
+        } catch {
+            // ignore
+        }
     }
 
-    private async actionScrollToSpecificSection(page: Page) {
+    private async actionScrollToSpecificSection(page: Page): Promise<void> {
         this.report('scroll_section', true, 'Jumping to section...')
         const sels = [
             '#description', '#reviews', '#specifications', '#details',
-            '.product-description', '.product-specs', '.product-reviews',
-            '.about-section', '.contact-section', '.features',
-            'h2', 'h3',
+            '.product-description', '.about-section', '.features', 'h2', 'h3',
         ]
         const randomSel = sels[Math.floor(Math.random() * sels.length)]
         try {
             const el = await page.$(randomSel)
-            if (el) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await HumanBehavior.randomDelay(2000, 5000)
-                await page.evaluate(() => window.scrollBy({ top: 200, behavior: 'smooth' }))
-                await HumanBehavior.randomDelay(1500, 3000)
-            }
-        } catch { /* ignore */ }
-    }
-
-    // ==================== SHOPPING FLOW ACTIONS ====================
-
-    private async actionAddToCart(page: Page) {
-        this.report('add_to_cart', true, 'Adding to cart...')
-        const cartBtnSels = [
-            'button.add-to-cart', '.add-to-cart', '.btn-add-cart',
-            'button[class*="cart"]', 'button[class*="addtocart"]',
-            '.them-gio-hang', '.mua-ngay',
-            'button:has-text("Add to cart")', 'button:has-text("Mua ngay")',
-            'a:has-text("Add to cart")',
-            '[data-action="add-to-cart"]', '#add-to-cart',
-        ]
-        for (const sel of cartBtnSels) {
-            try {
-                const btn = await page.$(sel)
-                if (btn) {
-                    const isVisible = await btn.isVisible().catch(() => false)
-                    if (!isVisible) continue
-                    await btn.scrollIntoViewIfNeeded().catch(() => { })
-                    await btn.hover().catch(() => { })
-                    await HumanBehavior.randomDelay(800, 1500)
-                    await btn.click().catch(() => { })
-                    await HumanBehavior.randomDelay(2000, 4000)
-                    this.report('added_to_cart', true, 'Product added to cart')
-                    return
-                }
-            } catch { /* next */ }
+            if (!el) return
+            await el.scrollIntoViewIfNeeded().catch(() => { })
+            await HumanBehavior.randomDelay(1200, 2400)
+            await page.evaluate(() => window.scrollBy({ top: 160, behavior: 'smooth' }))
+            await HumanBehavior.randomDelay(800, 1500)
+        } catch {
+            // ignore
         }
     }
 
-    private async actionFillCheckoutForm(page: Page, domain: string) {
-        this.report('fill_checkout', true, 'Viewing checkout page...')
-        const cartLinks = [
-            'a[href*="cart"]', 'a[href*="gio-hang"]', 'a[href*="checkout"]',
-            'a[href*="thanh-toan"]', '.cart-icon a', '.cart-link',
-            'a:has-text("Cart")',
-        ]
-        let navigated = false
-        for (const sel of cartLinks) {
-            try {
-                const link = await page.$(sel)
-                if (link) {
-                    const isVisible = await link.isVisible().catch(() => false)
-                    if (!isVisible) continue
-                    await Promise.all([
-                        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
-                        link.click()
-                    ])
-                    await HumanBehavior.randomDelay(2000, 4000)
-                    navigated = true
-                    break
-                }
-            } catch { /* next */ }
-        }
-
-        if (navigated) {
-            const checkoutBtns = [
-                'a[href*="checkout"]', 'a[href*="thanh-toan"]',
-                'button:has-text("Checkout")',
-                'a:has-text("Checkout")', '.checkout-btn',
-            ]
-            for (const sel of checkoutBtns) {
-                try {
-                    const btn = await page.$(sel)
-                    if (btn) {
-                        await Promise.all([
-                            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
-                            btn.click()
-                        ])
-                        await HumanBehavior.randomDelay(2000, 3000)
-                        break
-                    }
-                } catch { /* next */ }
-            }
-        }
-
-        // Generate Vietnamese customer data
-        const customer = VietnameseDataGenerator.generateCustomer()
-
-        // Fill form fields
-        const formFields = [
-            { sels: ['input[name*="name"]', 'input[name*="ten"]', 'input[name*="fullname"]', 'input[name*="ho_ten"]', '#billing_first_name', '#shipping_first_name'], value: customer.fullName },
-            { sels: ['input[name*="email"]', 'input[type="email"]', '#billing_email'], value: customer.email },
-            { sels: ['input[name*="phone"]', 'input[name*="tel"]', 'input[name*="dien_thoai"]', 'input[type="tel"]', '#billing_phone'], value: customer.phone },
-            { sels: ['input[name*="address"]', 'input[name*="dia_chi"]', 'textarea[name*="address"]', '#billing_address_1'], value: customer.address.full },
-            { sels: ['input[name*="city"]', 'input[name*="tinh"]', '#billing_city'], value: customer.address.city },
-            { sels: ['input[name*="district"]', 'input[name*="quan"]'], value: customer.address.district },
-            { sels: ['textarea[name*="note"]', 'textarea[name*="ghi_chu"]', '#order_comments'], value: Math.random() > 0.5 ? 'Giao hang trong gio hanh chinh' : '' },
-        ]
-
-        let fieldsFilledCount = 0
-        for (const field of formFields) {
-            if (!field.value) continue
-            for (const sel of field.sels) {
-                try {
-                    const input = await page.$(sel)
-                    if (input) {
-                        const isVisible = await input.isVisible().catch(() => false)
-                        if (!isVisible) continue
-                        await input.scrollIntoViewIfNeeded().catch(() => { })
-                        await input.click().catch(() => { })
-                        await HumanBehavior.randomDelay(300, 600)
-                        await input.evaluate((el: any) => { el.value = '' })
-                        await HumanBehavior.humanType(page, sel, field.value)
-                        await HumanBehavior.randomDelay(500, 1500)
-                        fieldsFilledCount++
-                        break
-                    }
-                } catch { /* next selector */ }
-            }
-        }
-
-        if (fieldsFilledCount > 0) {
-            this.report('form_filled', true, `Filled ${fieldsFilledCount} form fields`)
-        }
-
-        // Wait then go BACK - do NOT submit
-        await HumanBehavior.randomDelay(3000, 6000)
-        await page.goBack().catch(() => { })
-        await HumanBehavior.randomDelay(2000, 4000)
-        await page.goBack().catch(() => { })
-        await HumanBehavior.randomDelay(1000, 2000)
-        this.report('back_to_product', true, 'Back to product page')
-    }
-
-    // ==================== NAVIGATION & DISCOVERY ACTIONS ====================
-
-    private async actionClickMenuNav(page: Page) {
-        this.report('click_menu', true, 'Browsing menu...')
-        const sels = ['nav a', '.navbar a', '.main-menu a', '.menu a', 'header a', '.nav-link', '.menu-item a']
-        for (const sel of sels) {
-            const items = await page.$$(sel)
-            const visible = []
-            for (const it of items) {
-                if (await it.isVisible().catch(() => false)) visible.push(it)
-            }
-            if (visible.length > 0) {
-                const t = visible[Math.floor(Math.random() * visible.length)]
-                await t.hover().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                await Promise.all([
-                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
-                    t.click()
-                ]).catch(() => { })
-                await HumanBehavior.randomDelay(2000, 4000)
-                return
-            }
-        }
-    }
-
-    private async actionClickInternalLink(page: Page, domain: string) {
-        this.report('click_internal', true, 'Clicking internal link...')
-        const norm = domain.replace(/^(https?:\/\/)?(www\.)?/, '').replace(/\/$/, '')
-        const links = await page.$$('a[href]')
-        const internal = []
-        for (const l of links) {
-            try {
-                const href = await l.evaluate((n: HTMLAnchorElement) => n.href)
-                if (!href || href.includes('#') || href.startsWith('javascript:') || href.startsWith('tel:') || href.startsWith('mailto:')) continue
-                try {
-                    const u = new URL(href)
-                    if (u.hostname.replace(/^www\./, '').includes(norm) && await l.isVisible().catch(() => false))
-                        internal.push(l)
-                } catch { /* skip */ }
-            } catch { /* stale */ }
-        }
-        if (internal.length > 0) {
-            const link = internal[Math.floor(Math.random() * internal.length)]
-            await link.scrollIntoViewIfNeeded().catch(() => { })
-            await link.hover().catch(() => { })
-            await HumanBehavior.randomDelay(500, 1000)
-            await Promise.all([
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { }),
-                link.click()
-            ]).catch(() => { })
-            await HumanBehavior.randomDelay(2000, 4000)
-        }
-    }
-
-    private async actionBrowseCategories(page: Page) {
-        this.report('browse_categories', true, 'Browsing product categories...')
-        const catSels = [
-            '.category a', '.categories a', '.danh-muc a', '.product-categories a',
-            'a[href*="category"]', 'a[href*="danh-muc"]', 'a[href*="collections"]',
-            '.sidebar a', '.widget-categories a', '.cat-item a',
-        ]
-        for (const sel of catSels) {
-            const items = await page.$$(sel)
-            const visible = []
-            for (const i of items) { if (await i.isVisible().catch(() => false)) visible.push(i) }
-            if (visible.length > 0) {
-                const cat = visible[Math.floor(Math.random() * visible.length)]
-                await cat.scrollIntoViewIfNeeded().catch(() => { })
-                await cat.hover().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                await Promise.all([
-                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
-                    cat.click()
-                ]).catch(() => { })
-                await HumanBehavior.randomDelay(3000, 5000)
-                await page.evaluate(() => window.scrollBy({ top: 400, behavior: 'smooth' }))
-                await HumanBehavior.randomDelay(2000, 3000)
-                return
-            }
-        }
-    }
-
-    private async actionSearchOnSite(page: Page, keyword: string) {
-        this.report('search_on_site', true, 'Searching on website...')
-        const searchSels = [
-            'input[name="s"]', 'input[name="q"]', 'input[name="search"]',
-            'input[type="search"]', 'input[placeholder*="Search"]',
-            '.search-input', '#search-input',
-        ]
-        const shortKeyword = keyword.split(/\s+/).slice(0, 2).join(' ')
-        for (const sel of searchSels) {
-            try {
-                const input = await page.$(sel)
-                if (input && await input.isVisible().catch(() => false)) {
-                    await input.scrollIntoViewIfNeeded().catch(() => { })
-                    await input.click().catch(() => { })
-                    await HumanBehavior.randomDelay(300, 600)
-                    await HumanBehavior.humanType(page, sel, shortKeyword)
-                    await HumanBehavior.randomDelay(500, 1000)
-                    await page.keyboard.press('Enter')
-                    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { })
-                    await HumanBehavior.randomDelay(2000, 4000)
-                    await page.evaluate(() => window.scrollBy({ top: 300, behavior: 'smooth' }))
-                    await HumanBehavior.randomDelay(2000, 3000)
-                    this.report('searched', true, `Searched: "${shortKeyword}"`)
-                    return
-                }
-            } catch { /* next */ }
-        }
-    }
-
-    private async actionViewBreadcrumb(page: Page) {
+    private async actionViewBreadcrumb(page: Page): Promise<void> {
         this.report('view_breadcrumb', true, 'Viewing breadcrumb...')
         const bcSels = ['.breadcrumb a', '.breadcrumbs a', '[class*="breadcrumb"] a', 'nav[aria-label="Breadcrumb"] a']
         for (const sel of bcSels) {
             const items = await page.$$(sel)
-            if (items.length >= 2) {
-                const mid = items[Math.floor(Math.random() * (items.length - 1))]
-                await mid.hover().catch(() => { })
-                await HumanBehavior.randomDelay(500, 1000)
-                if (Math.random() > 0.5) {
-                    await Promise.all([
-                        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
-                        mid.click()
-                    ]).catch(() => { })
-                    await HumanBehavior.randomDelay(2000, 4000)
-                }
-                return
-            }
+            if (items.length < 1) continue
+            const mid = items[Math.floor(Math.random() * items.length)]
+            await mid.hover().catch(() => { })
+            await HumanBehavior.randomDelay(500, 1000)
+            // Hover only — avoid accidental off-site or deep navigation
+            return
         }
     }
 
-    private async actionViewPolicyPages(page: Page) {
+    private async actionViewPolicyPages(page: Page, target: string): Promise<void> {
         this.report('view_policy', true, 'Viewing policy page...')
         const sels = [
             'a[href*="chinh-sach"]', 'a[href*="policy"]', 'a[href*="bao-hanh"]',
             'a[href*="doi-tra"]', 'a[href*="shipping"]', 'a[href*="van-chuyen"]',
             'a[href*="return"]', 'a[href*="warranty"]', 'a[href*="terms"]',
-            'a:has-text("Warranty")', 'a:has-text("Shipping")', 'a:has-text("Return")',
         ]
         for (const sel of sels) {
             try {
                 const el = await page.$(sel)
-                if (el && await el.isVisible().catch(() => false)) {
-                    await el.scrollIntoViewIfNeeded().catch(() => { })
-                    await el.hover().catch(() => { })
-                    await HumanBehavior.randomDelay(500, 1000)
-                    await Promise.all([
-                        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
-                        el.click()
-                    ]).catch(() => { })
-                    await HumanBehavior.randomDelay(3000, 5000)
-                    await page.evaluate(() => window.scrollBy({ top: 300, behavior: 'smooth' }))
-                    await HumanBehavior.randomDelay(2000, 3000)
-                    // Go back
-                    await page.goBack().catch(() => { })
-                    await HumanBehavior.randomDelay(1000, 2000)
-                    return
-                }
-            } catch { /* next */ }
-        }
-    }
-
-    private async actionClickBannerSlider(page: Page) {
-        this.report('click_banner', true, 'Interacting with banner/slider...')
-        const sels = [
-            '.banner a', '.slider a', '.slideshow a', '.hero a',
-            '.swiper-slide a', '.owl-item a', '.slick-slide a',
-            '.carousel-item a', '[class*="banner"] a', '[class*="slider"] a',
-        ]
-        for (const sel of sels) {
-            const el = await page.$(sel)
-            if (el && await el.isVisible().catch(() => false)) {
+                if (!el || !(await el.isVisible().catch(() => false))) continue
+                const href = await el.evaluate((n) => (n as HTMLAnchorElement).href).catch(() => '')
+                if (href && !isSameWebSeoSite(href, target)) continue
                 await el.scrollIntoViewIfNeeded().catch(() => { })
                 await el.hover().catch(() => { })
-                await HumanBehavior.randomDelay(800, 1500)
-                await el.click().catch(() => { })
-                await HumanBehavior.randomDelay(2000, 4000)
-                return
-            }
-        }
-        // Try slider arrows
-        const arrows = await page.$$('.swiper-button-next, .slick-next, .owl-next, .carousel-control-next')
-        if (arrows.length > 0) {
-            const clicks = Math.floor(Math.random() * 3) + 1
-            for (let i = 0; i < clicks; i++) {
-                await arrows[0].click().catch(() => { })
+                await HumanBehavior.randomDelay(400, 800)
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
+                    el.click(),
+                ]).catch(() => { })
                 await HumanBehavior.randomDelay(1500, 3000)
-            }
-        }
-    }
-
-    private async actionResizeAndScroll(page: Page) {
-        this.report('resize_scroll', true, 'Adjusting view...')
-        try {
-            // Scroll to a random position on the page
-            const height = await page.evaluate(() => document.body.scrollHeight)
-            const randomPos = Math.floor(Math.random() * height * 0.7)
-            await page.evaluate((pos) => window.scrollTo({ top: pos, behavior: 'smooth' }), randomPos)
-            await HumanBehavior.randomDelay(2000, 4000)
-            // Scroll back up a bit
-            await page.evaluate(() => window.scrollBy({ top: -200, behavior: 'smooth' }))
-            await HumanBehavior.randomDelay(1000, 2000)
-        } catch { /* ignore */ }
-    }
-
-    // ==================== CONTACT & SOCIAL ACTIONS ====================
-
-    private async actionClickZaloMessenger(page: Page) {
-        this.report('click_zalo_mess', true, 'Clicking Zalo/Messenger button...')
-        const sels = [
-            // Zalo
-            'a[href*="zalo.me"]', 'a[href*="zl.me"]', '.zalo-chat', '.zalo',
-            'a[href*="zalo"]', '[class*="zalo"]', '#zalo-btn',
-            'img[src*="zalo"]', 'img[alt*="zalo"]', 'img[alt*="Zalo"]',
-            // Messenger
-            'a[href*="m.me"]', 'a[href*="messenger.com"]', '.messenger-chat',
-            '[class*="messenger"]', 'a[href*="facebook.com/messages"]',
-            'img[src*="messenger"]',
-            // Chat widgets
-            '.chat-widget', '.live-chat', '#chat-button', '.chat-btn',
-            '[class*="chat-widget"]', '.tawk-widget', '.fb-customerchat',
-            '#fb-root .fb-customerchat',
-        ]
-        for (const sel of sels) {
-            try {
-                const el = await page.$(sel)
-                if (el && await el.isVisible().catch(() => false)) {
-                    await el.scrollIntoViewIfNeeded().catch(() => { })
-                    await el.hover().catch(() => { })
-                    await HumanBehavior.randomDelay(1000, 2000)
-                    // Click it (but handle popup/new tab)
-                    const [newPage] = await Promise.all([
-                        page.context().waitForEvent('page', { timeout: 3000 }).catch(() => null),
-                        el.click().catch(() => { })
-                    ])
-                    await HumanBehavior.randomDelay(2000, 4000)
-                    // Close new tab if opened
-                    if (newPage) {
-                        await newPage.close().catch(() => { })
-                    }
-                    this.report('zalo_mess_clicked', true, 'Clicked Zalo/Messenger')
+                if (!this.verifyPageHost(page, target)) {
+                    await page.goBack().catch(() => { })
                     return
                 }
-            } catch { /* next */ }
-        }
-    }
-
-    private async actionClickPhoneNumber(page: Page) {
-        this.report('click_phone', true, 'Clicking phone number...')
-        const sels = [
-            'a[href^="tel:"]', '.hotline a', '.phone a', '.phone-number a',
-            '[class*="hotline"] a', '[class*="phone"] a',
-            'a[href*="tel:"]',
-        ]
-        for (const sel of sels) {
-            try {
-                const el = await page.$(sel)
-                if (el && await el.isVisible().catch(() => false)) {
-                    await el.scrollIntoViewIfNeeded().catch(() => { })
-                    await el.hover().catch(() => { })
-                    await HumanBehavior.randomDelay(1000, 2500)
-                    // Just hover, don't actually call
-                    this.report('phone_hovered', true, 'Viewed phone number')
-                    return
-                }
-            } catch { /* next */ }
-        }
-    }
-
-    private async actionCheckContactInfo(page: Page) {
-        this.report('check_contact', true, 'Checking contact info...')
-        const sels = [
-            'a[href*="tel:"]', 'a[href*="zalo"]', 'a[href*="zl.me"]',
-            'a[href*="mailto:"]', 'a[href*="messenger"]',
-            '.contact', '.lien-he', '#contact', '.hotline', '.phone-number',
-            '.zalo-chat', '.zalo', 'a[href*="wa.me"]',
-        ]
-        for (const sel of sels) {
-            const el = await page.$(sel)
-            if (el) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await el.hover().catch(() => { })
-                await HumanBehavior.randomDelay(1000, 2500)
-                this.report('found_contact', true, 'Contact info found')
+                await page.evaluate(() => window.scrollBy({ top: 200, behavior: 'smooth' }))
+                await HumanBehavior.randomDelay(1000, 2000)
+                await page.goBack().catch(() => { })
+                await HumanBehavior.randomDelay(600, 1200)
                 return
+            } catch {
+                // next
             }
         }
     }
 
-    private async actionViewSocialLinks(page: Page) {
+    private async actionClickInternalLink(page: Page, target: string): Promise<void> {
+        this.report('click_internal', true, 'Clicking internal link...')
+        const links = await page.$$('a[href]')
+        const internal: typeof links = []
+        for (const l of links) {
+            try {
+                const href = await l.evaluate((n) => (n as HTMLAnchorElement).href)
+                if (!href || href.includes('#') || /^(javascript|tel|mailto):/i.test(href)) continue
+                if (!isSameWebSeoSite(href, target)) continue
+                if (!(await l.isVisible().catch(() => false))) continue
+                internal.push(l)
+            } catch {
+                // stale
+            }
+        }
+        if (internal.length === 0) return
+        const link = internal[Math.floor(Math.random() * internal.length)]
+        await link.scrollIntoViewIfNeeded().catch(() => { })
+        await link.hover().catch(() => { })
+        await HumanBehavior.randomDelay(400, 800)
+        await Promise.all([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => { }),
+            link.click(),
+        ]).catch(() => { })
+        await HumanBehavior.randomDelay(1200, 2400)
+    }
+
+    private async actionViewRelatedProductsHover(page: Page): Promise<void> {
+        this.report('related_hover', true, 'Viewing related products...')
+        const sels = [
+            '.related-products a', '.product-related a', '.upsell a',
+            '.san-pham-lien-quan a', '[class*="related"] a', '.also-like a',
+        ]
+        for (const sel of sels) {
+            const items = await page.$$(sel)
+            if (items.length === 0) continue
+            const item = items[Math.floor(Math.random() * Math.min(items.length, 5))]
+            await item.scrollIntoViewIfNeeded().catch(() => { })
+            await item.hover().catch(() => { })
+            await HumanBehavior.randomDelay(1000, 2000)
+            // Hover only — no navigation to avoid off-site / deep trees
+            return
+        }
+    }
+
+    private async actionViewSocialLinks(page: Page): Promise<void> {
         this.report('view_social', true, 'Viewing social media links...')
         const sels = [
             'a[href*="facebook.com"]', 'a[href*="instagram.com"]',
@@ -1453,48 +1489,71 @@ export class WebSeoFlow {
         ]
         for (const sel of sels) {
             const el = await page.$(sel)
-            if (el) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await el.hover().catch(() => { })
-                await HumanBehavior.randomDelay(1000, 2000)
-                return
-            }
+            if (!el) continue
+            await el.scrollIntoViewIfNeeded().catch(() => { })
+            await el.hover().catch(() => { })
+            await HumanBehavior.randomDelay(800, 1600)
+            // Hover only — never click external social
+            return
         }
     }
 
-    private async actionHoverElements(page: Page) {
+    private async actionViewMenuNav(page: Page): Promise<void> {
+        this.report('view_menu', true, 'Browsing menu...')
+        const sels = ['nav a', '.navbar a', '.main-menu a', '.menu a', 'header a', '.nav-link']
+        for (const sel of sels) {
+            const items = await page.$$(sel)
+            const visible = []
+            for (const it of items) {
+                if (await it.isVisible().catch(() => false)) visible.push(it)
+            }
+            if (visible.length === 0) continue
+            const t = visible[Math.floor(Math.random() * visible.length)]
+            await t.hover().catch(() => { })
+            await HumanBehavior.randomDelay(600, 1200)
+            // Prefer hover; light same-site click only when href is same-site
+            const href = await t.evaluate((n) => (n as HTMLAnchorElement).href).catch(() => '')
+            const target = this.runtime?.targetUrl
+            if (href && target && isSameWebSeoSite(href, target) && Math.random() > 0.5) {
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { }),
+                    t.click(),
+                ]).catch(() => { })
+                await HumanBehavior.randomDelay(1200, 2200)
+            }
+            return
+        }
+    }
+
+    private async actionHoverElements(page: Page): Promise<void> {
         this.report('hover_elements', true, 'Hovering interactive elements...')
         const sels = [
-            'a.btn, button.btn', '.add-to-cart', '.buy-now',
+            'a.btn, button.btn',
             'a[href*="product"]', 'a[href*="san-pham"]',
             '.card', '.product-card', 'nav a', '.menu a',
         ]
         for (const sel of sels) {
             const els = await page.$$(sel)
-            if (els.length > 0) {
-                const el = els[Math.floor(Math.random() * Math.min(els.length, 5))]
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await el.hover().catch(() => { })
-                await HumanBehavior.randomDelay(800, 2000)
-                return
-            }
+            if (els.length === 0) continue
+            const el = els[Math.floor(Math.random() * Math.min(els.length, 5))]
+            await el.scrollIntoViewIfNeeded().catch(() => { })
+            await el.hover().catch(() => { })
+            await HumanBehavior.randomDelay(600, 1400)
+            return
         }
     }
 
-    private async actionHoverShareButtons(page: Page) {
-        this.report('hover_share', true, 'Viewing share buttons...')
-        const sels = [
-            '.share-buttons', '.social-share', '[class*="share"]',
-            'a[href*="sharer"]', 'a[href*="share"]',
-        ]
-        for (const sel of sels) {
-            const el = await page.$(sel)
-            if (el) {
-                await el.scrollIntoViewIfNeeded().catch(() => { })
-                await el.hover().catch(() => { })
-                await HumanBehavior.randomDelay(1000, 2000)
-                return
-            }
+    private async actionResizeAndScroll(page: Page): Promise<void> {
+        this.report('resize_scroll', true, 'Adjusting view...')
+        try {
+            const height = await page.evaluate(() => document.body.scrollHeight)
+            const randomPos = Math.floor(Math.random() * height * 0.7)
+            await page.evaluate((pos) => window.scrollTo({ top: pos, behavior: 'smooth' }), randomPos)
+            await HumanBehavior.randomDelay(1200, 2400)
+            await page.evaluate(() => window.scrollBy({ top: -200, behavior: 'smooth' }))
+            await HumanBehavior.randomDelay(600, 1200)
+        } catch {
+            // ignore
         }
     }
 }

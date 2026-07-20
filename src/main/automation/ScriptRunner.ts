@@ -1,19 +1,75 @@
 /**
  * ScriptRunner - Engine thực thi các automation scripts
+ *
+ * Hardened: navigate only allows http/https; upload/profile paths must
+ * resolve under allowed roots (userData / home / documents / cwd / appPath).
  */
 
 import { chromium, Browser, BrowserContext, Page } from 'playwright'
-import { BrowserWindow } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import type { AutomationScript, ScriptAction, ScriptExecutionResult, ScriptError } from './ScriptTypes'
+import { profileLockService } from '../services/ProfileLockService'
 import * as path from 'path'
 import * as fs from 'fs'
+
+type ScriptVariableValue = string | number | boolean | null | undefined
+
+function isHttpOrHttpsUrl(raw: string): boolean {
+    try {
+        const parsed = new URL(raw)
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+    } catch {
+        return false
+    }
+}
+
+function getScriptAllowedRoots(): string[] {
+    const roots: string[] = [process.cwd()]
+    try {
+        roots.push(app.getPath('userData'))
+        roots.push(app.getPath('home'))
+        roots.push(app.getPath('documents'))
+        roots.push(app.getPath('downloads'))
+        roots.push(app.getPath('temp'))
+        roots.push(app.getAppPath())
+    } catch {
+        // ignore when electron app paths are unavailable
+    }
+    return Array.from(new Set(roots.map(r => path.resolve(r))))
+}
+
+function isPathInsideRoot(candidate: string, root: string): boolean {
+    const resolvedCandidate = path.resolve(candidate)
+    const resolvedRoot = path.resolve(root).replace(/[/\\]+$/, '')
+    if (process.platform === 'win32') {
+        const c = resolvedCandidate.toLowerCase()
+        const r = resolvedRoot.toLowerCase()
+        return c === r || c.startsWith(r + path.sep) || c.startsWith(r + '\\') || c.startsWith(r + '/')
+    }
+    return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(resolvedRoot + path.sep)
+}
+
+function assertSafeLocalPath(rawPath: string, label: string): string {
+    if (!rawPath || typeof rawPath !== 'string' || rawPath.includes('\0')) {
+        throw new Error(`${label}: invalid path`)
+    }
+    const resolved = path.resolve(rawPath)
+    if (resolved.split(/[/\\]/).includes('..')) {
+        throw new Error(`${label}: path traversal is not allowed`)
+    }
+    const roots = getScriptAllowedRoots()
+    if (!roots.some(root => isPathInsideRoot(resolved, root))) {
+        throw new Error(`${label}: path is outside allowed roots`)
+    }
+    return resolved
+}
 
 export class ScriptRunner {
     private browser: Browser | null = null
     private context: BrowserContext | null = null
     private page: Page | null = null
     private shouldStop = false
-    private variables: Record<string, any> = {}
+    private variables: Record<string, ScriptVariableValue> = {}
     private errors: ScriptError[] = []
     private screenshots: string[] = []
 
@@ -44,6 +100,15 @@ export class ScriptRunner {
         })
     }
 
+    /** Ensure navigation target is http/https only (after variable substitution). */
+    private assertSafeNavigationUrl(rawUrl: string): string {
+        const url = rawUrl.trim()
+        if (!url || !isHttpOrHttpsUrl(url)) {
+            throw new Error(`navigate: only http/https URLs are allowed (got: ${url.slice(0, 80)})`)
+        }
+        return url
+    }
+
     // Stop execution
     stop() {
         this.shouldStop = true
@@ -52,7 +117,7 @@ export class ScriptRunner {
     // Execute script
     async execute(
         script: AutomationScript,
-        inputVariables: Record<string, any> = {},
+        inputVariables: Record<string, ScriptVariableValue> = {},
         accountOptions?: { profilePath?: string; email?: string; name?: string }
     ): Promise<ScriptExecutionResult> {
         const startTime = new Date()
@@ -79,6 +144,10 @@ export class ScriptRunner {
         // Add timestamp variable
         this.variables['timestamp'] = Date.now()
 
+        // Track raw persistent-profile ownership (released in finally; ephemeral path never locks).
+        let profileLockToken: string | null = null
+        let lockedProfilePath: string | null = null
+
         try {
             // Launch browser
             this.log('Launching browser...')
@@ -91,15 +160,29 @@ export class ScriptRunner {
 
             // If account has a profile path, use persistent context for cookies/sessions
             if (accountOptions?.profilePath) {
-                this.log(`Using profile: ${accountOptions.profilePath}`)
+                const safeProfilePath = assertSafeLocalPath(accountOptions.profilePath, 'profilePath')
+                this.log(`Using profile: ${safeProfilePath}`)
                 this.sendStatus(`Dùng profile: ${accountOptions.email || 'Unknown'}`, 0)
 
+                // Drop stale locks for owners without a live context (safety net for orphaned tokens).
+                profileLockService.cleanupStale({ maxAgeMs: 6 * 60 * 60 * 1000 })
+
+                profileLockToken = `script_runner:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`
+                lockedProfilePath = safeProfilePath
+                await profileLockService.acquire(safeProfilePath, {
+                    ownerToken: profileLockToken,
+                    kind: 'script_runner',
+                    label: accountOptions.email
+                        ? `script:${accountOptions.email}`
+                        : 'script_runner',
+                })
+
                 // Ensure profile directory exists
-                if (!fs.existsSync(accountOptions.profilePath)) {
-                    fs.mkdirSync(accountOptions.profilePath, { recursive: true })
+                if (!fs.existsSync(safeProfilePath)) {
+                    fs.mkdirSync(safeProfilePath, { recursive: true })
                 }
 
-                this.context = await chromium.launchPersistentContext(accountOptions.profilePath, {
+                this.context = await chromium.launchPersistentContext(safeProfilePath, {
                     headless: script.settings.headless,
                     args: browserArgs,
                     viewport: script.settings.viewport,
@@ -115,7 +198,7 @@ export class ScriptRunner {
 
                 this.page = this.context.pages()[0] || await this.context.newPage()
             } else {
-                // Normal launch without persistent profile
+                // Normal launch without persistent profile (no profile lock)
                 this.browser = await chromium.launch({
                     headless: script.settings.headless,
                     args: browserArgs,
@@ -226,6 +309,10 @@ export class ScriptRunner {
             this.context = null
             this.browser = null
             this.page = null
+            // Always release persistent profile ownership after close / launch failure.
+            if (lockedProfilePath && profileLockToken) {
+                profileLockService.release(lockedProfilePath, profileLockToken)
+            }
         }
     }
 
@@ -456,9 +543,11 @@ export class ScriptRunner {
         const p = action.params
 
         switch (action.type) {
-            case 'navigate':
-                await this.page.goto(this.replaceVariables(p.url || ''), { waitUntil: 'networkidle' })
+            case 'navigate': {
+                const targetUrl = this.assertSafeNavigationUrl(this.replaceVariables(p.url || ''))
+                await this.page.goto(targetUrl, { waitUntil: 'networkidle' })
                 break
+            }
 
             case 'click':
                 const clickSelector = this.replaceVariables(p.selector || '')
@@ -565,15 +654,17 @@ export class ScriptRunner {
                 }
                 break
 
-            case 'upload':
+            case 'upload': {
                 const uploadSelector = this.replaceVariables(p.inputSelector || p.selector || '')
-                const filePath = this.replaceVariables(p.filePath || '')
-                if (fs.existsSync(filePath)) {
+                const rawFilePath = this.replaceVariables(p.filePath || '')
+                const filePath = assertSafeLocalPath(rawFilePath, 'upload.filePath')
+                if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
                     await this.page.setInputFiles(uploadSelector, filePath)
                 } else {
                     throw new Error(`File not found: ${filePath}`)
                 }
                 break
+            }
 
             case 'extract':
                 const extractSelector = this.replaceVariables(p.selector || '')

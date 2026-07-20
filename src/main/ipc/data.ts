@@ -1,8 +1,40 @@
 import { ipcMain, shell, app } from 'electron'
 import { dataRootService } from '../services/DataRootService'
 import { profileService } from '../services/ProfileService'
+import { backupRestoreService } from '../services/BackupRestoreService'
 import { existsSync, readdirSync, statSync, mkdirSync, rmSync } from 'fs'
-import { join, basename } from 'path'
+import { join } from 'path'
+import {
+    backupIdSchema,
+    createBackupOptionsSchema,
+    restoreBackupOptionsSchema,
+} from '../../shared/backup-contracts'
+import { complianceAuditQuerySchema } from '../../shared/compliance-audit-contracts'
+import { complianceAuditService } from '../services/ComplianceAuditService'
+import {
+    assertOptionalPathWithinRoots,
+    assertPathWithinRoots,
+    getDataOpenAllowedRoots,
+    getLegacyMigrateAllowedRoots,
+    parseIpcPayload,
+    withIpcValidation,
+} from './validate'
+
+/** Roots allowed for backup package path resolution (managed-backups only + userData). */
+function getBackupAllowedRoots(): string[] {
+    const dataRoot = dataRootService.getDataRoot()
+    return [
+        dataRoot,
+        join(dataRoot, 'managed-backups'),
+        backupRestoreService.getManagedBackupsRoot(),
+    ]
+}
+
+/** Resolve backupId → absolute dir and enforce managed-backups containment. */
+function resolveValidatedBackupDir(channel: string, backupId: string): string {
+    const dir = backupRestoreService.resolveBackupDir(backupId)
+    return assertPathWithinRoots(channel, dir, getBackupAllowedRoots())
+}
 
 function safeGetDirSize(dir: string): number {
     if (!existsSync(dir)) return 0
@@ -34,7 +66,6 @@ function scanProfileLikeDir(baseDir: string): { size: number; count: number; coo
         for (const e of entries) {
             if (e.isDirectory()) {
                 const p = join(baseDir, e.name)
-                // include profile_* and account_* (legacy traffic)
                 if (e.name.startsWith('profile_') || e.name.startsWith('account_')) {
                     count++
                     size += safeGetDirSize(p)
@@ -43,7 +74,7 @@ function scanProfileLikeDir(baseDir: string): { size: number; count: number; coo
                 }
             }
         }
-    } catch {}
+    } catch { /* ignore */ }
     return { size, count, cookiesAccounts }
 }
 
@@ -54,7 +85,7 @@ function getDbSize(): number {
         if (existsSync(dbPath)) {
             return statSync(dbPath).size
         }
-    } catch {}
+    } catch { /* ignore */ }
     return 0
 }
 
@@ -72,12 +103,11 @@ async function computeStorageInfo() {
     const dbSize = getDbSize()
     const shotsSize = getScreenshotsSize(dataRoot)
 
-    // Also add profileService disk list for profiles (more accurate for its managed)
     let managedProfilesSize = 0
     try {
         const listed = profileService.listProfiles()
         managedProfilesSize = listed.reduce((s, p) => s + (p.size || 0), 0)
-    } catch {}
+    } catch { /* ignore */ }
 
     const items = [
         {
@@ -124,40 +154,74 @@ async function computeStorageInfo() {
 }
 
 export function registerDataHandlers() {
-    ipcMain.handle('data:getRoot', async () => {
+    ipcMain.handle('data:getRoot', withIpcValidation('data:getRoot', async () => {
         return {
             dataRoot: dataRootService.getDataRoot(),
         }
-    })
+    }))
 
-    ipcMain.handle('data:detectLegacy', async () => {
+    ipcMain.handle('data:detectLegacy', withIpcValidation('data:detectLegacy', async () => {
         return dataRootService.detectLegacyRoots()
-    })
+    }))
 
-    ipcMain.handle('data:migrateLegacy', async (_event, sourcePath?: string) => {
-        return dataRootService.migrateLegacyData(sourcePath)
-    })
+    ipcMain.handle('data:migrateLegacy', withIpcValidation('data:migrateLegacy', async (_event, sourcePath?: unknown) => {
+        const safeSource = assertOptionalPathWithinRoots(
+            'data:migrateLegacy',
+            sourcePath,
+            getLegacyMigrateAllowedRoots(),
+        )
+        return dataRootService.migrateLegacyData(safeSource)
+    }))
 
-    ipcMain.handle('data:getStorageInfo', async () => {
+    ipcMain.handle('data:getStorageInfo', withIpcValidation('data:getStorageInfo', async () => {
         return computeStorageInfo()
-    })
+    }))
 
-    ipcMain.handle('data:openPath', async (_event, targetPath?: string) => {
-        if (!targetPath || typeof targetPath !== 'string') return 'invalid'
-        try {
-            // ensure exists for root cases
-            if (!existsSync(targetPath)) {
-                // open parent if child missing
-                const parent = join(targetPath, '..')
-                if (existsSync(parent)) return await shell.openPath(parent)
-            }
-            return await shell.openPath(targetPath)
-        } catch (e: any) {
-            return e?.message || 'error'
+    ipcMain.handle('data:openPath', withIpcValidation('data:openPath', async (_event, targetPath?: unknown) => {
+        if (targetPath === undefined || targetPath === null || targetPath === '') {
+            return 'invalid'
         }
-    })
 
-    ipcMain.handle('data:clearCaches', async () => {
+        let safePath: string
+        try {
+            const dataRoot = dataRootService.getDataRoot()
+            let profilesPath: string | undefined
+            try {
+                profilesPath = profileService.getProfilesPath()
+            } catch {
+                profilesPath = undefined
+            }
+            safePath = assertPathWithinRoots(
+                'data:openPath',
+                targetPath,
+                getDataOpenAllowedRoots(dataRoot, profilesPath),
+            )
+        } catch {
+            return 'invalid'
+        }
+
+        try {
+            if (!existsSync(safePath)) {
+                const parent = join(safePath, '..')
+                try {
+                    const safeParent = assertPathWithinRoots(
+                        'data:openPath',
+                        parent,
+                        getDataOpenAllowedRoots(dataRootService.getDataRoot()),
+                    )
+                    if (existsSync(safeParent)) return await shell.openPath(safeParent)
+                } catch {
+                    return 'invalid'
+                }
+            }
+            return await shell.openPath(safePath)
+        } catch (e: unknown) {
+            const message = e instanceof Error ? e.message : 'error'
+            return message
+        }
+    }))
+
+    ipcMain.handle('data:clearCaches', withIpcValidation('data:clearCaches', async () => {
         let cleared = 0
         try {
             const profBase = profileService.getProfilesPath()
@@ -169,13 +233,12 @@ export function registerDataHandlers() {
                         try {
                             profileService.clearProfileCache(full)
                             cleared++
-                        } catch {}
+                        } catch { /* ignore */ }
                     }
                 }
             }
-        } catch {}
+        } catch { /* ignore */ }
 
-        // traffic_profiles caches (manual, same structure)
         try {
             const tBase = join(app.getPath('userData'), 'traffic_profiles')
             if (existsSync(tBase)) {
@@ -189,14 +252,91 @@ export function registerDataHandlers() {
                                 rmSync(cacheP, { recursive: true, force: true })
                                 mkdirSync(cacheP, { recursive: true })
                                 cleared++
-                            } catch {}
+                            } catch { /* ignore */ }
                         }
                     }
                 }
             }
-        } catch {}
+        } catch { /* ignore */ }
 
         return { success: true, cleared }
-    })
-}
+    }))
 
+    // -----------------------------------------------------------------------
+    // Managed backup / restore (path-validated; public DTOs only)
+    // -----------------------------------------------------------------------
+
+    ipcMain.handle(
+        'data:backupCreate',
+        withIpcValidation('data:backupCreate', async (_event, options?: unknown) => {
+            const parsed =
+                options === undefined || options === null
+                    ? {}
+                    : parseIpcPayload(
+                          'data:backupCreate',
+                          createBackupOptionsSchema,
+                          options,
+                      )
+            assertPathWithinRoots(
+                'data:backupCreate',
+                backupRestoreService.getManagedBackupsRoot(),
+                getBackupAllowedRoots(),
+            )
+            return backupRestoreService.createBackup(parsed)
+        }),
+    )
+
+    ipcMain.handle(
+        'data:backupList',
+        withIpcValidation('data:backupList', async () => {
+            assertPathWithinRoots(
+                'data:backupList',
+                backupRestoreService.getManagedBackupsRoot(),
+                getBackupAllowedRoots(),
+            )
+            return backupRestoreService.listBackups()
+        }),
+    )
+
+    ipcMain.handle(
+        'data:backupInspect',
+        withIpcValidation('data:backupInspect', async (_event, backupId?: unknown) => {
+            const id = parseIpcPayload('data:backupInspect', backupIdSchema, backupId)
+            resolveValidatedBackupDir('data:backupInspect', id)
+            return backupRestoreService.inspectBackup(id)
+        }),
+    )
+
+    ipcMain.handle(
+        'data:backupRestore',
+        withIpcValidation('data:backupRestore', async (_event, options?: unknown) => {
+            // Canonical shared schema: backupId + confirmation RESTORE + optional includeProfiles
+            const parsed = parseIpcPayload(
+                'data:backupRestore',
+                restoreBackupOptionsSchema,
+                options,
+            )
+            resolveValidatedBackupDir('data:backupRestore', parsed.backupId)
+            return backupRestoreService.restoreBackup(parsed)
+        }),
+    )
+
+    // -----------------------------------------------------------------------
+    // Compliance audit history (strict query; public DTOs only)
+    // -----------------------------------------------------------------------
+
+    ipcMain.handle(
+        'data:getComplianceAudit',
+        withIpcValidation('data:getComplianceAudit', async (_event, query?: unknown) => {
+            const parsed =
+                query === undefined || query === null
+                    ? {}
+                    : parseIpcPayload(
+                          'data:getComplianceAudit',
+                          complianceAuditQuerySchema,
+                          query,
+                      )
+            return complianceAuditService.listEvents(parsed)
+        }),
+    )
+}

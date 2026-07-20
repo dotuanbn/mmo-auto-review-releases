@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useMemo } from 'react'
-import { useAutomationStore } from '../stores'
+import { useAutomationStore, setupAutomationListeners } from '../stores'
 import {
     Plus,
     Play,
@@ -46,6 +46,22 @@ import {
     SectionPanel,
     Toolbar
 } from '../components/ui/surface'
+import { AutomationMonitor } from '../components/AutomationMonitor'
+import { ResourceMultiSelect } from '../components/campaigns/ResourceMultiSelect'
+import { RecoveryBanner } from '../components/campaigns/RecoveryBanner'
+import {
+    buildCampaignCreatePayload,
+    buildPoolConfirmMessage,
+    getPoolSelectionSummary,
+    type CampaignCreateFormState,
+} from '../components/campaigns/buildCampaignCreatePayload'
+import { CampaignSchedulerPanel } from '../components/scheduler'
+import {
+    CompliancePendingPanel,
+    ReviewIntentReconcilePanel,
+    useComplianceQueue,
+    useReviewIntentQueue,
+} from '../components/compliance'
 
 interface Campaign {
     id: number
@@ -64,6 +80,21 @@ interface CampaignLocation {
     name: string
 }
 
+interface CampaignAccountOption {
+    id: number
+    email: string
+    status: string
+}
+
+interface CampaignProxyOption {
+    id: number
+    host: string
+    port: number
+    type: string
+    status: string
+    country?: string | null
+}
+
 interface CampaignStats {
     total: number
     running: number
@@ -71,19 +102,46 @@ interface CampaignStats {
     done: number
 }
 
-interface PendingReviewSubmission {
-    requestId: string
-    createdAt: string
-    expiresAt: string
-    locationUrl: string
-    locationName?: string
-    accountEmail?: string
-    campaignId?: number
-    threadId?: number
-    reason: string
+type StatusFilter = 'all' | 'pending' | 'running' | 'paused' | 'done' | 'error'
+
+const EMPTY_CAMPAIGN_FORM: CampaignCreateFormState = {
+    name: '',
+    locationIds: [],
+    accountIds: [],
+    proxyIds: [],
+    reviewTemplates: [''],
+    rating: 5,
+    delayMin: 30,
+    delayMax: 60,
 }
 
-type StatusFilter = 'all' | 'pending' | 'running' | 'paused' | 'done' | 'error'
+function isCampaignAccount(value: unknown): value is CampaignAccountOption {
+    if (!value || typeof value !== 'object') return false
+    const candidate = value as { id?: unknown; email?: unknown; status?: unknown }
+    return (
+        typeof candidate.id === 'number' &&
+        typeof candidate.email === 'string' &&
+        typeof candidate.status === 'string'
+    )
+}
+
+function isCampaignProxy(value: unknown): value is CampaignProxyOption {
+    if (!value || typeof value !== 'object') return false
+    const candidate = value as {
+        id?: unknown
+        host?: unknown
+        port?: unknown
+        type?: unknown
+        status?: unknown
+    }
+    return (
+        typeof candidate.id === 'number' &&
+        typeof candidate.host === 'string' &&
+        typeof candidate.port === 'number' &&
+        typeof candidate.type === 'string' &&
+        typeof candidate.status === 'string'
+    )
+}
 
 function deriveCampaignStats(campaigns: Campaign[]): CampaignStats {
     return campaigns.reduce<CampaignStats>((acc, campaign) => {
@@ -119,7 +177,16 @@ const progressToneMap: Record<string, 'emerald' | 'amber' | 'blue' | 'rose' | 's
 
 export function Campaigns() {
     const { t } = useI18n()
-    const automationStore = useAutomationStore()
+    const automationStatus = useAutomationStore((s) => s.status)
+    const recoveryReport = useAutomationStore((s) => s.recoveryReport)
+    const recoveryLoading = useAutomationStore((s) => s.recoveryLoading)
+    const automationLoading = useAutomationStore((s) => s.loading)
+    const startCampaign = useAutomationStore((s) => s.startCampaign)
+    const stopCampaign = useAutomationStore((s) => s.stopCampaign)
+    const pauseAutomation = useAutomationStore((s) => s.pause)
+    const resumeCampaign = useAutomationStore((s) => s.resumeCampaign)
+    const refreshAutomation = useAutomationStore((s) => s.refresh)
+    const fetchRecoveryReport = useAutomationStore((s) => s.fetchRecoveryReport)
     const [campaigns, setCampaigns] = useState<Campaign[]>([])
     const [selectedIds, setSelectedIds] = useState<number[]>([])
     const [selectionMode, setSelectionMode] = useState(false)
@@ -129,19 +196,31 @@ export function Campaigns() {
     const [searchQuery, setSearchQuery] = useState('')
     const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
     const [expandedId, setExpandedId] = useState<number | null>(null)
-    const [newCampaign, setNewCampaign] = useState({
-        name: '',
-        locationIds: [] as number[],
-        reviewTemplates: [''],
-        rating: 5,
-        delayMin: 30,
-        delayMax: 60,
-    })
+    const [newCampaign, setNewCampaign] = useState<CampaignCreateFormState>({ ...EMPTY_CAMPAIGN_FORM })
     const [locations, setLocations] = useState<CampaignLocation[]>([])
+    const [accountOptions, setAccountOptions] = useState<CampaignAccountOption[]>([])
+    const [proxyOptions, setProxyOptions] = useState<CampaignProxyOption[]>([])
     const [activeAccountCount, setActiveAccountCount] = useState(0)
     const [activeProxyCount, setActiveProxyCount] = useState(0)
     const [createStep, setCreateStep] = useState(1)
-    const [pendingSubmissions, setPendingSubmissions] = useState<PendingReviewSubmission[]>([])
+    const [creating, setCreating] = useState(false)
+    const [resumingRecoveryId, setResumingRecoveryId] = useState<number | null>(null)
+    const {
+        pending: pendingSubmissions,
+        actingId: complianceActingId,
+        approve: approveCompliance,
+        reject: rejectCompliance,
+    } = useComplianceQueue()
+    const {
+        intents: pendingReviewIntents,
+        loading: reviewIntentsLoading,
+        refreshing: reviewIntentsRefreshing,
+        error: reviewIntentsError,
+        actingId: reviewIntentActingId,
+        available: reviewIntentsAvailable,
+        refresh: refreshReviewIntents,
+        reconcile: reconcileReviewIntentAction,
+    } = useReviewIntentQueue()
 
     const fetchCampaigns = useCallback(async () => {
         try {
@@ -160,72 +239,53 @@ export function Campaigns() {
 
     const fetchResources = useCallback(async () => {
         try {
-            const [locationData, accountCount, proxyCount] = await Promise.all([
+            const [locationData, accountCount, proxyCount, accountsData, proxiesData] = await Promise.all([
                 window.electronAPI.locations.getPending(),
                 window.electronAPI.accounts.getActiveCount(),
                 window.electronAPI.proxies.getActiveCount(),
+                window.electronAPI.accounts.getAll(),
+                window.electronAPI.proxies.getAll(),
             ])
             setLocations(Array.isArray(locationData) ? locationData.filter(isCampaignLocation) : [])
             setActiveAccountCount(Number(accountCount) || 0)
             setActiveProxyCount(Number(proxyCount) || 0)
+
+            const accounts = Array.isArray(accountsData)
+                ? accountsData.filter(isCampaignAccount).filter((a) => a.status === 'active')
+                : []
+            const proxies = Array.isArray(proxiesData)
+                ? proxiesData.filter(isCampaignProxy).filter((p) => p.status === 'active')
+                : []
+            setAccountOptions(accounts)
+            setProxyOptions(proxies)
         } catch (error) {
             console.error('Failed to fetch campaign resources:', error)
         }
     }, [])
 
     useEffect(() => {
+        setupAutomationListeners()
+        void refreshAutomation()
+        void fetchRecoveryReport()
         fetchCampaigns()
         fetchResources()
-    }, [fetchCampaigns, fetchResources])
+    }, [fetchCampaigns, fetchResources, refreshAutomation, fetchRecoveryReport])
 
+    // Auto-refresh running campaigns + keep automation snapshot warm
     useEffect(() => {
-        let mounted = true
-
-        const loadPending = async () => {
-            try {
-                const queue = await (window as any).electronAPI.compliance.getPendingReviewSubmissions()
-                if (mounted) {
-                    setPendingSubmissions(Array.isArray(queue) ? queue : [])
-                }
-            } catch (error) {
-                console.error('Failed to load pending review submissions:', error)
-            }
-        }
-
-        loadPending()
-
-        const unsubscribeQueue = (window as any).electronAPI.compliance.onReviewSubmissionQueue((queue: PendingReviewSubmission[]) => {
-            setPendingSubmissions(Array.isArray(queue) ? queue : [])
-        })
-        const unsubscribePending = (window as any).electronAPI.compliance.onReviewSubmissionPending((payload: PendingReviewSubmission) => {
-            setPendingSubmissions(prev => {
-                if (prev.some(item => item.requestId === payload.requestId)) {
-                    return prev
-                }
-                return [payload, ...prev]
-            })
-        })
-        const unsubscribeResolved = (window as any).electronAPI.compliance.onReviewSubmissionResolved((payload: { requestId: string }) => {
-            setPendingSubmissions(prev => prev.filter(item => item.requestId !== payload.requestId))
-        })
-
-        return () => {
-            mounted = false
-            try { unsubscribeQueue() } catch { }
-            try { unsubscribePending() } catch { }
-            try { unsubscribeResolved() } catch { }
-        }
-    }, [])
-
-    // Auto-refresh running campaigns
-    useEffect(() => {
-        if (stats.running > 0) {
+        if (stats.running > 0 || automationStatus.running) {
             const interval = setInterval(() => {
-                fetchCampaigns()
+                void fetchCampaigns()
+                void refreshAutomation()
             }, 10000)
             return () => clearInterval(interval)
         }
-    }, [stats.running, fetchCampaigns])
+    }, [stats.running, automationStatus.running, fetchCampaigns, refreshAutomation])
+
+    const recoveryCampaignLabels = useMemo(
+        () => campaigns.map((c) => ({ id: c.id, name: c.name })),
+        [campaigns],
+    )
 
     const filteredCampaigns = useMemo(() => campaigns.filter(c => {
         const matchSearch = c.name.toLowerCase().includes(searchQuery.toLowerCase())
@@ -244,52 +304,124 @@ export function Campaigns() {
         ? Math.round((campaignTotals.success / campaignTotals.completed) * 100)
         : 0
     const selectedLocationIds = useMemo(() => new Set(newCampaign.locationIds), [newCampaign.locationIds])
+    const poolSummary = useMemo(() => getPoolSelectionSummary(newCampaign), [newCampaign])
+    const showLiveMonitor = automationStatus.running || automationStatus.paused || stats.running > 0
+
+    const accountSelectOptions = useMemo(
+        () =>
+            accountOptions.map((acc) => ({
+                id: acc.id,
+                label: acc.email,
+                badge: acc.status,
+                badgeTone: 'emerald' as const,
+            })),
+        [accountOptions]
+    )
+
+    const proxySelectOptions = useMemo(
+        () =>
+            proxyOptions.map((proxy) => ({
+                id: proxy.id,
+                label: `${proxy.host}:${proxy.port}`,
+                sublabel: [proxy.type, proxy.country].filter(Boolean).join(' · '),
+                badge: proxy.status,
+                badgeTone: 'emerald' as const,
+            })),
+        [proxyOptions]
+    )
+
+    const resetCreateForm = () => {
+        setNewCampaign({ ...EMPTY_CAMPAIGN_FORM })
+        setCreateStep(1)
+    }
 
     const handleCreateCampaign = async () => {
-        if (!newCampaign.name || newCampaign.locationIds.length === 0) return
-        try {
-            await window.electronAPI.campaigns.create({
-                name: newCampaign.name,
-                locationIds: newCampaign.locationIds,
-                reviewTemplates: newCampaign.reviewTemplates.filter(t => t.trim()),
-                rating: newCampaign.rating,
-                delayMin: newCampaign.delayMin,
-                delayMax: newCampaign.delayMax,
+        if (!newCampaign.name || newCampaign.locationIds.length === 0 || creating) return
+
+        if (poolSummary.needsPoolConfirm) {
+            const confirmText = buildPoolConfirmMessage({
+                useAllAccounts: poolSummary.useAllAccounts,
+                useAllProxies: poolSummary.useAllProxies,
+                title: t(
+                    'campaigns.confirmUseFullPool',
+                    'Empty selection will use the entire available pool. Continue?'
+                ),
+                accountPoolLabel: t(
+                    'campaigns.confirmUseAllAccounts',
+                    'Accounts: use entire active account pool'
+                ),
+                proxyPoolLabel: t(
+                    'campaigns.confirmUseAllProxies',
+                    'Proxies: use entire active proxy pool (or none if pool empty)'
+                ),
             })
+            if (!confirm(confirmText)) return
+        }
+
+        const payload = buildCampaignCreatePayload(newCampaign)
+        try {
+            setCreating(true)
+            await window.electronAPI.campaigns.create(payload)
             await fetchCampaigns()
             await fetchResources()
-            setNewCampaign({
-                name: '',
-                locationIds: [],
-                reviewTemplates: [''],
-                rating: 5,
-                delayMin: 30,
-                delayMax: 60,
-            })
-            setCreateStep(1)
+            resetCreateForm()
             setShowCreateModal(false)
         } catch (error) {
             alert(t('campaigns.createFailed'))
+        } finally {
+            setCreating(false)
         }
     }
 
     const handleStart = async (id: number) => {
-        const result = await automationStore.startCampaign(id)
+        const result = await startCampaign(id)
         if (!result.success) {
-            alert(`${t('campaigns.createFailed')}: ${result.error}`)
+            alert(`${t('campaigns.startFailed', 'Failed to start')}: ${result.error}`)
         }
         await fetchCampaigns()
+        await refreshAutomation()
     }
 
     const handlePause = async (id: number) => {
+        // campaigns.pause also pauses AutomationController
+        await pauseAutomation()
         await window.electronAPI.campaigns.pause(id)
         await fetchCampaigns()
+        await refreshAutomation()
+    }
+
+    const handleResume = async (id: number) => {
+        const result = await resumeCampaign(id)
+        if (!result.success) {
+            alert(`${t('campaigns.startFailed', 'Failed to resume')}: ${result.error}`)
+        }
+        await fetchCampaigns()
+        await refreshAutomation()
+    }
+
+    /** Recovery banner resume — always resumeCampaign (pending jobs only), never auto-start. */
+    const handleRecoveryResume = async (id: number) => {
+        setResumingRecoveryId(id)
+        try {
+            const result = await resumeCampaign(id)
+            if (!result.success) {
+                alert(
+                    `${t('campaigns.recoveryResumeFailed', 'Failed to resume recovery')}: ${result.error ?? ''}`,
+                )
+            }
+            await fetchCampaigns()
+            await refreshAutomation()
+            await fetchRecoveryReport()
+        } finally {
+            setResumingRecoveryId(null)
+        }
     }
 
     const handleStop = async (id: number) => {
-        await automationStore.stopCampaign()
+        await stopCampaign()
         await window.electronAPI.campaigns.stop(id)
         await fetchCampaigns()
+        await refreshAutomation()
     }
 
     const handleDelete = async (id: number) => {
@@ -331,33 +463,35 @@ export function Campaigns() {
 
     const handleDuplicate = async (campaign: Campaign) => {
         setNewCampaign({
+            ...EMPTY_CAMPAIGN_FORM,
             name: `${campaign.name} (Copy)`,
-            locationIds: [],
-            reviewTemplates: [''],
             rating: campaign.rating,
-            delayMin: 30,
-            delayMax: 60,
         })
         setCreateStep(1)
+        void fetchResources()
         setShowCreateModal(true)
     }
 
-    const handleApproveSubmission = async (requestId: string) => {
-        try {
-            await (window as any).electronAPI.compliance.approveReviewSubmission(requestId)
-            setPendingSubmissions(prev => prev.filter(item => item.requestId !== requestId))
-        } catch (error) {
-            console.error('Failed to approve manual review submission:', error)
-        }
+    const openCreateModal = () => {
+        setCreateStep(1)
+        void fetchResources()
+        setShowCreateModal(true)
     }
 
-    const handleRejectSubmission = async (requestId: string) => {
-        try {
-            await (window as any).electronAPI.compliance.rejectReviewSubmission(requestId, 'rejected_in_campaign_ui')
-            setPendingSubmissions(prev => prev.filter(item => item.requestId !== requestId))
-        } catch (error) {
-            console.error('Failed to reject manual review submission:', error)
-        }
+    const handleApproveSubmission = (requestId: string) => {
+        void approveCompliance(requestId)
+    }
+
+    const handleRejectSubmission = (requestId: string) => {
+        void rejectCompliance(requestId, 'rejected_in_campaign_ui')
+    }
+
+    const handleReconcileReviewIntent = (
+        historyId: number,
+        outcome: 'confirmed_success' | 'confirmed_not_posted',
+        note?: string,
+    ) => {
+        void reconcileReviewIntentAction(historyId, outcome, note)
     }
 
     const getProgress = (completed: number, total: number) => {
@@ -369,14 +503,6 @@ export function Campaigns() {
         return completed > 0
             ? Math.round(((Number(campaign.successReviews) || 0) / completed) * 100)
             : 0
-    }
-
-    const formatTimestamp = (value: string) => {
-        const parsed = new Date(value)
-        if (Number.isNaN(parsed.getTime())) {
-            return value
-        }
-        return parsed.toLocaleString('vi-VN')
     }
 
     // Resource readiness
@@ -397,15 +523,15 @@ export function Campaigns() {
                     onClick={() => {
                         fetchCampaigns()
                         fetchResources()
+                        void refreshAutomation()
+                        void fetchRecoveryReport()
+                        void refreshReviewIntents()
                     }}
-                    className={loading ? 'animate-spin' : undefined}
+                    className={loading || reviewIntentsRefreshing ? 'animate-spin' : undefined}
                 />
                 <PrimaryButton
                     icon={Plus}
-                    onClick={() => {
-                        setCreateStep(1)
-                        setShowCreateModal(true)
-                    }}
+                    onClick={openCreateModal}
                     disabled={!resourceReady}
                     title={!resourceReady ? t('campaigns.needResourcesFirst') : ''}
                 >
@@ -436,76 +562,44 @@ export function Campaigns() {
                 </AlertBanner>
             )}
 
-            {/* Live Automation Status */}
-            {automationStore.status.running && (
-                <Panel tone="emerald" className="p-5">
-                    <div className="flex items-center justify-between mb-3">
-                        <div className="flex items-center gap-3">
-                            <div className="relative">
-                                <div className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />
-                                <div className="absolute inset-0 w-3 h-3 rounded-full bg-emerald-500 animate-ping opacity-30" />
-                            </div>
-                            <div>
-                                <p className="text-emerald-700 font-semibold">{t('campaigns.campaignRunning')}</p>
-                                <p className="text-sm text-[#5f5a6d]">{automationStore.status.message}</p>
-                            </div>
-                        </div>
-                        <div className="text-right">
-                            <div className="text-3xl font-bold text-emerald-600">{automationStore.status.progress}%</div>
-                            <div className="text-xs text-[#908a9e]">{t('campaigns.progressSection')}</div>
-                        </div>
-                    </div>
-                    <ProgressBar value={automationStore.status.progress} tone="emerald" />
-                </Panel>
+            {/* Crash recovery — pending durable jobs; manual resume only (never auto-start) */}
+            <RecoveryBanner
+                report={recoveryReport}
+                campaigns={recoveryCampaignLabels}
+                loading={recoveryLoading || automationLoading}
+                resumingId={resumingRecoveryId}
+                disabled={automationStatus.running}
+                onResume={handleRecoveryResume}
+                onRefresh={async () => {
+                    await fetchRecoveryReport()
+                    await fetchCampaigns()
+                }}
+            />
+
+            {/* Live Automation Status — stream from AutomationController via store */}
+            {showLiveMonitor && (
+                <AutomationMonitor embedded showControls />
             )}
 
-            {/* Pending Review Submissions */}
-            {pendingSubmissions.length > 0 && (
-                <Panel tone="amber" className="p-4 space-y-3" key="pending-panel">
-                    <div className="flex items-center gap-2">
-                        <AlertCircle className="w-5 h-5 text-amber-600" />
-                        <div className="text-amber-700 font-semibold text-sm">
-                            Manual review submit approvals pending ({pendingSubmissions.length})
-                        </div>
-                    </div>
-                    <div className="space-y-2">
-                        {pendingSubmissions.slice(0, 6).map(request => (
-                            <div key={request.requestId} className="bg-white/70 border border-[#e9e4f2] rounded-[14px] p-3">
-                                <div className="flex items-center justify-between gap-3">
-                                    <div className="min-w-0">
-                                        <div className="text-sm text-[#17171f] font-medium truncate">
-                                            {request.locationName || request.locationUrl}
-                                        </div>
-                                        <div className="text-xs text-[#908a9e] mt-1 break-all">
-                                            {request.locationUrl}
-                                        </div>
-                                        <div className="text-xs text-[#908a9e] mt-1">
-                                            {request.accountEmail || 'Unknown account'} -- Thread #{request.threadId ?? '-'} --
-                                            {' '}created {formatTimestamp(request.createdAt)}
-                                        </div>
-                                    </div>
-                                    <div className="flex items-center gap-2 shrink-0">
-                                        <PrimaryButton
-                                            tone="emerald"
-                                            onClick={() => handleApproveSubmission(request.requestId)}
-                                            className="!px-3 !py-1.5 !text-xs"
-                                        >
-                                            Approve
-                                        </PrimaryButton>
-                                        <PrimaryButton
-                                            tone="rose"
-                                            onClick={() => handleRejectSubmission(request.requestId)}
-                                            className="!px-3 !py-1.5 !text-xs"
-                                        >
-                                            Reject
-                                        </PrimaryButton>
-                                    </div>
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                </Panel>
-            )}
+            {/* Pending Review Submissions (pre-submit compliance operator panel) */}
+            <CompliancePendingPanel
+                pending={pendingSubmissions}
+                actingId={complianceActingId}
+                onApprove={handleApproveSubmission}
+                onReject={handleRejectSubmission}
+            />
+
+            {/* Durable submitting/unconfirmed intents — manual reconcile (distinct from pre-submit) */}
+            <ReviewIntentReconcilePanel
+                intents={pendingReviewIntents}
+                loading={reviewIntentsLoading}
+                refreshing={reviewIntentsRefreshing}
+                error={reviewIntentsError}
+                actingId={reviewIntentActingId}
+                available={reviewIntentsAvailable}
+                onReconcile={handleReconcileReviewIntent}
+                onRefresh={refreshReviewIntents}
+            />
 
             {/* Stats Grid */}
             <StatRow>
@@ -614,7 +708,7 @@ export function Campaigns() {
                                 action={
                                     <PrimaryButton
                                         icon={Plus}
-                                        onClick={() => { setCreateStep(1); setShowCreateModal(true) }}
+                                        onClick={openCreateModal}
                                         disabled={!resourceReady}
                                     >
                                         {t('campaigns.newCampaign')}
@@ -733,7 +827,22 @@ export function Campaigns() {
                                                     </>
                                                 )}
                                                 {campaign.status === 'paused' && (
-                                                    <PrimaryButton icon={Play} tone="emerald" onClick={() => handleStart(campaign.id)} className="!px-3 !py-1.5 !text-xs">
+                                                    <PrimaryButton
+                                                        icon={Play}
+                                                        tone="emerald"
+                                                        onClick={() => {
+                                                            // Prefer engine resume when this campaign is the live one
+                                                            if (
+                                                                automationStatus.running &&
+                                                                automationStatus.currentCampaignId === campaign.id
+                                                            ) {
+                                                                void handleResume(campaign.id)
+                                                            } else {
+                                                                void handleStart(campaign.id)
+                                                            }
+                                                        }}
+                                                        className="!px-3 !py-1.5 !text-xs"
+                                                    >
                                                         {t('common.resume')}
                                                     </PrimaryButton>
                                                 )}
@@ -750,7 +859,7 @@ export function Campaigns() {
                                     {/* Expanded Details */}
                                     {isExpanded && (
                                         <div className="px-5 pb-5 pt-0 border-t border-[#e9e4f2]">
-                                            <div className="pt-4 grid grid-cols-2 gap-4">
+                                            <div className="pt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                                                 <div>
                                                     <h4 className="text-xs text-[#908a9e] uppercase tracking-wider font-bold mb-2">{t('campaigns.detailInfo')}</h4>
                                                     <div className="space-y-2 text-sm">
@@ -786,6 +895,10 @@ export function Campaigns() {
                                                     </div>
                                                 </div>
                                             </div>
+                                            <CampaignSchedulerPanel
+                                                campaignId={campaign.id}
+                                                campaignName={campaign.name}
+                                            />
                                         </div>
                                     )}
                                 </Panel>
@@ -798,7 +911,10 @@ export function Campaigns() {
             {/* Create Campaign Modal - Step Wizard */}
             <Modal
                 open={showCreateModal}
-                onClose={() => setShowCreateModal(false)}
+                onClose={() => {
+                    setShowCreateModal(false)
+                    resetCreateForm()
+                }}
                 title={t('campaigns.createCampaign')}
                 description={`${t('campaigns.stepLabel')} ${createStep} / 3`}
                 size="lg"
@@ -936,10 +1052,42 @@ export function Campaigns() {
                     </div>
                 )}
 
-                {/* Step 3: Settings & Confirm */}
+                {/* Step 3: Resources, Settings & Confirm */}
                 {createStep === 3 && (
                     <div className="space-y-4">
-                        <div className="grid grid-cols-2 gap-4">
+                        <ResourceMultiSelect
+                            title={t('campaigns.selectAccounts', 'Select Accounts')}
+                            countLabel={`(${newCampaign.accountIds.length} ${t('common.selected')} / ${accountOptions.length} ${t('campaigns.available')})`}
+                            options={accountSelectOptions}
+                            selectedIds={newCampaign.accountIds}
+                            onChange={(ids) => setNewCampaign((prev) => ({ ...prev, accountIds: ids }))}
+                            emptyPoolHint={t(
+                                'campaigns.emptyAccountsUsePool',
+                                'No accounts selected — campaign will use the entire active account pool.'
+                            )}
+                            noOptionsLabel={t('campaigns.noActiveAccounts', 'No active accounts')}
+                            selectAllLabel={t('common.selectAll')}
+                            clearLabel={t('common.deselectAll')}
+                            icon={Users}
+                        />
+
+                        <ResourceMultiSelect
+                            title={t('campaigns.selectProxies', 'Select Proxies')}
+                            countLabel={`(${newCampaign.proxyIds.length} ${t('common.selected')} / ${proxyOptions.length} ${t('campaigns.available')})`}
+                            options={proxySelectOptions}
+                            selectedIds={newCampaign.proxyIds}
+                            onChange={(ids) => setNewCampaign((prev) => ({ ...prev, proxyIds: ids }))}
+                            emptyPoolHint={t(
+                                'campaigns.emptyProxiesUsePool',
+                                'No proxies selected — campaign will use the entire active proxy pool (or no proxy if pool empty).'
+                            )}
+                            noOptionsLabel={t('campaigns.noProxyOptional', 'No proxy (optional)')}
+                            selectAllLabel={t('common.selectAll')}
+                            clearLabel={t('common.deselectAll')}
+                            icon={Globe}
+                        />
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div>
                                 <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
                                     <Timer className="w-3.5 h-3.5 inline mr-1" />
@@ -970,7 +1118,7 @@ export function Campaigns() {
 
                         {/* Summary */}
                         <SectionPanel icon={Eye} title={t('campaigns.campaignSummary')} tone="violet">
-                            <div className="grid grid-cols-2 gap-3 text-sm">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                                 <div>
                                     <span className="text-[#908a9e]">{t('common.name')}:</span>
                                     <span className="text-[#17171f] ml-2 font-medium">{newCampaign.name}</span>
@@ -984,18 +1132,38 @@ export function Campaigns() {
                                     <span className="text-[#8d74e8] ml-2 font-medium">{newCampaign.locationIds.length}</span>
                                 </div>
                                 <div>
-                                    <span className="text-[#908a9e]">Templates:</span>
+                                    <span className="text-[#908a9e]">{t('campaigns.templatesLabel', 'Templates')}:</span>
                                     <span className="text-[#8d74e8] ml-2 font-medium">{newCampaign.reviewTemplates.filter(tmpl => tmpl.trim()).length}</span>
                                 </div>
                                 <div>
-                                    <span className="text-[#908a9e]">Delay:</span>
+                                    <span className="text-[#908a9e]">{t('campaigns.delayLabel', 'Delay')}:</span>
                                     <span className="text-[#5f5a6d] ml-2">{newCampaign.delayMin}s - {newCampaign.delayMax}s</span>
                                 </div>
                                 <div>
-                                    <span className="text-[#908a9e]">Accounts:</span>
-                                    <span className="text-emerald-600 ml-2 font-medium">{activeAccountCount} {t('campaigns.ready')}</span>
+                                    <span className="text-[#908a9e]">{t('campaigns.accountsLabel')}:</span>
+                                    <span className="text-emerald-600 ml-2 font-medium">
+                                        {poolSummary.useAllAccounts
+                                            ? t('campaigns.poolAllAccounts', `All active (${accountOptions.length || activeAccountCount})`)
+                                            : `${newCampaign.accountIds.length} ${t('common.selected')}`}
+                                    </span>
+                                </div>
+                                <div>
+                                    <span className="text-[#908a9e]">{t('campaigns.proxiesLabel', 'proxies')}:</span>
+                                    <span className="text-emerald-600 ml-2 font-medium">
+                                        {poolSummary.useAllProxies
+                                            ? t('campaigns.poolAllProxies', `All active (${proxyOptions.length || activeProxyCount})`)
+                                            : `${newCampaign.proxyIds.length} ${t('common.selected')}`}
+                                    </span>
                                 </div>
                             </div>
+                            {poolSummary.needsPoolConfirm && (
+                                <p className="text-xs text-amber-700 mt-3">
+                                    {t(
+                                        'campaigns.poolConfirmHint',
+                                        'Creating with empty account/proxy selection will ask you to confirm using the full pool.'
+                                    )}
+                                </p>
+                            )}
                         </SectionPanel>
 
                         <div className="flex gap-3">
@@ -1005,10 +1173,12 @@ export function Campaigns() {
                             <PrimaryButton
                                 className="flex-1"
                                 icon={Rocket}
-                                onClick={handleCreateCampaign}
-                                disabled={!newCampaign.name || newCampaign.locationIds.length === 0}
+                                onClick={() => void handleCreateCampaign()}
+                                disabled={!newCampaign.name || newCampaign.locationIds.length === 0 || creating}
                             >
-                                {t('campaigns.createCampaign')}
+                                {creating
+                                    ? t('campaigns.creating', 'Creating...')
+                                    : t('campaigns.createCampaign')}
                             </PrimaryButton>
                         </div>
                     </div>

@@ -16,23 +16,70 @@ const SCREEN_RESOLUTIONS = [
     { width: 1600, height: 900 },
 ]
 
-// Common desktop user agents (Chrome on Windows/Mac)
+// Common desktop user agents (Chrome 128-131).
+// Windows 11 still reports "Windows NT 10.0" — never use NT 11.0 (bot signal).
 const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
 ]
 
-// WebGL renderers (common GPU combinations)
-const WEBGL_CONFIGS = [
+// Client Hints for modern Chrome versions
+export interface ClientHints {
+    secChUa: string
+    secChUaPlatform: string
+    secChUaMobile: string
+    secChUaFullVersion: string
+}
+
+// Map Chrome major version → Client Hints (platform filled at lookup time)
+const CLIENT_HINTS_MAP: Record<string, Omit<ClientHints, 'secChUaPlatform'>> = {
+    '131': {
+        secChUa: '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
+        secChUaMobile: '?0',
+        secChUaFullVersion: '131.0.6778.85',
+    },
+    '130': {
+        secChUa: '"Chromium";v="130", "Google Chrome";v="130", "Not_A Brand";v="99"',
+        secChUaMobile: '?0',
+        secChUaFullVersion: '130.0.6723.117',
+    },
+    '129': {
+        secChUa: '"Chromium";v="129", "Google Chrome";v="129", "Not_A Brand";v="24"',
+        secChUaMobile: '?0',
+        secChUaFullVersion: '129.0.6668.100',
+    },
+    '128': {
+        secChUa: '"Chromium";v="128", "Google Chrome";v="128", "Not_A Brand";v="24"',
+        secChUaMobile: '?0',
+        secChUaFullVersion: '128.0.6613.120',
+    },
+}
+
+// WebGL renderers — Windows uses ANGLE/D3D11; macOS uses Apple Metal-backed ANGLE
+const WEBGL_CONFIGS_WINDOWS = [
     { vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0)' },
     { vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)' },
+    { vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0)' },
     { vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0)' },
+    { vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD Radeon RX 7600 Direct3D11 vs_5_0 ps_5_0)' },
     { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)' },
     { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel Iris Plus Graphics 640 Direct3D11 vs_5_0 ps_5_0)' },
+]
+
+const WEBGL_CONFIGS_MACOS = [
+    { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)' },
+    { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)' },
+    { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)' },
+    { vendor: 'Google Inc. (Intel Inc.)', renderer: 'ANGLE (Intel Inc., Intel(R) Iris(TM) Plus Graphics 640, OpenGL 4.1)' },
+    { vendor: 'Google Inc. (ATI Technologies Inc.)', renderer: 'ANGLE (ATI Technologies Inc., AMD Radeon Pro 5500M OpenGL Engine, OpenGL 4.1)' },
 ]
 
 // Timezone offsets (minutes from UTC)
@@ -67,6 +114,7 @@ export interface BrowserFingerprint {
     deviceMemory: number
     canvasNoise: number // Seed for canvas noise
     audioNoise: number // Seed for audio noise
+    clientHints?: ClientHints
     createdAt: Date
 }
 
@@ -88,18 +136,50 @@ export class FingerprintService {
         return Math.floor(Math.random() * (max - min + 1)) + min
     }
 
+    // Single source of truth for UA pool (used by BrowserService.getRandomUserAgent)
+    getRandomUserAgent(): string {
+        return this.getRandomItem(USER_AGENTS)
+    }
+
+    // Extract Chrome major version and return matching Client Hints
+    getClientHints(fingerprint: BrowserFingerprint): ClientHints {
+        const match = fingerprint.userAgent.match(/Chrome\/(\d+)/)
+        const major = match?.[1] ?? '131'
+        const platform = fingerprint.userAgent.includes('Macintosh') ? 'macOS' : 'Windows'
+        const base = CLIENT_HINTS_MAP[major] ?? CLIENT_HINTS_MAP['131']
+        return {
+            secChUa: base.secChUa,
+            secChUaPlatform: `"${platform}"`,
+            secChUaMobile: base.secChUaMobile,
+            secChUaFullVersion: base.secChUaFullVersion,
+        }
+    }
+
+    private pickWebGl(isWindows: boolean): { vendor: string; renderer: string } {
+        return this.getRandomItem(isWindows ? WEBGL_CONFIGS_WINDOWS : WEBGL_CONFIGS_MACOS)
+    }
+
     // Generate a new fingerprint
     generate(): BrowserFingerprint {
-        const userAgent = this.getRandomItem(USER_AGENTS)
-        const isWindows = userAgent.includes('Windows')
+        return this.generateForUserAgent(this.getRandomUserAgent())
+    }
+
+    /**
+     * Build a fingerprint whose UA / platform / WebGL / Client Hints stay consistent.
+     * Use when a caller already chose a User-Agent (randomizeUserAgent path).
+     */
+    generateForUserAgent(userAgent: string): BrowserFingerprint {
+        // Normalize invalid Windows 11 UA token if any external caller passes it
+        const normalizedUa = userAgent.replace(/Windows NT 11\.0/g, 'Windows NT 10.0')
+        const isWindows = !normalizedUa.includes('Macintosh')
 
         const fingerprint: BrowserFingerprint = {
             id: this.generateId(),
-            userAgent,
+            userAgent: normalizedUa,
             screenResolution: this.getRandomItem(SCREEN_RESOLUTIONS),
             colorDepth: this.getRandomItem([24, 32]),
             devicePixelRatio: this.getRandomItem([1, 1.25, 1.5, 2]),
-            webgl: this.getRandomItem(WEBGL_CONFIGS),
+            webgl: this.pickWebGl(isWindows),
             timezone: this.getRandomItem(TIMEZONES),
             languages: this.getRandomItem(LANGUAGES),
             platform: isWindows ? 'Win32' : 'MacIntel',
@@ -109,6 +189,7 @@ export class FingerprintService {
             audioNoise: Math.random(),
             createdAt: new Date(),
         }
+        fingerprint.clientHints = this.getClientHints(fingerprint)
 
         this.fingerprints.set(fingerprint.id, fingerprint)
         return fingerprint

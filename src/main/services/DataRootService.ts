@@ -1,10 +1,31 @@
 import { app } from 'electron'
 import { cpSync, existsSync, mkdirSync, readdirSync } from 'fs'
-import { dirname, join } from 'path'
+import { tmpdir } from 'os'
+import { dirname, isAbsolute, join, relative, resolve } from 'path'
 
 const PORTABLE_DATA_DIR = 'data'
 const STABLE_PACKAGED_DATA_DIR = 'MMO Auto Review'
 const LEGACY_DATA_CANDIDATES = ['mmo-auto-review', 'MMO Auto Review']
+
+export function resolveSmokeDataRootOverride(
+    env: NodeJS.ProcessEnv = process.env,
+    tempPath: string = tmpdir(),
+): string | null {
+    if (env.MMO_SMOKE_MODE !== '1') return null
+
+    const requested = env.SMOKE_USER_DATA_DIR?.trim()
+    if (!requested) {
+        throw new Error('MMO_SMOKE_MODE requires SMOKE_USER_DATA_DIR')
+    }
+
+    const allowedRoot = resolve(tempPath, 'mmo-packaged-smoke')
+    const candidate = resolve(requested)
+    const rel = relative(allowedRoot, candidate)
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+        throw new Error('Smoke userData must be under the OS temp mmo-packaged-smoke root')
+    }
+    return candidate
+}
 
 function nowSuffix(): string {
     return new Date().toISOString().replace(/[:.]/g, '-')
@@ -71,6 +92,13 @@ function safeCountEntries(path: string): number {
 
 class DataRootService {
     configurePortableUserDataPath(): { portable: boolean; dataRoot: string } {
+        const smokeDataRoot = resolveSmokeDataRootOverride()
+        if (smokeDataRoot) {
+            ensureDirectory(smokeDataRoot)
+            app.setPath('userData', smokeDataRoot)
+            return { portable: false, dataRoot: smokeDataRoot }
+        }
+
         const portableDir = getPortableExecutableDir()
         if (!portableDir) {
             const current = app.getPath('userData')

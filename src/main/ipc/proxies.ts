@@ -1,77 +1,154 @@
+/**
+ * Proxy IPC handlers — runtime Zod validation at the boundary.
+ * Public responses never include password secrets (PublicProxy + hasPassword).
+ */
+
 import { ipcMain } from 'electron'
 import { proxyService } from '../services/ProxyService'
+import {
+    omitUndefinedFields,
+    proxyCreateSchema,
+    proxyIdSchema,
+    proxyImportArgsSchema,
+    proxyUpdateArgsSchema,
+    type ProxyUpdateInput,
+} from '../../shared/proxy-contracts'
+import { parseIpcArgs, parseIpcPayload, withIpcValidation } from './validate'
 
 export function registerProxyHandlers() {
-    // Get all proxies
-    ipcMain.handle('proxies:getAll', async () => {
-        return proxyService.getAll()
-    })
+    // Get all proxies — public DTO only
+    ipcMain.handle(
+        'proxies:getAll',
+        withIpcValidation('proxies:getAll', async () => {
+            return proxyService.getAllPublic()
+        }),
+    )
 
-    // Get active proxies
-    ipcMain.handle('proxies:getActive', async () => {
-        return proxyService.getActive()
-    })
+    // Get active proxies — public DTO only
+    ipcMain.handle(
+        'proxies:getActive',
+        withIpcValidation('proxies:getActive', async () => {
+            return proxyService.getActivePublic()
+        }),
+    )
 
-    ipcMain.handle('proxies:getActiveCount', async () => {
-        return proxyService.getActiveCount()
-    })
+    ipcMain.handle(
+        'proxies:getActiveCount',
+        withIpcValidation('proxies:getActiveCount', async () => {
+            return proxyService.getActiveCount()
+        }),
+    )
 
-    // Add new proxy
-    ipcMain.handle('proxies:add', async (_event, data: {
-        host: string
-        port: number
-        username?: string
-        password?: string
-        type?: 'http' | 'https' | 'socks5'
-        country?: string
-        provider?: string
-    }) => {
-        return proxyService.create({
-            host: data.host,
-            port: data.port,
-            username: data.username,
-            password: data.password,
-            type: data.type || 'http',
-            country: data.country,
-            provider: data.provider,
-            status: 'active',
-            createdAt: new Date(),
-        })
-    })
+    // Add new proxy — returns public DTO (no password)
+    ipcMain.handle(
+        'proxies:add',
+        withIpcValidation('proxies:add', async (_event, data: unknown) => {
+            const payload = parseIpcPayload('proxies:add', proxyCreateSchema, data)
+            const created = await proxyService.create({
+                host: payload.host,
+                port: payload.port,
+                username: payload.username,
+                password: payload.password,
+                type: payload.type,
+                country: payload.country,
+                provider: payload.provider,
+                status: 'active',
+                createdAt: new Date(),
+            })
+            return proxyService.toPublicProxy(created)
+        }),
+    )
 
-    // Update proxy
-    ipcMain.handle('proxies:update', async (_event, id: number, data: any) => {
-        return proxyService.update(id, data)
-    })
+    // Update proxy — blank password keeps secret; null clears; public DTO out
+    ipcMain.handle(
+        'proxies:update',
+        withIpcValidation('proxies:update', async (_event, id: unknown, data: unknown) => {
+            const [proxyId, payload] = parseIpcArgs(
+                'proxies:update',
+                proxyUpdateArgsSchema,
+                [id, data],
+            )
+            const update: Partial<ProxyUpdateInput> = omitUndefinedFields(payload)
+            if (Object.keys(update).length === 0) {
+                const existing = await proxyService.getById(proxyId)
+                return existing ? proxyService.toPublicProxy(existing) : undefined
+            }
+            const updated = await proxyService.update(
+                proxyId,
+                update as Parameters<typeof proxyService.update>[1],
+            )
+            return updated ? proxyService.toPublicProxy(updated) : undefined
+        }),
+    )
 
     // Delete proxy
-    ipcMain.handle('proxies:delete', async (_event, id: number) => {
-        return proxyService.delete(id)
-    })
+    ipcMain.handle(
+        'proxies:delete',
+        withIpcValidation('proxies:delete', async (_event, id: unknown) => {
+            const proxyId = parseIpcPayload('proxies:delete', proxyIdSchema, id)
+            return await proxyService.delete(proxyId)
+        }),
+    )
 
-    // Check single proxy
-    ipcMain.handle('proxies:check', async (_event, id: number) => {
-        return proxyService.checkProxy(id)
-    })
+    // HTTP quick check (native http/net)
+    ipcMain.handle(
+        'proxies:check',
+        withIpcValidation('proxies:check', async (_event, id: unknown) => {
+            const proxyId = parseIpcPayload('proxies:check', proxyIdSchema, id)
+            return await proxyService.checkProxy(proxyId)
+        }),
+    )
 
-    // Check all proxies
-    ipcMain.handle('proxies:checkAll', async () => {
-        await proxyService.checkAllProxies()
-        return { success: true }
-    })
+    /**
+     * Runtime-parity preflight (ProxyBridge + Playwright ephemeral path).
+     * Returns structured reasonCode, latencyMs, observedIp, bridgeMode.
+     */
+    ipcMain.handle(
+        'proxies:checkRuntime',
+        withIpcValidation('proxies:checkRuntime', async (_event, id: unknown) => {
+            const proxyId = parseIpcPayload('proxies:checkRuntime', proxyIdSchema, id)
+            return await proxyService.checkProxyRuntime(proxyId)
+        }),
+    )
 
-    // Import from text
-    ipcMain.handle('proxies:importText', async (_event, text: string, defaultProvider?: string) => {
-        return proxyService.importFromText(text, defaultProvider)
-    })
+    // Check all proxies (HTTP quick)
+    ipcMain.handle(
+        'proxies:checkAll',
+        withIpcValidation('proxies:checkAll', async () => {
+            await proxyService.checkAllProxies()
+            return { success: true }
+        }),
+    )
+
+    // Import from text (bounded size + optional provider)
+    ipcMain.handle(
+        'proxies:importText',
+        withIpcValidation(
+            'proxies:importText',
+            async (_event, text: unknown, defaultProvider?: unknown) => {
+                const [importText, provider] = parseIpcArgs(
+                    'proxies:importText',
+                    proxyImportArgsSchema,
+                    [text, defaultProvider],
+                )
+                return await proxyService.importFromText(importText, provider)
+            },
+        ),
+    )
 
     // Delete dead proxies
-    ipcMain.handle('proxies:deleteDead', async () => {
-        return proxyService.deleteDeadProxies()
-    })
+    ipcMain.handle(
+        'proxies:deleteDead',
+        withIpcValidation('proxies:deleteDead', async () => {
+            return proxyService.deleteDeadProxies()
+        }),
+    )
 
     // Get statistics
-    ipcMain.handle('proxies:getStats', async () => {
-        return proxyService.getStats()
-    })
+    ipcMain.handle(
+        'proxies:getStats',
+        withIpcValidation('proxies:getStats', async () => {
+            return proxyService.getStats()
+        }),
+    )
 }

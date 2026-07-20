@@ -1,36 +1,96 @@
+/**
+ * AI IPC handlers - all payloads validated at the boundary.
+ * API keys are validated and persisted through AIService's encrypted settings path.
+ */
+
 import { ipcMain } from 'electron'
 import { aiService } from '../services/AIService'
+import {
+    aiGenerateBulkArgsSchema,
+    aiGenerateReviewArgsSchema,
+    aiImproveReviewArgsSchema,
+    aiSetApiKeyArgsSchema,
+    aiSaveReviewArgsSchema,
+} from '../../shared/ai-contracts'
+import { parseIpcArgs, withIpcValidation } from './validate'
 
 export function registerAIHandlers() {
-    // Generate single review
-    ipcMain.handle('ai:generateReview', async (_event, locationName: string, options?: any) => {
-        return await aiService.generateReview(locationName, options?.category, options)
-    })
+    ipcMain.handle(
+        'ai:generateReview',
+        withIpcValidation('ai:generateReview', async (_event, locationName: unknown, options?: unknown) => {
+            const [name, opts] = parseIpcArgs(
+                'ai:generateReview',
+                aiGenerateReviewArgsSchema,
+                [locationName, options],
+            )
+            return await aiService.generateReview(name, opts?.category, {
+                style: opts?.style,
+                language: opts?.language,
+                rating: opts?.rating,
+                length: opts?.length,
+            })
+        }),
+    )
 
-    // Generate multiple reviews
-    ipcMain.handle('ai:generateBulk', async (_event, count: number, locationName: string, category?: string, options?: any) => {
-        return await aiService.generateBulkReviews(count, locationName, category, options)
-    })
+    ipcMain.handle(
+        'ai:generateBulk',
+        withIpcValidation(
+            'ai:generateBulk',
+            async (
+                _event,
+                count: unknown,
+                locationName: unknown,
+                category?: unknown,
+                options?: unknown,
+            ) => {
+                const [n, name, cat, opts] = parseIpcArgs(
+                    'ai:generateBulk',
+                    aiGenerateBulkArgsSchema,
+                    [count, locationName, category, options],
+                )
+                return await aiService.generateBulkReviews(n, name, cat, opts ?? {})
+            },
+        ),
+    )
 
-    // Improve existing review
-    ipcMain.handle('ai:improveReview', async (_event, text: string, language?: 'vi' | 'en') => {
-        return await aiService.improveReview(text, language)
-    })
+    ipcMain.handle(
+        'ai:improveReview',
+        withIpcValidation('ai:improveReview', async (_event, text: unknown, language?: unknown) => {
+            const [body, lang] = parseIpcArgs(
+                'ai:improveReview',
+                aiImproveReviewArgsSchema,
+                [text, language],
+            )
+            return await aiService.improveReview(body, lang)
+        }),
+    )
 
-    // Set API key
-    ipcMain.handle('ai:setApiKey', async (_event, key: string) => {
-        return await aiService.setApiKey(key)
-    })
+    ipcMain.handle(
+        'ai:setApiKey',
+        withIpcValidation('ai:setApiKey', async (_event, key: unknown) => {
+            const [parsedKey] = parseIpcArgs('ai:setApiKey', aiSetApiKeyArgsSchema, [key])
+            return await aiService.setApiKey(parsedKey)
+        }),
+    )
 
-    // Get API key status
-    ipcMain.handle('ai:getApiKeyStatus', async () => {
-        return await aiService.getApiKeyStatus()
-    })
+    ipcMain.handle(
+        'ai:getApiKeyStatus',
+        withIpcValidation('ai:getApiKeyStatus', async () => {
+            return await aiService.getApiKeyStatus()
+        }),
+    )
 
-    // Save generated review
-    ipcMain.handle('ai:saveReview', async (_event, review: any, locationId?: number) => {
-        return await aiService.saveGeneratedReview(review, locationId)
-    })
+    ipcMain.handle(
+        'ai:saveReview',
+        withIpcValidation('ai:saveReview', async (_event, review: unknown, locationId?: unknown) => {
+            const [parsedReview, parsedLocationId] = parseIpcArgs(
+                'ai:saveReview',
+                aiSaveReviewArgsSchema,
+                [review, locationId],
+            )
+            return await aiService.saveGeneratedReview(parsedReview, parsedLocationId)
+        }),
+    )
 
     console.log('AI handlers registered')
 }
