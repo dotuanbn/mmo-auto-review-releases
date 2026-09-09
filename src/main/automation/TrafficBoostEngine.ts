@@ -3,6 +3,10 @@ import { browserService, BrowserConfig } from './BrowserService'
 import { HumanBehavior } from './HumanBehavior'
 import { proxyService } from '../services/ProxyService'
 import { fproxyService } from '../services/FProxyService'
+import {
+    fproxyPoolService,
+    type FProxyLease,
+} from '../services/FProxyPoolService'
 import { loadSettings } from '../ipc/settings'
 import { runtimePolicyService } from '../runtime/v2/runtimePolicy'
 import { getDatabase } from '../database'
@@ -99,7 +103,15 @@ export interface ThreadDetail {
     currentKeyword?: string // Current search keyword being used
     status: 'idle' | 'visiting' | 'waiting' | 'done'
     progress: number
-    proxyInfo?: string // e.g. "113.190.148.126:38733 (Quáº£ng BÃ¬nh, Vietnam)"
+    proxyInfo?: string // e.g. "113.190.148.126:38733 (Quang Binh, Vietnam)"
+    /** Absolute ms when FProxy IP for this thread expires (time_die). */
+    proxyIpExpiresAt?: number | null
+    /** Absolute ms when this thread's proxy can rotate next (waiting_time). */
+    proxyRotateAt?: number | null
+    /** Absolute soft deadline for current visit budget. */
+    visitSoftDeadlineAt?: number | null
+    /** Human timing note for UI countdown (waiting for rotate / budget left). */
+    timingLabel?: string
 }
 
 export interface VisitActionRecord {
@@ -1274,6 +1286,7 @@ export class TrafficBoostEngine {
     private statusListeners: Set<(status: TrafficBoostStatus) => void> = new Set()
     private actionListeners: Set<(event: RuntimeActionEvent) => void> = new Set()
     private threadUrlBroadcastAt: Map<number, number> = new Map()
+    private readonly proxyAcquireControllers = new Set<AbortController>()
     /** Campaign-local account/profile exclusivity: one concurrent visit per account/profile. */
     private campaignAccountLocks: Map<string, Promise<void>> = new Map()
 
@@ -1295,14 +1308,16 @@ export class TrafficBoostEngine {
     }
 
     /**
-     * Campaign-local exclusivity: same account/profile cannot run two visits at once.
-     * Anonymous (no account) skips lock. Waits cooperatively; always release in finally.
+     * Campaign-local exclusivity for persistent Chromium profiles only.
+     * Anonymous / ephemeral map-traffic visits skip lock so multi-IP threads can run concurrently.
      */
     private async acquireCampaignAccountLock(
-        account: { id?: number | null; profilePath?: string | null } | null | undefined
+        account: { id?: number | null; profilePath?: string | null } | null | undefined,
+        options: { usePersistentProfile?: boolean } = {},
     ): Promise<() => void> {
-        if (!account?.id) {
-            return () => { /* anonymous: no lock */ }
+        const usePersistentProfile = options.usePersistentProfile === true
+        if (!usePersistentProfile || !account?.id) {
+            return () => { /* ephemeral/anonymous: multi-IP concurrent OK */ }
         }
         const profileKey = typeof account.profilePath === 'string' && account.profilePath.trim()
             ? `profile:${account.profilePath.trim()}`
@@ -1474,6 +1489,72 @@ export class TrafficBoostEngine {
             || url.includes('/v3/signin')
             || url.includes('signin/identifier')
             || url.includes('consent.google.com')
+    }
+
+    
+    private formatProxyCountdown(totalSeconds: number): string {
+        const safe = Math.max(0, Math.floor(totalSeconds))
+        const m = Math.floor(safe / 60)
+        const s = safe % 60
+        return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    }
+
+    private setThreadProxyTiming(
+        threadIdx: number,
+        timing: {
+            proxyIpExpiresAt?: number | null
+            proxyRotateAt?: number | null
+            visitSoftDeadlineAt?: number | null
+            timingLabel?: string
+            status?: ThreadDetail['status']
+            action?: string
+        } = {},
+    ): void {
+        const current = this.ensureThreadDetail(threadIdx)
+        this.threadDetails[threadIdx] = {
+            ...current,
+            proxyIpExpiresAt: timing.proxyIpExpiresAt !== undefined ? timing.proxyIpExpiresAt : current.proxyIpExpiresAt,
+            proxyRotateAt: timing.proxyRotateAt !== undefined ? timing.proxyRotateAt : current.proxyRotateAt,
+            visitSoftDeadlineAt: timing.visitSoftDeadlineAt !== undefined ? timing.visitSoftDeadlineAt : current.visitSoftDeadlineAt,
+            timingLabel: timing.timingLabel !== undefined ? timing.timingLabel : current.timingLabel,
+            status: timing.status || current.status,
+            currentAction: timing.action || current.currentAction,
+        }
+        this.sendStatus(this.buildStatus())
+    }
+
+private ensureThreadDetail(threadIdx: number): ThreadDetail {
+        let current = this.threadDetails[threadIdx]
+        if (!current) {
+            current = {
+                id: threadIdx,
+                accountEmail: '',
+                locationName: '',
+                currentAction: '',
+                currentUrl: '',
+                status: 'waiting',
+                progress: 0,
+            }
+            this.threadDetails[threadIdx] = current
+        }
+        return current
+    }
+
+    private setThreadAction(threadIdx: number, action: string): void {
+        const current = this.ensureThreadDetail(threadIdx)
+        if (current.currentAction === action) return
+        this.threadDetails[threadIdx] = {
+            ...current,
+            currentAction: action,
+        }
+    }
+
+    private setThreadKeyword(threadIdx: number, keyword: string): void {
+        const current = this.ensureThreadDetail(threadIdx)
+        this.threadDetails[threadIdx] = {
+            ...current,
+            currentKeyword: keyword,
+        }
     }
 
     private updateThreadCurrentUrl(threadIdx: number, page: Page): void {
@@ -1674,6 +1755,10 @@ export class TrafficBoostEngine {
                 status: t.status,
                 progress: t.progress ?? 0,
                 proxyInfo: t.proxyInfo || '',
+                proxyIpExpiresAt: t.proxyIpExpiresAt ?? null,
+                proxyRotateAt: t.proxyRotateAt ?? null,
+                visitSoftDeadlineAt: t.visitSoftDeadlineAt ?? null,
+                timingLabel: t.timingLabel || '',
             })),
             effectiveNetworkMode: this.networkState.mode,
             networkState: this.networkState,
@@ -1878,7 +1963,7 @@ export class TrafficBoostEngine {
             ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fallbackQuery)}`
             : 'https://www.google.com/maps'
 
-        this.threadDetails[threadIdx].currentAction = 'Direct mode: recovering map context'
+        this.setThreadAction(threadIdx, 'Direct mode: recovering map context')
         this.sendStatus(this.buildStatus({
             campaignName: statusContext.campaignName,
             currentRound: statusContext.currentRound,
@@ -1909,7 +1994,7 @@ export class TrafficBoostEngine {
         if (!recovered && fallbackQuery) {
             try {
                 const organicFlow = new OrganicSearchFlow((status) => {
-                    this.threadDetails[threadIdx].currentAction = status
+                    this.setThreadAction(threadIdx, status)
                 })
                 const organicResult = await organicFlow.execute(page, fallbackQuery, {
                     name: locationName || fallbackQuery,
@@ -1981,7 +2066,7 @@ export class TrafficBoostEngine {
             return
         }
 
-        this.threadDetails[threadIdx].currentAction = 'Google Login gate detected'
+        this.setThreadAction(threadIdx, 'Google Login gate detected')
         this.sendStatus(this.buildStatus({
             campaignName: statusContext.campaignName,
             currentRound: statusContext.currentRound,
@@ -2074,7 +2159,7 @@ export class TrafficBoostEngine {
             return
         }
 
-        this.threadDetails[threadIdx].currentAction = 'Google Login blocked (skip visit)'
+        this.setThreadAction(threadIdx, 'Google Login blocked (skip visit)')
         this.recordAction(actionsPerformed, {
             action: 'context_recover_map_failed',
             success: false,
@@ -2147,7 +2232,7 @@ export class TrafficBoostEngine {
         }, actionContext)
 
         // === TRY AUTO-SOLVE CAPTCHA VIA API ===
-        this.threadDetails[threadIdx].currentAction = 'Đang giải CAPTCHA tự động...'
+        this.setThreadAction(threadIdx, 'Đang giải CAPTCHA tự động...')
         this.sendStatus(this.buildStatus({
             campaignName: statusContext.campaignName,
             currentRound: statusContext.currentRound,
@@ -2174,13 +2259,13 @@ export class TrafficBoostEngine {
                     queueDepth: this.currentQueueDepth,
                     timestamp: new Date().toISOString(),
                 }, actionContext)
-                this.threadDetails[threadIdx].currentAction = 'CAPTCHA solved ✓ - continuing visit'
+                this.setThreadAction(threadIdx, 'CAPTCHA solved ✓ - continuing visit')
                 return
             }
         }
 
         // === FALLBACK: AUTO-SKIP (old behavior) ===
-        this.threadDetails[threadIdx].currentAction = 'CAPTCHA auto-skip: recovering context'
+        this.setThreadAction(threadIdx, 'CAPTCHA auto-skip: recovering context')
         this.sendStatus(this.buildStatus({
             campaignName: statusContext.campaignName,
             currentRound: statusContext.currentRound,
@@ -2221,7 +2306,7 @@ export class TrafficBoostEngine {
                 queueDepth: this.currentQueueDepth,
                 timestamp: new Date().toISOString(),
             }, actionContext)
-            this.threadDetails[threadIdx].currentAction = 'CAPTCHA recovered - continuing visit'
+            this.setThreadAction(threadIdx, 'CAPTCHA recovered - continuing visit')
             return true
         }
 
@@ -2266,7 +2351,7 @@ export class TrafficBoostEngine {
             return
         }
 
-        this.threadDetails[threadIdx].currentAction = 'CAPTCHA unrecoverable (skip visit)'
+        this.setThreadAction(threadIdx, 'CAPTCHA unrecoverable (skip visit)')
         this.recordAction(actionsPerformed, {
             action: 'context_recover_map_failed',
             success: false,
@@ -2362,23 +2447,34 @@ export class TrafficBoostEngine {
         delayMaxSeconds: number,
         mode: 'agentic' | 'seo',
         threadIdx: number,
-        fixedActionCount: boolean
+        fixedActionCount: boolean,
+        options: { fproxyPoolEnabled?: boolean; proxyEnabled?: boolean } = {},
     ): number {
         const safeActions = this.normalizeDesiredActions(desiredActions)
         const adaptiveFactor = this.getAdaptiveDelayFactor(threadIdx)
         const safeDelayMin = Math.max(0, Number(delayMinSeconds || 0))
         const safeDelayMax = Math.max(safeDelayMin, Number(delayMaxSeconds || safeDelayMin))
         const averageDelayMs = Math.max(500, Math.floor(((safeDelayMin + safeDelayMax) / 2) * 750 * adaptiveFactor))
-        const averageActionExecutionMs = mode === 'agentic' ? 9000 : 6200
-        const baseOverheadMs = fixedActionCount ? 60_000 : 45_000
-        const fixedFactor = fixedActionCount ? 1.25 : 1
+        // Keep KPI visits intentionally compact under rotating proxies (direction/website/phone).
+        const averageActionExecutionMs = mode === 'agentic' ? 7000 : 5200
+        const baseOverheadMs = fixedActionCount ? 35_000 : 28_000
+        const fixedFactor = fixedActionCount ? 1.15 : 1
         const estimatedMs = Math.floor(baseOverheadMs + (safeActions * (averageDelayMs + averageActionExecutionMs) * fixedFactor))
         const hardMaxMs = 12 * 60 * 1000
         const computedMs = Math.max(this.visitWatchdogTimeoutMs, Math.min(hardMaxMs, estimatedMs))
-        // If proxy auto-rotation is active, cap visit timeout to fit within rotation interval
-        if (fproxyService.getApiKey() && fproxyService.isAutoRotateActive()) {
-            const proxyIntervalMs = fproxyService.getRotateIntervalMs()
-            const proxyCappedMs = Math.max(45_000, proxyIntervalMs - 5_000) // 5s buffer for cleanup
+
+        // Align with FProxy rotate window (~2 min): visit must finish before provider rotates IP.
+        const fproxyRotationActive = !!options.proxyEnabled && (
+            !!options.fproxyPoolEnabled
+            || (!!fproxyService.getApiKey() && fproxyService.isAutoRotateActive())
+        )
+        if (fproxyRotationActive) {
+            const proxyIntervalMs = Math.max(
+                60_000,
+                Number(fproxyService.getRotateIntervalMs?.() || 120_000) || 120_000,
+            )
+            // Leave cleanup buffer so context close + lease release finish before next IP.
+            const proxyCappedMs = Math.max(45_000, proxyIntervalMs - 12_000)
             return Math.min(computedMs, proxyCappedMs)
         }
         return computedMs
@@ -2494,7 +2590,7 @@ export class TrafficBoostEngine {
                 break
             }
 
-            this.threadDetails[threadIdx].currentAction = `Resolving prompt (${reason})`
+            this.setThreadAction(threadIdx, `Resolving prompt (${reason})`)
             if (statusContext) {
                 this.sendStatus(this.buildStatus({
                     campaignName: statusContext.campaignName,
@@ -2592,6 +2688,23 @@ export class TrafficBoostEngine {
         // Load proxy runtime settings from a single source of truth
         const runtimeProxySettings = this.applyRuntimeProxySettings()
         const proxyEnabled = runtimeProxySettings.proxyEnabled
+        const fproxyPoolSnapshot = await fproxyPoolService.getSnapshot()
+        const enabledPoolSlotCount = fproxyPoolSnapshot.slots.filter(
+            slot => slot.enabled && slot.hasSecret,
+        ).length
+        const fproxyPoolEnabled = proxyEnabled && enabledPoolSlotCount > 0
+        const strictFproxyPool = fproxyPoolEnabled && fproxyPoolSnapshot.policy.strictUnique
+        if (strictFproxyPool) {
+            const beforeThreads = safeThreadCount
+            safeThreadCount = Math.min(safeThreadCount, enabledPoolSlotCount)
+            if (safeThreadCount !== beforeThreads) {
+                console.log(
+                    '[TrafficBoost] FProxy strict pool capacity clamp threads ' +
+                    beforeThreads + ' -> ' + safeThreadCount +
+                    ' (enabledSlots=' + enabledPoolSlotCount + ')',
+                )
+            }
+        }
         this.networkState = await networkOrchestrator.resolveEffectiveMode()
         if (proxyEnabled && runtimeProxySettings.fproxyApiKey && !fproxyService.getApiKey()) {
             fproxyService.setApiKey(runtimeProxySettings.fproxyApiKey)
@@ -2611,7 +2724,7 @@ export class TrafficBoostEngine {
         }
 
         // Start FProxy auto-rotate if API key is configured
-        if (proxyEnabled && fproxyService.getApiKey()) {
+        if (proxyEnabled && !fproxyPoolEnabled && fproxyService.getApiKey()) {
             this.networkState = {
                 ...this.networkState,
                 mode: 'fproxy',
@@ -2687,9 +2800,17 @@ export class TrafficBoostEngine {
         if (accounts.length === 0) accounts = [null] // anonymous / no usable account
 
         const usableAccountCount = accounts.filter((account) => account !== null).length
+        // web_seo needs logged-in/profile exclusivity, so threads cannot exceed usable accounts.
+        // maps traffic (direct/organic/map_search) is multi-IP: concurrent visits are OK even with 1 account.
+        const mapsMultiIpTraffic = campaign.trafficMode !== 'web_seo'
         if (campaign.trafficMode === 'web_seo' && usableAccountCount > 0) {
             safeThreadCount = Math.min(safeThreadCount, usableAccountCount)
         }
+        console.log(
+            `[TrafficBoost] Concurrency plan: threads=${safeThreadCount}, ` +
+            `enabledFProxySlots=${enabledPoolSlotCount}, accounts=${usableAccountCount || 0}, ` +
+            `mode=${campaign.trafficMode || 'direct'}, mapsMultiIp=${mapsMultiIpTraffic}`,
+        )
 
         // Get locations
         const allLocations = db.select().from(schema.locations).all().filter(l => locationIds.includes(l.id))
@@ -2889,7 +3010,12 @@ export class TrafficBoostEngine {
                                     this._currentRound = currentRound
                                 }
                                 await visitQueue.add(async () => {
-                                const releaseAccountLock = await this.acquireCampaignAccountLock(task.account)
+                                // Maps multi-IP traffic uses ephemeral browsers so one selected account
+                                // never serializes N concurrent proxy visits on the same map.
+                                const usePersistentProfile = !mapsMultiIpTraffic && !!task.account
+                                const releaseAccountLock = await this.acquireCampaignAccountLock(task.account, {
+                                    usePersistentProfile,
+                                })
                                 try {
                                 const depthNow = trafficVisitQueue.getCampaignCounters(campaignId)
                                 this.currentQueueDepth = Math.max(0, depthNow.remaining)
@@ -2927,17 +3053,29 @@ export class TrafficBoostEngine {
                                 message: `Thread ${threadIdx + 1}: Visiting ${locationName}`,
                             }))
 
-                            // === Proxy Countdown Sync: Wait for fresh rotation before starting visit ===
-                            if (proxyEnabled && fproxyService.getApiKey() && fproxyService.isAutoRotateActive() && fproxyService.hasUsableProxy()) {
-                                const proxyIntervalSec = Math.round(fproxyService.getRotateIntervalMs() / 1000)
-                                // Require at least 80% of the rotation interval to start a visit
+                            // === Proxy Countdown Sync (v1.0.11 classic): wait by server waiting_time before visit ===
+                            // Multi-key pool uses the same UX/timer contract as single-key FProxyService.proxyDieAt.
+                            let preSyncedAvailableMs: number | null = null
+                            if (proxyEnabled && fproxyPoolEnabled) {
+                                const proxyIntervalSec = 120
                                 const minTimeRequired = Math.max(30, Math.floor(proxyIntervalSec * 0.8))
-                                
-                                const availableMs = await fproxyService.waitForFreshRotation(
+                                const waitResult = await fproxyPoolService.waitForFreshRotation(
                                     minTimeRequired,
                                     () => this.shouldStop,
                                     (msg) => {
-                                        this.threadDetails[threadIdx].currentAction = msg
+                                        // Parse "... Ns remaining" for live thread timing UI.
+                                        const match = /(\d+)s remaining/i.exec(msg)
+                                        const leftSec = match ? Number(match[1]) : 0
+                                        this.setThreadProxyTiming(threadIdx, {
+                                            status: leftSec > 0 ? 'waiting' : 'waiting',
+                                            proxyRotateAt: leftSec > 0 ? Date.now() + leftSec * 1000 : Date.now(),
+                                            proxyIpExpiresAt: null,
+                                            visitSoftDeadlineAt: null,
+                                            timingLabel: leftSec > 0
+                                                ? `Cho xoay IP ${this.formatProxyCountdown(leftSec)}`
+                                                : 'Dang lay IP moi',
+                                            action: msg,
+                                        })
                                         this.sendStatus(this.buildStatus({
                                             campaignName: campaign.name,
                                             currentRound,
@@ -2946,9 +3084,59 @@ export class TrafficBoostEngine {
                                             failedVisits,
                                             message: `Thread ${threadIdx + 1}: ${msg}`,
                                         }))
-                                    }
+                                    },
                                 )
-                                
+                                preSyncedAvailableMs = waitResult.availableMs
+                                if (this.shouldStop || preSyncedAvailableMs <= 0) {
+                                    if (this.shouldStop) return
+                                    await trafficVisitQueue.failVisit(
+                                        task.durableVisitId,
+                                        'proxy_wait_unavailable',
+                                        { immediateRetry: true },
+                                    )
+                                    return
+                                }
+                                console.log(
+                                    `[TrafficBoost] Thread ${threadIdx + 1}: FProxy pool ready after countdown sync, ` +
+                                    `available=${Math.round(preSyncedAvailableMs / 1000)}s, readySlots=${waitResult.readySlotIds.join(',') || 'n/a'}`,
+                                )
+                            } else if (
+                                !fproxyPoolEnabled
+                                && proxyEnabled
+                                && fproxyService.getApiKey()
+                                && fproxyService.isAutoRotateActive()
+                                && fproxyService.hasUsableProxy()
+                            ) {
+                                const proxyIntervalSec = Math.round(fproxyService.getRotateIntervalMs() / 1000)
+                                // Require at least 80% of the rotation interval to start a visit
+                                const minTimeRequired = Math.max(30, Math.floor(proxyIntervalSec * 0.8))
+
+                                const availableMs = await fproxyService.waitForFreshRotation(
+                                    minTimeRequired,
+                                    () => this.shouldStop,
+                                    (msg) => {
+                                        const match = /(\d+)s remaining/i.exec(msg)
+                                        const leftSec = match ? Number(match[1]) : 0
+                                        this.setThreadProxyTiming(threadIdx, {
+                                            status: 'waiting',
+                                            proxyRotateAt: leftSec > 0 ? Date.now() + leftSec * 1000 : Date.now(),
+                                            timingLabel: leftSec > 0
+                                                ? `Cho xoay IP ${this.formatProxyCountdown(leftSec)}`
+                                                : 'Dang lay IP moi',
+                                            action: msg,
+                                        })
+                                        this.sendStatus(this.buildStatus({
+                                            campaignName: campaign.name,
+                                            currentRound,
+                                            completedVisits,
+                                            totalVisits,
+                                            failedVisits,
+                                            message: `Thread ${threadIdx + 1}: ${msg}`,
+                                        }))
+                                    },
+                                )
+                                preSyncedAvailableMs = availableMs
+
                                 if (this.shouldStop || availableMs <= 0) {
                                     // Do not leave a claimed running visit orphaned:
                                     // stop path cancels non-terminal; proxy wait abort requeues immediately.
@@ -2963,7 +3151,7 @@ export class TrafficBoostEngine {
                                     return
                                 }
                                 console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Proxy ready! Starting visit with ${Math.round(availableMs / 1000)}s available`)
-                            } else if (proxyEnabled && fproxyService.getApiKey() && fproxyService.isAutoRotateActive()) {
+                            } else if (!fproxyPoolEnabled && proxyEnabled && fproxyService.getApiKey() && fproxyService.isAutoRotateActive()) {
                                 console.log(`[TrafficBoost] Thread ${threadIdx + 1}: FProxy has no usable lease yet, skipping countdown wait and attempting direct acquisition`)
                             }
                             
@@ -2977,22 +3165,34 @@ export class TrafficBoostEngine {
                             const watchdogMode: 'agentic' | 'seo' = (campaign.trafficMode !== 'web_seo' && agenticMapPlannerReady)
                                 ? 'agentic'
                                 : 'seo'
-                            // Compute base watchdog, then hard-cap to 120s when proxy rotation is active
-                            const isProxyRotationActive = proxyEnabled && fproxyService.getApiKey() && fproxyService.isAutoRotateActive()
+                            // Align visit lifecycle with FProxy rotate window (pool multi-key or legacy single-key).
+                            const isProxyRotationActive = proxyEnabled && (
+                                fproxyPoolEnabled
+                                || (
+                                    Boolean(fproxyService.getApiKey())
+                                    && fproxyService.isAutoRotateActive()
+                                )
+                            )
                             const computedWatchdogMs = this.computeVisitWatchdogTimeoutMs(
                                 requestedActionsForVisit,
                                 Number(campaign.delayMinSeconds ?? 5),
                                 Number(campaign.delayMaxSeconds ?? 12),
                                 watchdogMode,
                                 threadIdx,
-                                campaignUseFixedActionCount
+                                campaignUseFixedActionCount,
+                                { fproxyPoolEnabled, proxyEnabled },
                             )
-                            // STRICT 2-MIN LIFECYCLE: When proxy rotation is active, cap total visit to 120s
-                            // to synchronize browser lifecycle with IP rotation interval
-                            const visitWatchdogTimeoutMs = isProxyRotationActive
-                                ? Math.min(computedWatchdogMs, 120_000)
+                            // STRICT rotate lifecycle: never schedule a visit longer than the provider IP window.
+                            const providerRotateMs = Math.max(
+                                60_000,
+                                Number(fproxyService.getRotateIntervalMs?.() || 120_000) || 120_000,
+                            )
+                            let visitWatchdogTimeoutMs = isProxyRotationActive
+                                ? Math.min(computedWatchdogMs, Math.max(45_000, providerRotateMs - 12_000))
                                 : computedWatchdogMs
-                            const visitSoftDeadlineAt = visitStart + Math.max(15_000, visitWatchdogTimeoutMs - 12_000)
+                            // Soft stop before hard abort so KPI phase exits cleanly inside the IP window.
+                            let visitSoftDeadlineAt = visitStart + Math.max(15_000, visitWatchdogTimeoutMs - 12_000)
+                            let visitHardDeadlineAt = visitStart + visitWatchdogTimeoutMs
                             const actionsPerformed: VisitActionRecord[] = []
                             let profilePath: string | undefined
                             let contextId: number | null = null
@@ -3001,9 +3201,23 @@ export class TrafficBoostEngine {
                             let contextCleanupStarted = false
                             let visitBudgetStopLogged = false
                             let usedProxyThisVisit = false
+                            let fproxyLease: FProxyLease | null = null
+                            let proxyLeaseAbortHandler: (() => void) | null = null
                             const visitProxySnapshotTime = Date.now() // Timestamp for per-thread proxy rotation check
 
-                            const shouldStopForVisitBudget = () => Date.now() >= visitSoftDeadlineAt
+                            const shouldStopForVisitBudget = () => {
+                                if (Date.now() >= visitSoftDeadlineAt) return true
+                                if (fproxyLease) {
+                                    // Leave a small buffer before provider endpoint expiry / next rotate.
+                                    const leaseSoftAt = Math.min(
+                                        fproxyLease.endpointExpiresAt - 8_000,
+                                        // If rotateAllowedAt is within the visit, stop early only after IP is near end-of-life.
+                                        fproxyLease.endpointExpiresAt - 8_000,
+                                    )
+                                    if (Date.now() >= leaseSoftAt) return true
+                                }
+                                return false
+                            }
                             const markVisitBudgetStop = (detail: string) => {
                                 if (visitBudgetStopLogged) {
                                     return
@@ -3026,9 +3240,6 @@ export class TrafficBoostEngine {
                                     return
                                 }
 
-                                if (contextId === null) {
-                                    return
-                                }
                                 contextCleanupStarted = true
 
                                 try {
@@ -3037,6 +3248,7 @@ export class TrafficBoostEngine {
                                     // Ignore page monitor teardown errors.
                                 }
 
+                                if (contextId !== null) {
                                 // For ephemeral (no profilePath): skip save (in-memory only, clean-slate per visit).
                                 // For profilePath: persistent launchPersistentContext already writes live state to disk; we still close here (final stop may snapshot).
                                 if (profilePath) {
@@ -3054,100 +3266,259 @@ export class TrafficBoostEngine {
                                 if (this.threadContextIds.get(threadIdx) === contextId) {
                                     this.threadContextIds.delete(threadIdx)
                                 }
+                                }
+
+                                if (fproxyLease && proxyLeaseAbortHandler) {
+                                    fproxyLease.signal.removeEventListener('abort', proxyLeaseAbortHandler)
+                                }
+                                await fproxyLease?.release(reason)
+                                fproxyLease = null
+                            }
+
+                            // Acquire FProxy BEFORE visit watchdog so cooldown wait is not counted as visit time.
+                            let proxyConfig: BrowserConfig['proxy'] = undefined
+                            let proxyInfoStr = ''
+                            try {
+                                if (task.account && usePersistentProfile) {
+                                    profilePath = this.ensureAccountProfile(task.account)
+                                } else {
+                                    // Ephemeral multi-IP path: cookies may still be injected below without locking a profile dir.
+                                    profilePath = undefined
+                                    if (task.account && mapsMultiIpTraffic) {
+                                        console.log(
+                                            `[TrafficBoost] Thread ${threadIdx + 1}: maps multi-IP mode -> ephemeral context` +
+                                            ` for account ${task.account.email || task.account.id} (concurrent IPs allowed)`,
+                                        )
+                                    }
+                                }
+
+                                // Create browser context with account's profile + proxy
+                                // Try FProxy API first, then static proxies
+                                 const runtimeProxy = this.applyRuntimeProxySettings()
+                                 const useProxyThisVisit = runtimeProxy.proxyEnabled
+                                     && (!task.forceDirectConnection || strictFproxyPool)
+                                 usedProxyThisVisit = useProxyThisVisit
+ 
+                             if (useProxyThisVisit) {
+                                 if (fproxyPoolEnabled) {
+                                     const acquireController = new AbortController()
+                                     this.proxyAcquireControllers.add(acquireController)
+                                     // Wait until a free FProxy key is past cooldown and has a fresh IP window.
+                                     // Prefer the earliest-ready slot (fair ranking inside pool service).
+                                     const snap = await fproxyPoolService.getSnapshot().catch(() => null)
+                                     const nowMs = Date.now()
+                                     const freeSlots = (snap?.slots || []).filter(s =>
+                                         s.enabled && s.hasSecret && s.status !== 'leased' && s.status !== 'disabled'
+                                     )
+                                     const nextReadyAt = freeSlots
+                                         .map(s => s.cooldownUntil || s.nextRotateAt || 0)
+                                         .filter((v): v is number => typeof v === 'number' && v > nowMs)
+                                         .sort((a, b) => a - b)[0] || (nowMs + providerRotateMs)
+                                     const waitSec = Math.max(0, Math.ceil((nextReadyAt - nowMs) / 1000))
+                                     this.setThreadProxyTiming(threadIdx, {
+                                         status: 'waiting',
+                                         proxyRotateAt: nextReadyAt,
+                                         proxyIpExpiresAt: null,
+                                         visitSoftDeadlineAt: null,
+                                         timingLabel: waitSec > 0
+                                             ? `Cho xoay IP ${this.formatProxyCountdown(waitSec)}`
+                                             : 'Dang lay IP moi',
+                                         action: waitSec > 0
+                                             ? `Cho key san sang (xoay IP con ${this.formatProxyCountdown(waitSec)})`
+                                             : 'Dang lay IP FProxy moi',
+                                     })
+
+                                     // Keep UI ticking while waiting for acquire (cooldown may be up to ~2 min).
+                                     const waitTicker = setInterval(() => {
+                                         if (this.shouldStop) return
+                                         const cur = this.threadDetails[threadIdx]
+                                         const until = cur?.proxyRotateAt
+                                         if (!until) return
+                                         const left = Math.max(0, Math.ceil((until - Date.now()) / 1000))
+                                         const timingLabel = left > 0
+                                             ? `Cho xoay IP ${this.formatProxyCountdown(left)}`
+                                             : 'Dang lay IP moi'
+                                         const action = left > 0
+                                             ? `Cho key san sang (xoay IP con ${this.formatProxyCountdown(left)})`
+                                             : 'Dang lay IP FProxy moi'
+                                         if (cur.currentAction !== action || cur.timingLabel !== timingLabel) {
+                                             this.setThreadProxyTiming(threadIdx, {
+                                                 status: 'waiting',
+                                                 timingLabel,
+                                                 action,
+                                             })
+                                         }
+                                     }, 1000)
+
+                                     try {
+                                         // minRemaining must fit one full visit inside time_die, not exceed it.
+                                         // Request slightly more than visit budget so acquire rejects near-expired IPs.
+                                         const minRemainingForVisit = Math.min(
+                                             Math.max(45_000, visitWatchdogTimeoutMs + 10_000),
+                                             Math.max(50_000, providerRotateMs - 5_000),
+                                         )
+                                         fproxyLease = await fproxyPoolService.acquire({
+                                             owner: {
+                                                 kind: 'traffic_visit',
+                                                 id: `campaign-${campaignId}:thread-${threadIdx}`,
+                                                 threadId: threadIdx,
+                                             },
+                                             // Wait through full provider cooldown if needed (rotate ~2 min + buffer).
+                                             timeoutMs: Math.max(180_000, providerRotateMs + 90_000),
+                                             minRemainingMs: minRemainingForVisit,
+                                             signal: acquireController.signal,
+                                         })
+                                     } finally {
+                                         clearInterval(waitTicker)
+                                         this.proxyAcquireControllers.delete(acquireController)
+                                     }
+
+                                     // Re-anchor visit deadlines to ROTATE window (~2 min), not IP life (~30 min).
+                                     const nowAfterLease = Date.now()
+                                     const leaseRemainingMs = Math.max(
+                                         20_000,
+                                         fproxyLease.endpointExpiresAt - nowAfterLease,
+                                     )
+                                     // waiting_time cycle only. Ignore mirrored time_die values on rotateAllowedAt.
+                                     const rotateWindowMs = (() => {
+                                         const fromLease = fproxyLease.rotateAllowedAt > nowAfterLease
+                                             ? (fproxyLease.rotateAllowedAt - nowAfterLease)
+                                             : 0
+                                         if (fromLease > 0 && fromLease <= 5 * 60_000) return fromLease
+                                         if (preSyncedAvailableMs && preSyncedAvailableMs > 0 && preSyncedAvailableMs <= 5 * 60_000) {
+                                             return preSyncedAvailableMs
+                                         }
+                                         return 120_000
+                                     })()
+                                     const leaseHardBudgetMs = Math.max(
+                                         30_000,
+                                         Math.min(
+                                             visitWatchdogTimeoutMs,
+                                             rotateWindowMs - 8_000,
+                                             Math.max(30_000, leaseRemainingMs - 8_000),
+                                         ),
+                                     )
+                                     visitWatchdogTimeoutMs = leaseHardBudgetMs
+                                     visitHardDeadlineAt = nowAfterLease + leaseHardBudgetMs
+                                     visitSoftDeadlineAt = nowAfterLease + Math.max(12_000, leaseHardBudgetMs - 10_000)
+
+                                     proxyConfig = { ...fproxyLease.proxySnapshot }
+                                     proxyInfoStr = `${fproxyLease.observedIp} (FProxy slot ${fproxyLease.slotId})`
+                                     this.networkState = {
+                                         ...this.networkState,
+                                         mode: 'fproxy',
+                                         reason: 'fproxy_pool_lease_assigned',
+                                         proxyInfo: proxyInfoStr,
+                                         useProxySetting: true,
+                                         checkedAt: new Date().toISOString(),
+                                     }
+                                     console.log(
+                                         `[TrafficBoost] Thread ${threadIdx + 1}: ` +
+                                         `FProxy slot ${fproxyLease.slotId}, egress ${fproxyLease.observedIp}, ` +
+                                         `ipWindowMs=${leaseRemainingMs}, visitBudgetMs=${visitWatchdogTimeoutMs}`,
+                                     )
+                                     this.setThreadProxyTiming(threadIdx, {
+                                         status: 'visiting',
+                                         proxyIpExpiresAt: fproxyLease.endpointExpiresAt,
+                                         proxyRotateAt: fproxyLease.rotateAllowedAt,
+                                         visitSoftDeadlineAt,
+                                         timingLabel: `Con ${this.formatProxyCountdown(Math.ceil(visitWatchdogTimeoutMs / 1000))}s budget`,
+                                         action: `FProxy IP ready (${Math.round(visitWatchdogTimeoutMs / 1000)}s budget)`,
+                                     })
+                                     this.threadDetails[threadIdx] = {
+                                         ...this.ensureThreadDetail(threadIdx),
+                                         proxyInfo: proxyInfoStr,
+                                     }
+                                 } else {
+                                 const fproxyKey = fproxyService.getApiKey()
+                                 if (fproxyKey) {
+                                    // Use FProxy.me API for dynamic proxy
+                                    console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Using FProxy API...`)
+                                    try {
+                                        const fproxy = await fproxyService.getProxyForBrowser()
+                                        if (fproxy) {
+                                            proxyConfig = fproxy
+                                            const info = fproxyService.getProxyInfo()
+                                            proxyInfoStr = `${fproxy.host}:${fproxy.port}${info?.location ? ` (${info.location})` : ''}`
+                                            this.networkState = {
+                                                ...this.networkState,
+                                                mode: 'fproxy',
+                                                reason: 'active_fproxy_proxy_assigned',
+                                                proxyInfo: proxyInfoStr,
+                                                useProxySetting: true,
+                                                checkedAt: new Date().toISOString(),
+                                            }
+                                            console.log(`[TrafficBoost] Thread ${threadIdx + 1}: FProxy: ${proxyInfoStr}, user: ${fproxy.username}`)
+                                        } else {
+                                            console.log(`[TrafficBoost] Thread ${threadIdx + 1}: FProxy returned null, direct connection`)
+                                        }
+                                    } catch (fErr: any) {
+                                        console.log(`[TrafficBoost] Thread ${threadIdx + 1}: FProxy error: ${fErr.message}`)
+                                    }
+                                } else {
+                                    // Fallback: use static proxies from DB
+                                    const activeProxy = await proxyService.getRandomActive()
+                                    if (activeProxy) {
+                                        proxyConfig = {
+                                            host: activeProxy.host,
+                                            port: activeProxy.port,
+                                            username: activeProxy.username || undefined,
+                                            password: activeProxy.password || undefined,
+                                            type: (activeProxy.type as 'http' | 'https' | 'socks5') || 'http',
+                                        }
+                                        proxyInfoStr = `${activeProxy.host}:${activeProxy.port}${activeProxy.country ? ` (${activeProxy.country})` : ''}`
+                                        this.networkState = {
+                                            ...this.networkState,
+                                            mode: 'static_proxy',
+                                            reason: 'active_static_proxy_assigned',
+                                            proxyInfo: proxyInfoStr,
+                                            useProxySetting: true,
+                                            checkedAt: new Date().toISOString(),
+                                        }
+                                        console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Static proxy: ${proxyInfoStr}`)
+                                    } else {
+                                        console.log(`[TrafficBoost] Thread ${threadIdx + 1}: No proxy, direct connection`)
+                                        this.networkState = {
+                                            ...this.networkState,
+                                            mode: 'direct',
+                                            reason: 'static_proxy_pool_empty',
+                                            proxyInfo: undefined,
+                                            useProxySetting: true,
+                                            checkedAt: new Date().toISOString(),
+                                         }
+                                     }
+                                 }
+                                 }
+                             } else {
+                                if (task.forceDirectConnection) {
+                                    console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Proxy temporarily bypassed for retry, using direct connection`)
+                                } else {
+                                    console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Proxy disabled in settings, using direct connection`)
+                                }
+                                this.networkState = {
+                                    ...this.networkState,
+                                    mode: 'direct',
+                                    reason: task.forceDirectConnection ? 'proxy_failed_fallback_direct' : 'proxy_disabled_in_settings',
+                                    proxyInfo: undefined,
+                                    useProxySetting: task.forceDirectConnection ? true : false,
+                                    checkedAt: new Date().toISOString(),
+                                }
+                            }
+
+                            } catch (proxyAcquireError) {
+                                try { await fproxyLease?.release('acquire_failed') } catch {}
+                                fproxyLease = null
+                                throw proxyAcquireError
                             }
 
                             try {
                                 await this.runWithTimeout(async () => {
                                     // Retrieve and self-heal task.account.profilePath (via ensureAccountProfile which computes, mkdirs, DB-updates if stale).
                                     // Pass healed path into config; branch to createContext (persistent profile) vs createEphemeralContext (anonymous).
-                                    if (task.account) {
-                                        profilePath = this.ensureAccountProfile(task.account)
-                                    } else {
-                                        profilePath = undefined
+                                    // Proxy already acquired outside watchdog; create browser with bound IP window.
+                                    if (watchdogTriggered || shouldStopForVisitBudget()) {
+                                        throw new Error('VISIT_ABORTED_BY_WATCHDOG')
                                     }
-
-                                    // Create browser context with account's profile + proxy
-                                    // Try FProxy API first, then static proxies
-                                    let proxyConfig: BrowserConfig['proxy'] = undefined
-                                    let proxyInfoStr = ''
-                                    const runtimeProxy = this.applyRuntimeProxySettings()
-                                    const useProxyThisVisit = runtimeProxy.proxyEnabled && !task.forceDirectConnection
-                                    usedProxyThisVisit = useProxyThisVisit
-
-                                if (useProxyThisVisit) {
-                                    const fproxyKey = fproxyService.getApiKey()
-                                    if (fproxyKey) {
-                                        // Use FProxy.me API for dynamic proxy
-                                        console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Using FProxy API...`)
-                                        try {
-                                            const fproxy = await fproxyService.getProxyForBrowser()
-                                            if (fproxy) {
-                                                proxyConfig = fproxy
-                                                const info = fproxyService.getProxyInfo()
-                                                proxyInfoStr = `${fproxy.host}:${fproxy.port}${info?.location ? ` (${info.location})` : ''}`
-                                                this.networkState = {
-                                                    ...this.networkState,
-                                                    mode: 'fproxy',
-                                                    reason: 'active_fproxy_proxy_assigned',
-                                                    proxyInfo: proxyInfoStr,
-                                                    useProxySetting: true,
-                                                    checkedAt: new Date().toISOString(),
-                                                }
-                                                console.log(`[TrafficBoost] Thread ${threadIdx + 1}: FProxy: ${proxyInfoStr}, user: ${fproxy.username}`)
-                                            } else {
-                                                console.log(`[TrafficBoost] Thread ${threadIdx + 1}: FProxy returned null, direct connection`)
-                                            }
-                                        } catch (fErr: any) {
-                                            console.log(`[TrafficBoost] Thread ${threadIdx + 1}: FProxy error: ${fErr.message}`)
-                                        }
-                                    } else {
-                                        // Fallback: use static proxies from DB
-                                        const activeProxy = await proxyService.getRandomActive()
-                                        if (activeProxy) {
-                                            proxyConfig = {
-                                                host: activeProxy.host,
-                                                port: activeProxy.port,
-                                                username: activeProxy.username || undefined,
-                                                password: activeProxy.password || undefined,
-                                                type: (activeProxy.type as 'http' | 'https' | 'socks5') || 'http',
-                                            }
-                                            proxyInfoStr = `${activeProxy.host}:${activeProxy.port}${activeProxy.country ? ` (${activeProxy.country})` : ''}`
-                                            this.networkState = {
-                                                ...this.networkState,
-                                                mode: 'static_proxy',
-                                                reason: 'active_static_proxy_assigned',
-                                                proxyInfo: proxyInfoStr,
-                                                useProxySetting: true,
-                                                checkedAt: new Date().toISOString(),
-                                            }
-                                            console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Static proxy: ${proxyInfoStr}`)
-                                        } else {
-                                            console.log(`[TrafficBoost] Thread ${threadIdx + 1}: No proxy, direct connection`)
-                                            this.networkState = {
-                                                ...this.networkState,
-                                                mode: 'direct',
-                                                reason: 'static_proxy_pool_empty',
-                                                proxyInfo: undefined,
-                                                useProxySetting: true,
-                                                checkedAt: new Date().toISOString(),
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    if (task.forceDirectConnection) {
-                                        console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Proxy temporarily bypassed for retry, using direct connection`)
-                                    } else {
-                                        console.log(`[TrafficBoost] Thread ${threadIdx + 1}: Proxy disabled in settings, using direct connection`)
-                                    }
-                                    this.networkState = {
-                                        ...this.networkState,
-                                        mode: 'direct',
-                                        reason: task.forceDirectConnection ? 'proxy_failed_fallback_direct' : 'proxy_disabled_in_settings',
-                                        proxyInfo: undefined,
-                                        useProxySetting: task.forceDirectConnection ? true : false,
-                                        checkedAt: new Date().toISOString(),
-                                    }
-                                }
 
                                 // Config: pass profilePath (when present) so create* decides persistent vs ephemeral.
                                 const config: BrowserConfig = {
@@ -3173,7 +3544,7 @@ export class TrafficBoostEngine {
                                             }
                                         } catch (error) {
                                             if (this.isBrowserContextClosedError(error)) {
-                                                this.threadDetails[threadIdx].currentAction = 'Browser disconnected - recreating context'
+                                                this.setThreadAction(threadIdx, 'Browser disconnected - recreating context')
                                             }
                                             throw error
                                         }
@@ -3194,7 +3565,7 @@ export class TrafficBoostEngine {
                                             const maxAttempts = attempt + retriesLeft
                                             const errorMessage = attemptError?.message || 'browser context closed'
 
-                                            this.threadDetails[threadIdx].currentAction = `Browser disconnected - relaunching (${attempt}/${maxAttempts})`
+                                            this.setThreadAction(threadIdx, `Browser disconnected - relaunching (${attempt}/${maxAttempts})`)
                                             this.sendStatus(this.buildStatus({
                                                 campaignName: campaign.name,
                                                 currentRound,
@@ -3220,6 +3591,18 @@ export class TrafficBoostEngine {
                                         },
                                     }
                                 )
+                                if (fproxyLease) {
+                                    const activeLease = fproxyLease
+                                    proxyLeaseAbortHandler = () => {
+                                        watchdogTriggered = true
+                                        void recycleVisitContext('watchdog_timeout')
+                                    }
+                                    activeLease.signal.addEventListener(
+                                        'abort',
+                                        proxyLeaseAbortHandler,
+                                        { once: true },
+                                    )
+                                }
                                 this.activeContexts.set(contextId, profilePath || '')
                                 this.threadContextIds.set(threadIdx, contextId)
 
@@ -3349,7 +3732,7 @@ export class TrafficBoostEngine {
                                             ? this.resolveWebSeoDwellSeconds(campaign)
                                             : null
 
-                                        this.threadDetails[threadIdx].currentKeyword = keyword
+                                        this.setThreadKeyword(threadIdx, keyword)
                                         this.sendStatus(this.buildStatus({
                                             campaignName: campaign.name,
                                             currentRound,
@@ -3372,7 +3755,7 @@ export class TrafficBoostEngine {
                                         }
 
                                         if (avoidGoogleSearchForThread && campaign.trafficMode === 'organic') {
-                                            this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct map navigation'
+                                            this.setThreadAction(threadIdx, 'Captcha cooldown: direct map navigation')
                                             await page.goto(task.location.url, {
                                                 waitUntil: 'commit',
                                                 timeout: 20000,
@@ -3380,14 +3763,14 @@ export class TrafficBoostEngine {
                                             await HumanBehavior.randomDelay(1200, 2600)
                                         } else if (avoidGoogleSearchForThread && campaign.trafficMode === 'map_search') {
                                             // map_search cooldown: direct map URL (per spec, avoid Google search UI)
-                                            this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct map navigation (map_search)'
+                                            this.setThreadAction(threadIdx, 'Captcha cooldown: direct map navigation (map_search)')
                                             await page.goto(task.location.url, {
                                                 waitUntil: 'commit',
                                                 timeout: 20000,
                                             })
                                             await HumanBehavior.randomDelay(1200, 2600)
                                         } else if (avoidGoogleSearchForThread && campaign.trafficMode === 'web_seo') {
-                                            this.threadDetails[threadIdx].currentAction = 'Captcha cooldown: direct website browsing'
+                                            this.setThreadAction(threadIdx, 'Captcha cooldown: direct website browsing')
                                             const targetUrl = normalizeWebSeoTargetUrl(task.location.url)
                                             const targetHost = targetUrl ? extractTargetHost(targetUrl) : null
                                             if (!targetUrl || !targetHost) {
@@ -3404,7 +3787,7 @@ export class TrafficBoostEngine {
                                             })
                                             await HumanBehavior.randomDelay(2000, 4200)
                                             const cooldownFlow = new WebSeoFlow((status) => {
-                                                this.threadDetails[threadIdx].currentAction = status.message || status.action
+                                                this.setThreadAction(threadIdx, status.message || status.action)
                                             })
                                             const cooldownConfig: WebSeoExecuteConfig = {
                                                 keyword,
@@ -3450,7 +3833,7 @@ export class TrafficBoostEngine {
                                             this.assertWebSeoOutcomeOrThrow(webSeoVisitState.outcome)
                                         } else if (campaign.trafficMode === 'organic') {
                                             const searchHandler = new AgenticSearchHandler((status) => {
-                                                this.threadDetails[threadIdx].currentAction = status
+                                                this.setThreadAction(threadIdx, status)
                                                 this.sendStatus(this.buildStatus({
                                                     campaignName: campaign.name,
                                                     currentRound,
@@ -3480,21 +3863,36 @@ export class TrafficBoostEngine {
                                             }
 
                                             if (!searchResult.foundMap) {
-                                                // Fallback to direct mode if map not found
-                                                this.threadDetails[threadIdx].currentAction = 'Fallback: Direct navigation'
-                                                console.log(`[TrafficBoost] Agentic organic search failed for "${task.location.name}", falling back to direct URL`)
+                                                // Fallback to direct mode if map not found in search results
+                                                this.setThreadAction(threadIdx, 'Fallback: Chuyển sang URL trực tiếp...')
+                                                console.log(`[TrafficBoost] Organic search did not find "${task.location.name}" for "${keyword}", falling back to direct URL`)
                                                 await page.goto(task.location.url, {
-                                                    waitUntil: 'commit',
-                                                    timeout: 20000
-                                                })
-                                                await HumanBehavior.randomDelay(1000, 3000)
+                                                    waitUntil: 'domcontentloaded',
+                                                    timeout: 25000
+                                                }).catch(() => {})
+                                                await HumanBehavior.randomDelay(1500, 3000)
+                                                await this.ensureDirectModeMapReady(
+                                                    page,
+                                                    threadIdx,
+                                                    task.location,
+                                                    {
+                                                        campaignName: campaign.name,
+                                                        currentRound,
+                                                        completedVisits,
+                                                        totalVisits,
+                                                        failedVisits,
+                                                    },
+                                                    actionsPerformed,
+                                                    actionContext,
+                                                    !!task.account
+                                                )
                                             }
                                             // After organic discovery flow, we're on the map page -> continue to SEO actions below
                                         } else if (campaign.trafficMode === 'map_search') {
                                             // MAP_SEARCH MODE: open maps.google.com/maps, type keyword (round-robin), scroll feed max 15 cards, match by name/placeId, click to detail.
                                             // On not found within limit -> fallback to direct URL. Then common path runs autonomous KPI agent (since !== 'web_seo').
                                             const mapSearchFlow = new MapSearchFlow((status: string) => {
-                                                this.threadDetails[threadIdx].currentAction = status
+                                                this.setThreadAction(threadIdx, status)
                                                 this.sendStatus(this.buildStatus({
                                                     campaignName: campaign.name,
                                                     currentRound,
@@ -3524,13 +3922,28 @@ export class TrafficBoostEngine {
                                             }
 
                                             if (!mapSearchResult.foundMap) {
-                                                this.threadDetails[threadIdx].currentAction = 'Fallback: Direct navigation (map_search)'
+                                                this.setThreadAction(threadIdx, 'Fallback: Chuyển sang URL trực tiếp...')
                                                 console.log(`[TrafficBoost] MapSearchFlow did not find "${task.location.name}" within limit for "${keyword}", falling back to direct URL`)
                                                 await page.goto(task.location.url, {
-                                                    waitUntil: 'commit',
-                                                    timeout: 20000
-                                                })
-                                                await HumanBehavior.randomDelay(1000, 3000)
+                                                    waitUntil: 'domcontentloaded',
+                                                    timeout: 25000
+                                                }).catch(() => {})
+                                                await HumanBehavior.randomDelay(1500, 3000)
+                                                await this.ensureDirectModeMapReady(
+                                                    page,
+                                                    threadIdx,
+                                                    task.location,
+                                                    {
+                                                        campaignName: campaign.name,
+                                                        currentRound,
+                                                        completedVisits,
+                                                        totalVisits,
+                                                        failedVisits,
+                                                    },
+                                                    actionsPerformed,
+                                                    actionContext,
+                                                    !!task.account
+                                                )
                                             }
                                             // On success or fallback we are on map page -> fall through to common consent/login/stabilize + autonomous KPI
                                         } else {
@@ -3544,7 +3957,7 @@ export class TrafficBoostEngine {
                                             const requireOrganic = Boolean(campaign.webSeoRequireOrganic)
 
                                             const webSeoFlow = new WebSeoFlow((status) => {
-                                                this.threadDetails[threadIdx].currentAction = status.message || status.action
+                                                this.setThreadAction(threadIdx, status.message || status.action)
                                                 this.sendStatus(this.buildStatus({
                                                     campaignName: campaign.name,
                                                     currentRound,
@@ -3629,7 +4042,7 @@ export class TrafficBoostEngine {
 
                                     } else {
                                         // DIRECT MODE: Navigate straight to URL (original behavior)
-                                        this.threadDetails[threadIdx].currentAction = 'Loading map...'
+                                        this.setThreadAction(threadIdx, 'Loading map...')
                                         this.sendStatus(this.buildStatus({
                                             campaignName: campaign.name,
                                             currentRound,
@@ -3834,7 +4247,7 @@ export class TrafficBoostEngine {
                                                 campaignUseFixedActionCount ? Number(campaign.actionsPerVisit ?? 5) : 10,
                                                 threadIdx,
                                                 (msg: string) => {
-                                                    this.threadDetails[threadIdx].currentAction = msg
+                                                    this.setThreadAction(threadIdx, msg)
                                                     this.sendStatus(this.buildStatus({
                                                         campaignName: campaign.name,
                                                         currentRound,
@@ -3846,7 +4259,7 @@ export class TrafficBoostEngine {
                                                 },
                                                 () => this.shouldStop
                                                     || shouldStopForVisitBudget()
-                                                    || (proxyEnabled && !!fproxyService.getApiKey()
+                                                    || (!fproxyPoolEnabled && proxyEnabled && !!fproxyService.getApiKey()
                                                         && fproxyService.hasProxyRotatedSince(visitProxySnapshotTime)
                                                         && (Date.now() - visitStart) < (visitWatchdogTimeoutMs * 0.5)),
                                                 'all',
@@ -3875,7 +4288,7 @@ export class TrafficBoostEngine {
                                                 locationUrl: task.location.url,
                                                 threadId: threadIdx,
                                                 onStatusUpdate: (msg: string) => {
-                                                    this.threadDetails[threadIdx].currentAction = msg
+                                                    this.setThreadAction(threadIdx, msg)
                                                     this.sendStatus(this.buildStatus({
                                                         campaignName: campaign.name,
                                                         currentRound,
@@ -3887,7 +4300,7 @@ export class TrafficBoostEngine {
                                                 },
                                                 shouldStop: () => this.shouldStop
                                                     || shouldStopForVisitBudget()
-                                                    || (proxyEnabled && !!fproxyService.getApiKey()
+                                                    || (!fproxyPoolEnabled && proxyEnabled && !!fproxyService.getApiKey()
                                                         && fproxyService.hasProxyRotatedSince(visitProxySnapshotTime)
                                                         && (Date.now() - visitStart) < (visitWatchdogTimeoutMs * 0.5)),
                                             })
@@ -3998,12 +4411,15 @@ export class TrafficBoostEngine {
                                     await recycleVisitContext(watchdogTriggered ? 'watchdog_timeout' : 'visit_end')
                                 }
 
-                                }, visitWatchdogTimeoutMs * 1.2, async () => {
+                                }, Math.max(20_000, Math.min(visitWatchdogTimeoutMs * 1.15, Math.max(0, visitHardDeadlineAt - Date.now()) + 5_000)), async () => {
                                     watchdogTriggered = true
                                     await recycleVisitContext('watchdog_timeout')
                                 })
 
                             } catch (error: unknown) {
+                                await recycleVisitContext(
+                                    watchdogTriggered ? 'watchdog_timeout' : 'visit_end',
+                                )
                                 const errMsg = sanitizeErrorDetail(error)
                                 const errStack = error instanceof Error ? (error.stack || '') : ''
                                 console.error(`[TrafficBoost] Visit failed:`, errMsg)
@@ -4039,8 +4455,18 @@ export class TrafficBoostEngine {
                                 const isProxyFailure = failureClassification.bucket === 'proxy_error'
                                 const canRetryWithoutProxy = isProxyFailure
                                     && usedProxyThisVisit
+                                    && !strictFproxyPool
                                     && !task.forceDirectConnection
                                     && (task.proxyRetryCount ?? 0) < 1
+                                    && !this.shouldStop
+                                // Strict FProxy pool: requeue on another unique slot instead of failing the map permanently.
+                                const canRetryWithFproxyPool = isProxyFailure
+                                    && usedProxyThisVisit
+                                    && strictFproxyPool
+                                    && (task.proxyRetryCount ?? 0) < 2
+                                    && !this.shouldStop
+                                const canRetryBrowserCrash = failureClassification.bucket === 'browser_crash'
+                                    && (task.watchdogRetryCount ?? 0) < 1
                                     && !this.shouldStop
                                 const canRetryWatchdog = isWatchdogFailure
                                     && (task.watchdogRetryCount ?? 0) < 1
@@ -4061,6 +4487,40 @@ export class TrafficBoostEngine {
                                         detail: `Proxy connection failed (${errMsg}). Requeued visit with direct connection fallback`,
                                         threadId: threadIdx,
                                         retryCategory: 'network',
+                                        queueDepth: this.currentQueueDepth,
+                                        timestamp: new Date().toISOString(),
+                                    }, actionContext)
+                                } else if (canRetryWithFproxyPool) {
+                                    await trafficVisitQueue.failVisit(task.durableVisitId, errMsg, {
+                                        immediateRetry: true,
+                                        mergePayload: {
+                                            proxyRetryCount: (task.proxyRetryCount ?? 0) + 1,
+                                        },
+                                    })
+                                    this.recordAction(actionsPerformed, {
+                                        action: 'proxy_error_retry_pool_requeued',
+                                        success: true,
+                                        source: 'runtime',
+                                        detail: `Proxy/tunnel failed (${errMsg}). Requeued visit for another FProxy slot`,
+                                        threadId: threadIdx,
+                                        retryCategory: 'network',
+                                        queueDepth: this.currentQueueDepth,
+                                        timestamp: new Date().toISOString(),
+                                    }, actionContext)
+                                } else if (canRetryBrowserCrash) {
+                                    await trafficVisitQueue.failVisit(task.durableVisitId, errMsg, {
+                                        immediateRetry: true,
+                                        mergePayload: {
+                                            watchdogRetryCount: (task.watchdogRetryCount ?? 0) + 1,
+                                        },
+                                    })
+                                    this.recordAction(actionsPerformed, {
+                                        action: 'browser_crash_retry_requeued',
+                                        success: true,
+                                        source: 'runtime',
+                                        detail: `Browser/context closed unexpectedly (${errMsg}). Requeued visit`,
+                                        threadId: threadIdx,
+                                        retryCategory: 'browser_context',
                                         queueDepth: this.currentQueueDepth,
                                         timestamp: new Date().toISOString(),
                                     }, actionContext)
@@ -4237,6 +4697,7 @@ export class TrafficBoostEngine {
             terminalMessage = `Error: ${campaignErrMsg}`
         } finally {
             this.running = false
+            this.abortPendingProxyAcquires()
             this.campaignAccountLocks.clear()
             try {
                 this.sendStatus(this.buildStatus({
@@ -4282,6 +4743,7 @@ export class TrafficBoostEngine {
         this.shouldStop = true
         this.paused = false
         this.running = false
+        this.abortPendingProxyAcquires()
         if (this.currentCampaignId) {
             const campaignId = this.currentCampaignId
             try {
@@ -4308,7 +4770,16 @@ export class TrafficBoostEngine {
         }
         this.activeContexts.clear()
         this.threadContextIds.clear()
-        this.threadDetails = []
+        // Keep thread slots so late async callbacks do not crash on undefined entries.
+        this.threadDetails = this.threadDetails.map((thread, idx) => ({
+            id: thread?.id ?? idx,
+            accountEmail: '',
+            locationName: '',
+            currentAction: 'stopped',
+            currentUrl: '',
+            status: 'done' as const,
+            progress: 100,
+        }))
         this.currentQueueDepth = 0
         fproxyService.stopAutoRotate()
         // Broadcast stopped status to UI
@@ -4323,6 +4794,7 @@ export class TrafficBoostEngine {
         // Close browser contexts to save resources (per spec: keep full progress/counts/indices in memory+DB).
         // Persist counters so resume (or app reopen + resume) continues exactly: visits, round, keyword/account order via logs+DB.
         this.paused = true
+        this.abortPendingProxyAcquires()
         // keep running=true so monitor treats as active (paused) control session
         if (this.currentCampaignId) {
             const campaignId = this.currentCampaignId
@@ -4416,6 +4888,13 @@ export class TrafficBoostEngine {
     // ============================================================
 
     isRunning(): boolean { return this.running }
+
+    private abortPendingProxyAcquires(): void {
+        for (const controller of Array.from(this.proxyAcquireControllers)) {
+            controller.abort()
+        }
+        this.proxyAcquireControllers.clear()
+    }
 
     getStatus(): TrafficBoostStatus {
         return this.buildStatus()

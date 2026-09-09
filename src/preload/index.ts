@@ -16,6 +16,12 @@ import type {
     ProxyUpdatePayload,
 } from '../shared/proxy-contracts'
 import type {
+    FProxyAddSlotInput,
+    FProxyPoolPolicy,
+    FProxyPoolSnapshotDto,
+    FProxySlotTestResultDto,
+} from '../shared/fproxy-pool-contracts'
+import type {
     AccountWarmupStatusDto,
     WarmupActionResultDto,
     WarmupStartOptions,
@@ -131,6 +137,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getInfo: () => ipcRenderer.invoke('fproxy:getInfo'),
         test: () => ipcRenderer.invoke('fproxy:test'),
         testApi: () => ipcRenderer.invoke('fproxy:testApi'), // Settings: test proxy API endpoint + live proxy connect
+    },
+    fproxyPool: {
+        getSnapshot: (): Promise<FProxyPoolSnapshotDto> =>
+            ipcRenderer.invoke('fproxy:getSnapshot'),
+        addSlot: (input: FProxyAddSlotInput): Promise<FProxyPoolSnapshotDto> =>
+            ipcRenderer.invoke('fproxy:addSlot', input),
+        removeSlot: (id: number): Promise<FProxyPoolSnapshotDto> =>
+            ipcRenderer.invoke('fproxy:removeSlot', id),
+        setEnabled: (id: number, enabled: boolean): Promise<FProxyPoolSnapshotDto> =>
+            ipcRenderer.invoke('fproxy:setEnabled', id, enabled),
+        updatePolicy: (policy: FProxyPoolPolicy): Promise<FProxyPoolSnapshotDto> =>
+            ipcRenderer.invoke('fproxy:updatePolicy', policy),
+        testSlot: (id: number): Promise<FProxySlotTestResultDto> =>
+            ipcRenderer.invoke('fproxy:testSlot', id),
+        testAll: (): Promise<FProxySlotTestResultDto[]> =>
+            ipcRenderer.invoke('fproxy:testAll'),
+        refreshAll: (): Promise<FProxyPoolSnapshotDto> =>
+            ipcRenderer.invoke('fproxy:refreshAll'),
+        onSnapshot: (callback: (snapshot: FProxyPoolSnapshotDto) => void) => {
+            const listener = (_event: Electron.IpcRendererEvent, snapshot: FProxyPoolSnapshotDto) =>
+                callback(snapshot)
+            ipcRenderer.on('fproxy:poolSnapshot', listener)
+            return () => ipcRenderer.removeListener('fproxy:poolSnapshot', listener)
+        },
     },
 
     // Locations
@@ -812,7 +842,22 @@ declare global {
                 onState: (callback: (state: any) => void) => () => void
             }
             fproxy: {
+                setApiKey: (apiKey: string) => Promise<{ success: boolean; snapshot: FProxyPoolSnapshotDto }>
+                getNew: () => Promise<FProxyPoolSnapshotDto>
+                getInfo: () => Promise<FProxyPoolSnapshotDto['slots'][number] | null>
+                test: () => Promise<{ success: boolean; message: string; ip?: string; latencyMs?: number; location?: string }>
                 testApi: () => Promise<{ success: boolean; message: string; ip?: string; latencyMs?: number; location?: string }>
+            }
+            fproxyPool: {
+                getSnapshot: () => Promise<FProxyPoolSnapshotDto>
+                addSlot: (input: FProxyAddSlotInput) => Promise<FProxyPoolSnapshotDto>
+                removeSlot: (id: number) => Promise<FProxyPoolSnapshotDto>
+                setEnabled: (id: number, enabled: boolean) => Promise<FProxyPoolSnapshotDto>
+                updatePolicy: (policy: FProxyPoolPolicy) => Promise<FProxyPoolSnapshotDto>
+                testSlot: (id: number) => Promise<FProxySlotTestResultDto>
+                testAll: () => Promise<FProxySlotTestResultDto[]>
+                refreshAll: () => Promise<FProxyPoolSnapshotDto>
+                onSnapshot: (callback: (snapshot: FProxyPoolSnapshotDto) => void) => () => void
             }
             reports: {
                 getActionTrace: (payload?: { campaignId?: number; limit?: number }) => Promise<any[]>

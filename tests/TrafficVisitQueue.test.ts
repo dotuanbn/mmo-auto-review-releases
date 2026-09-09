@@ -89,7 +89,7 @@ describe('TrafficVisitQueue — contracts helpers', () => {
         expect(computeTrafficVisitBackoffMs(5, 1000, 10_000)).toBe(10_000)
     })
 
-    it('buildTrafficVisitSeedItems is deterministic location×round', () => {
+        it('buildTrafficVisitSeedItems is deterministic location?round', () => {
         const items = buildTrafficVisitSeedItems({
             locations: [{ id: 1 }, { id: 2 }],
             accountIds: [10, 20],
@@ -101,6 +101,20 @@ describe('TrafficVisitQueue — contracts helpers', () => {
         expect(items[1]).toMatchObject({ visitIndex: 1, payload: { locationId: 2, round: 1 } })
         expect(items[2]).toMatchObject({ visitIndex: 2, payload: { locationId: 1, round: 2 } })
         expect(items.map((i) => i.visitIndex)).toEqual([0, 1, 2, 3])
+        // Consecutive visits spread across account pool by visitIndex (supports multi-IP concurrency).
+        expect(items.map((i) => i.payload.accountId)).toEqual([10, 20, 10, 20])
+    })
+
+    it('spreads one map multi-visit across account pool for concurrent threads', () => {
+        const items = buildTrafficVisitSeedItems({
+            locations: [{ id: 99 }],
+            accountIds: [1, 2, 3],
+            visitsPerLocation: 3,
+            requestedActions: 2,
+        })
+        expect(items).toHaveLength(3)
+        expect(items.map((i) => i.payload.accountId)).toEqual([1, 2, 3])
+        expect(items.every((i) => i.payload.locationId === 99)).toBe(true)
     })
 })
 

@@ -1,4 +1,5 @@
 import { loadSettings } from '../../ipc/settings'
+import { fproxyPoolService } from '../../services/FProxyPoolService'
 import { fproxyService } from '../../services/FProxyService'
 import { proxyService } from '../../services/ProxyService'
 import { NetworkStateV2 } from './types'
@@ -26,7 +27,11 @@ class NetworkOrchestrator {
         const useProxySetting = settings.useProxy === true
         const configuredFProxyApiKey = sanitizeApiKey(settings.fproxyApiKey)
         const activeFProxyKey = sanitizeApiKey(fproxyService.getApiKey())
-        const hasFProxyApiKey = configuredFProxyApiKey.length > 0 || activeFProxyKey.length > 0
+        const poolSnapshot = await fproxyPoolService.getSnapshot()
+        const enabledPoolSlots = poolSnapshot.slots.filter(slot => slot.enabled && slot.hasSecret)
+        const hasFProxyApiKey = enabledPoolSlots.length > 0
+            || configuredFProxyApiKey.length > 0
+            || activeFProxyKey.length > 0
 
         if (!useProxySetting) {
             this.currentState = {
@@ -43,7 +48,9 @@ class NetworkOrchestrator {
             this.currentState = {
                 mode: 'fproxy',
                 reason: 'fproxy_available',
-                proxyInfo: this.formatFProxyInfo(),
+                proxyInfo: enabledPoolSlots.length > 0
+                    ? this.formatFProxyPoolInfo(enabledPoolSlots.length, poolSnapshot.slots)
+                    : this.formatLegacyFProxyInfo(),
                 useProxySetting,
                 hasFProxyApiKey,
                 checkedAt: nowIso(),
@@ -93,6 +100,24 @@ class NetworkOrchestrator {
         }
 
         if (state.mode === 'fproxy') {
+            const snapshot = await fproxyPoolService.getSnapshot()
+            const enabledSlots = snapshot.slots.filter(slot => slot.enabled && slot.hasSecret)
+            if (enabledSlots.length > 0) {
+                const results = await fproxyPoolService.testAll()
+                const healthy = results.filter(result => result.success)
+                return {
+                    success: healthy.length > 0,
+                    state: {
+                        ...state,
+                        proxyInfo: this.formatFProxyPoolInfo(healthy.length, snapshot.slots),
+                        checkedAt: nowIso(),
+                    },
+                    message: healthy.length > 0
+                        ? `FProxy pool is ready (${healthy.length}/${enabledSlots.length})`
+                        : 'FProxy pool has no healthy slot',
+                }
+            }
+
             const proxy = await fproxyService.getProxyForBrowser()
             if (!proxy) {
                 return {
@@ -138,10 +163,19 @@ class NetworkOrchestrator {
         }
     }
 
-    private formatFProxyInfo(): string | undefined {
+    private formatLegacyFProxyInfo(): string | undefined {
         const info = fproxyService.getProxyInfo()
         if (!info) return undefined
         return `${info.ip}:${info.port}${info.location ? ` (${info.location})` : ''}`
+    }
+
+    private formatFProxyPoolInfo(
+        available: number,
+        slots: Array<{ enabled: boolean; status: string }>,
+    ): string {
+        const enabled = slots.filter(slot => slot.enabled).length
+        const leased = slots.filter(slot => slot.status === 'leased').length
+        return `${available}/${enabled} slots ready${leased > 0 ? `, ${leased} in use` : ''}`
     }
 }
 

@@ -49,6 +49,7 @@ export interface ExecuteAvailableKpisOptions {
 }
 
 export interface ExecuteKpiOptions {
+    placeUrl?: string
     directionStartPoint?: string
 }
 
@@ -84,7 +85,6 @@ const DIRECTION_SELECTORS = [
 
 const WEBSITE_SELECTORS = [
     'a[data-item-id="authority"]',
-    'a[href^="http"]:not([href*="google."])',
     'a[aria-label*="Website" i]',
     'a[aria-label*="website" i]',
     'a[aria-label*="Trang web" i]',
@@ -116,42 +116,81 @@ function humanDelay(min: number, max: number): Promise<void> {
 /**
  * Perform a human-like click on a Playwright locator with Bézier mouse approach.
  */
+export function isBareMapsViewportUrl(url: string): boolean {
+    const lower = (url || '').toLowerCase()
+    if (!(lower.includes('google.com/maps') || lower.includes('maps.google.'))) return false
+    if (lower.includes('/maps/place/')) return false
+    if (lower.includes('/maps/dir')) return false
+    return /\/maps\/@-?\d+(\.\d+)?,-?\d+(\.\d+)?/.test(lower)
+}
+
+export function normalizeMapsPlaceUrl(url: string): string {
+    const raw = (url || '').trim()
+    if (!raw) return raw
+    try {
+        const parsed = new URL(raw)
+        if (parsed.pathname.includes('/maps/place/')) {
+            parsed.search = ''
+            parsed.hash = ''
+            return parsed.toString()
+        }
+    } catch {
+        // keep raw
+    }
+    return raw
+}
+
 async function humanClickLocator(
     page: Page,
     locator: ReturnType<Page['locator']>,
     label: string
 ): Promise<boolean> {
     try {
-        const visible = await locator.isVisible({ timeout: 2000 }).catch(() => false)
+        const count = await locator.count().catch(() => 0)
+        if (count <= 0) return false
+
+        const visible = await locator.isVisible({ timeout: 2200 }).catch(() => false)
         if (!visible) return false
 
+        // Prefer actionable elements; skip if disabled/hidden for pointer.
+        const enabled = await locator.isEnabled({ timeout: 800 }).catch(() => true)
+        if (!enabled) return false
+
         await locator.scrollIntoViewIfNeeded().catch(() => {})
-        await humanDelay(300, 600)
+        await humanDelay(250, 550)
 
         const box = await locator.boundingBox().catch(() => null)
+        // Guard: giant/hidden boxes often mean wrong overlay target.
+        if (box && (box.width < 8 || box.height < 8 || box.width > 900 || box.height > 420)) {
+            // Still try native locator click which uses Playwright hit-testing.
+            await locator.click({ timeout: 3000, trial: true }).catch(() => {})
+            await locator.click({ timeout: 3000 })
+            log(`Clicked (locator): ${label}`)
+            return true
+        }
+
         if (box) {
-            // Approach with Bézier-like curve
-            const targetX = box.x + box.width * (0.3 + Math.random() * 0.4)
-            const targetY = box.y + box.height * (0.3 + Math.random() * 0.4)
+            // Center-biased target to avoid edge misclicks on neighboring controls.
+            const targetX = box.x + box.width * (0.42 + Math.random() * 0.16)
+            const targetY = box.y + box.height * (0.42 + Math.random() * 0.16)
 
-            // Pre-click hover approach
-            const startX = targetX + randomInt(-120, 120)
-            const startY = targetY + randomInt(-80, 80)
-            await page.mouse.move(startX, startY, { steps: randomInt(4, 8) }).catch(() => {})
-            await humanDelay(100, 250)
+            const startX = targetX + randomInt(-80, 80)
+            const startY = targetY + randomInt(-50, 50)
+            await page.mouse.move(startX, startY, { steps: randomInt(3, 6) }).catch(() => {})
+            await humanDelay(80, 180)
 
-            // Move to target with micro-steps
             await moveCursor(page, targetX, targetY)
-            await page.mouse.move(targetX, targetY, { steps: randomInt(8, 16) }).catch(() => {})
+            await page.mouse.move(targetX, targetY, { steps: randomInt(6, 12) }).catch(() => {})
+            await humanDelay(160, 380)
 
-            // Pre-click hesitation (humans pause briefly before clicking)
-            await humanDelay(200, 500)
-
-            // Click
-            await clickCursor(page, targetX, targetY)
-            await page.mouse.click(targetX, targetY, { delay: randomInt(30, 80) })
+            // Prefer Playwright click (hit-testing) over raw coordinates to reduce misclicks.
+            try {
+                await locator.click({ timeout: 2500, delay: randomInt(30, 70) })
+            } catch {
+                await clickCursor(page, targetX, targetY)
+                await page.mouse.click(targetX, targetY, { delay: randomInt(30, 80) })
+            }
         } else {
-            // Fallback: direct click
             await locator.click({ timeout: 3000 })
         }
 
@@ -160,9 +199,9 @@ async function humanClickLocator(
     } catch (err) {
         log(`Click failed for "${label}": ${err instanceof Error ? err.message : String(err)}`)
 
-        // Force-click fallback
+        // Last resort force-click only once; avoid endless wrong-target spam.
         try {
-            await locator.click({ timeout: 2000, force: true })
+            await locator.click({ timeout: 1600, force: true })
             log(`Force-click succeeded for "${label}"`)
             return true
         } catch {
@@ -265,8 +304,12 @@ export class KpiSkills {
             if (/(add|upload|write|sign|login|review|photo)/i.test(text)) return false
 
             switch (type) {
-                case 'phone':
-                    return /tel:|phone|call|goi|gọi|dien thoai|điện thoại/i.test(text)
+                case 'phone': {
+                    const hasTel = /tel:/i.test(summary.href || '') || /tel:/i.test(text)
+                    const hasDigits = /(?:\+?\d[\d\s().-]{7,}\d)/.test(text)
+                    const hasLabel = /phone|call|goi|gọi|dien thoai|điện thoại/i.test(text)
+                    return hasTel || (hasLabel && hasDigits)
+                }
                 case 'website': {
                     const href = summary.href || ''
                     return /website|trang web|go to site/i.test(text)
@@ -329,8 +372,11 @@ export class KpiSkills {
             const dom = await DOMUtils.extractInteractiveDOM(page)
             const phoneCandidate = dom.summaries.find(s => {
                 const text = [s.textContent, s.ariaLabel, s.href].filter(Boolean).join(' ')
-                return /tel:|phone|điện thoại|gọi ngay|call/i.test(text) &&
-                    !/(add|upload|write|sign|login)/i.test(text)
+                const hasTel = /tel:/i.test(s.href || '') || /tel:/i.test(text)
+                const hasPhoneDigits = /(?:\+?\d[\d\s().-]{7,}\d)/.test(text)
+                const hasPhoneLabel = /phone|điện thoại|gọi ngay|call|goi/i.test(text)
+                return (hasTel || (hasPhoneLabel && hasPhoneDigits)) &&
+                    !/(add|upload|write|sign|login|review|photo|direction|website)/i.test(text)
             })
 
             if (phoneCandidate) {
@@ -538,10 +584,11 @@ export class KpiSkills {
             const websiteCandidate = dom.summaries.find(s => {
                 const text = [s.textContent, s.ariaLabel, s.title].filter(Boolean).join(' ')
                 const href = s.href || ''
-                // Must be an external link
+                const labeled = /website|trang web|go to site/i.test(text)
+                const external = /^https?:\/\/(?!([^/]*\.)?google\.)/i.test(href)
                 return (
-                    (/website|trang web|go to site/i.test(text) || /^https?:\/\/(?!.*google)/i.test(href)) &&
-                    !/(add|upload|write|sign|login|review|photo)/i.test(text)
+                    (labeled || (external && !/(maps\.google|goo\.gl\/maps|accounts\.google)/i.test(href))) &&
+                    !/(add|upload|write|sign|login|review|photo|share|save|direction|phone|call)/i.test(text)
                 )
             })
 
@@ -682,8 +729,13 @@ export class KpiSkills {
                     }
                     actions.push(`website_fallback_browsed_${Math.round((Date.now() - browseStart) / 1000)}s`)
                 } catch (err) {
-                    log(`T${threadId}: Website fallback href open failed: ${err}`)
+                    const msg = err instanceof Error ? err.message : String(err)
+                    log(`T${threadId}: Website fallback href open failed: ${msg}`)
                     actions.push('website_fallback_href_failed')
+                    if (/ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY_CONNECTION_FAILED|proxy|tunnel/i.test(msg)) {
+                        actions.push('website_proxy_tunnel_failed')
+                        verified = false
+                    }
                 } finally {
                     await fallbackPage.close().catch(() => {})
                     await page.bringToFront().catch(() => {})
@@ -735,23 +787,72 @@ export class KpiSkills {
 
         log(`T${threadId}: Executing DIRECTION KPI skill...`)
 
+        // Prefer campaign place URL if provided; warm-up may leave a bare map viewport.
+        // First visit is especially fragile: force place URL + wait for directions button itself.
+        const preferredPlace = this.normalizeMapsPlaceUrl(options.placeUrl || '')
+        const ensureDirectionsReady = async (reason: string): Promise<boolean> => {
+            // Close photo/nearby overlays first.
+            for (let i = 0; i < 2; i++) {
+                await page.keyboard.press('Escape').catch(() => {})
+                await humanDelay(250, 450)
+            }
+            if (await this.isPlaceActionsVisible(page)) {
+                const dirBtn = page.locator(
+                    'button[data-item-id="directions"], a[data-item-id="directions"], button[aria-label*="Directions" i], button[aria-label*="Ch? ???ng" i], button[jsaction*="pane.placeActions.directions"]'
+                ).first()
+                const ready = await dirBtn.isVisible({ timeout: 1200 }).catch(() => false)
+                if (ready) return true
+            }
+            if (!preferredPlace || this.isBareMapsViewportUrl(preferredPlace)) return false
+            await page.goto(preferredPlace, {
+                waitUntil: 'domcontentloaded',
+                timeout: 15000,
+            }).catch(() => {})
+            await humanDelay(1000, 1800)
+            actions.push(reason)
+            // Wait specifically for Directions action (more reliable than generic H1).
+            const dirBtn = page.locator(
+                'button[data-item-id="directions"], a[data-item-id="directions"], button[aria-label*="Directions" i], button[aria-label*="Ch? ???ng" i], button[jsaction*="pane.placeActions.directions"]'
+            ).first()
+            return await dirBtn.isVisible({ timeout: 3500 }).catch(() => false)
+        }
+
+        await ensureDirectionsReady('direction_preflight_navigated_place')
+
         // Save current URL so we can detect unwanted navigation
         const beforeUrl = page.url()
 
         const directionSelectors = [
             'button[data-item-id="directions"]',
             'a[data-item-id="directions"]',
+            'button[data-value="Directions"]',
+            'button[jsaction*="pane.placeActions.directions"]',
             'button[aria-label*="Directions" i]',
-            'button[aria-label*="Chỉ đường" i]',
+            'button[aria-label*="Ch? ???ng" i]',
             'a[aria-label*="Directions" i]',
-            'a[aria-label*="Chỉ đường" i]',
+            'a[aria-label*="Ch? ???ng" i]',
             'button[data-tooltip*="Directions" i]',
-            'button[data-tooltip*="Chỉ đường" i]',
-            'img[src*="directions"] + *',
+            'button[data-tooltip*="Ch? ???ng" i]',
+            // Avoid fragile image-sibling selector that can misclick map chrome.
         ]
+
+        // If we are on a bare viewport without place actions, do not invent clicks.
+        if (!(await this.isPlaceActionsVisible(page))) {
+            actions.push('direction_place_actions_missing_before_click')
+            const recovered = await ensureDirectionsReady('direction_preflight_retry_place')
+            if (!recovered) {
+                const recoveryUrl = this.normalizeMapsPlaceUrl(options.placeUrl || beforeUrl)
+                if (recoveryUrl && !this.isBareMapsViewportUrl(recoveryUrl)) {
+                    await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {})
+                    await humanDelay(1000, 1800)
+                }
+            }
+        }
 
         for (const selector of directionSelectors) {
             const locator = page.locator(selector).first()
+            const visible = await locator.isVisible({ timeout: 900 }).catch(() => false)
+            if (!visible) continue
             const clicked = await humanClickLocator(page, locator, `direction: ${selector}`)
             if (clicked) {
                 executed = true
@@ -818,7 +919,7 @@ export class KpiSkills {
             }
 
             */
-            await this.restorePlacePageAfterDirection(page, beforeUrl, actions)
+            await this.restorePlacePageAfterDirection(page, beforeUrl, actions, options.placeUrl || beforeUrl)
 
             // Post-action: natural mouse drift
             const viewport = page.viewportSize()
@@ -907,8 +1008,13 @@ export class KpiSkills {
             'input[aria-label*="origin" i]',
             'input[aria-label*="start" i]',
             'input[aria-label*="xuat phat" i]',
+            'input[aria-label*="Xuất phát" i]',
+            'input[aria-label*="điểm bắt đầu" i]',
             'input[aria-label*="diem bat dau" i]',
+            'input[placeholder*="Starting point" i]',
+            'input[placeholder*="điểm bắt đầu" i]',
             'div.tactile-searchbox-input input',
+            'div[role="dialog"] input[type="text"]',
         ]
 
         for (const selector of selectors) {
@@ -974,27 +1080,99 @@ export class KpiSkills {
         }
     }
 
+    private async isPlaceActionsVisible(page: Page): Promise<boolean> {
+        const selectors = [
+            'button[data-item-id="directions"]',
+            'a[data-item-id="directions"]',
+            'button[data-item-id^="phone"]',
+            'a[data-item-id="phone"]',
+            'a[data-item-id="authority"]',
+            'button[aria-label*="Directions" i]',
+            'button[aria-label*="Chỉ đường" i]',
+            'h1.DUwDvf',
+            'h1.fontHeadlineLarge',
+        ]
+        for (const selector of selectors) {
+            const visible = await page.locator(selector).first().isVisible({ timeout: 500 }).catch(() => false)
+            if (visible) return true
+        }
+        return false
+    }
+
+    private normalizeMapsPlaceUrl(url: string): string {
+        return normalizeMapsPlaceUrl(url)
+    }
+
+    private isBareMapsViewportUrl(url: string): boolean {
+        return isBareMapsViewportUrl(url)
+    }
+
     private async restorePlacePageAfterDirection(
         page: Page,
         beforeUrl: string,
-        actions: string[]
+        actions: string[],
+        preferredPlaceUrl?: string
     ): Promise<void> {
         try {
-            await page.keyboard.press('Escape').catch(() => {})
-            await humanDelay(500, 1000)
+            // Close directions UI first (Escape often returns to place panel without hard navigation).
+            for (let i = 0; i < 2; i++) {
+                await page.keyboard.press('Escape').catch(() => {})
+                await humanDelay(350, 700)
+            }
+
+            if (await this.isPlaceActionsVisible(page)) {
+                actions.push('direction_place_actions_still_visible')
+                return
+            }
 
             const currentUrl = page.url()
             const hasDirectionsUi = await page.locator(
-                'input[aria-label*="origin" i], input[aria-label*="Starting" i], input[aria-label*="Xuất phát" i], div[data-trip-id]'
+                'input[aria-label*="origin" i], input[aria-label*="Starting" i], input[aria-label*="Xuất phát" i], input[aria-label*="điểm bắt đầu" i], div[data-trip-id], div[data-trip-index]'
             ).count().catch(() => 0)
-            const shouldRestore = beforeUrl.includes('/maps')
-                && (currentUrl !== beforeUrl || currentUrl.toLowerCase().includes('/dir') || hasDirectionsUi > 0)
+            const onBareViewport = this.isBareMapsViewportUrl(currentUrl)
+            const shouldRestore = currentUrl.toLowerCase().includes('/dir')
+                || hasDirectionsUi > 0
+                || onBareViewport
+                || !(await this.isPlaceActionsVisible(page))
 
             if (!shouldRestore) return
 
-            await page.goto(beforeUrl, { waitUntil: 'commit', timeout: 10000 }).catch(() => {})
-            await humanDelay(1000, 2000)
-            actions.push('direction_restored_place_context')
+            // Prefer known place URL (campaign location) over pre-click URL, because warm-up can leave a bare @lat,lng viewport.
+            const candidates = [
+                preferredPlaceUrl,
+                beforeUrl,
+            ]
+                .map(u => this.normalizeMapsPlaceUrl(u || ''))
+                .filter(u => !!u && u.includes('/maps'))
+
+            // Deduplicate while preserving order.
+            const uniqueCandidates: string[] = []
+            for (const c of candidates) {
+                if (!uniqueCandidates.includes(c)) uniqueCandidates.push(c)
+            }
+
+            for (const candidate of uniqueCandidates) {
+                // Skip bare viewport URLs; they will not restore phone/website/direction actions.
+                if (this.isBareMapsViewportUrl(candidate)) continue
+                await page.goto(candidate, { waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {})
+                await humanDelay(900, 1600)
+                if (await this.isPlaceActionsVisible(page)) {
+                    actions.push('direction_restored_place_context')
+                    return
+                }
+            }
+
+            // Last chance: goBack a couple of times then check actions.
+            for (let i = 0; i < 2; i++) {
+                await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {})
+                await humanDelay(700, 1200)
+                if (await this.isPlaceActionsVisible(page)) {
+                    actions.push('direction_restored_via_goback')
+                    return
+                }
+            }
+
+            actions.push('direction_restore_context_failed')
         } catch {
             actions.push('direction_restore_context_failed')
         }
