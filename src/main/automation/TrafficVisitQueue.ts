@@ -667,7 +667,7 @@ export function buildTrafficVisitSeedItems(params: {
     let visitIndex = 0
     for (let round = 1; round <= visitsPerLocation; round++) {
         for (let li = 0; li < locations.length; li++) {
-            const accountId = pool[(round + li - 1) % pool.length] ?? null
+            const accountId = pool[visitIndex % pool.length] ?? null
             items.push({
                 visitIndex,
                 maxAttempts,

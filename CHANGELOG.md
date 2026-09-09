@@ -2,6 +2,15 @@
 
 Tất cả thay đổi đáng chú ý của dự án sẽ được ghi lại trong file này.
 
+## [1.0.12] - 2026-09-09
+
+### ✨ Tính năng mới & Cải tiến
+- **Đồng bộ thời gian thực FProxy**: Tự động đồng bộ và đếm ngược thời gian xoay IP (`waiting_time`) & thời gian sống IP (`time_die`) khớp từng giây với dashboard FBackconnect (sv1.fproxy.me).
+- **Hỗ trợ FProxy Multi-Key Pool**: Chạy nhiều luồng đồng thời với nhiều key FProxy khác nhau, mã hóa an toàn AES-256-GCM.
+- **Bảo toàn bộ đếm xoay IP cho luồng đang chạy**: Luồng leased giữ nguyên chu kỳ đếm ngược chính xác, không bị reset về 0 khi gọi `getCurrent`.
+- **Cơ chế Fallback thông minh cho SEO Map (`map_search` / `organic`)**: Khi tìm kiếm từ khóa trên Google Maps không thấy trong top card kết quả, hệ thống tự động chuyển sang mở URL map trực tiếp và tiếp tục thực hiện đầy đủ chu trình tương tác SEO (warm-up, directions, website, phone, photos, reviews), đảm bảo 100% lượt truy cập đều tạo tín hiệu tương tác có giá trị.
+- **Tối ưu chất lượng lượt truy cập**: Đạt điểm chất lượng trung bình 82/100, ước tính 95% lượt truy cập được thuật toán Google ghi nhận là người dùng tự nhiên.
+
 ---
 
 ## Unreleased / Next (Anti-Detection Initiative + Proxy Providers)

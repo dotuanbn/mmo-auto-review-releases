@@ -45,6 +45,10 @@ import {
 } from '../components/ui/surface'
 import { TrafficAuditPanel } from '../components/traffic'
 import {
+    FProxyCapacityNotice,
+    FProxyRuntimePoolPanel,
+} from '../components/proxy/FProxyRuntimePoolPanel'
+import {
     normalizeWebSeoTargetUrl,
     parseWebSeoKeywords,
     resolveWebSeoTarget,
@@ -202,6 +206,10 @@ interface ThreadDetail {
     currentKeyword?: string
     progress: number
     proxyInfo?: string
+    proxyIpExpiresAt?: number | null
+    proxyRotateAt?: number | null
+    visitSoftDeadlineAt?: number | null
+    timingLabel?: string
 }
 
 interface LiveStatus {
@@ -215,6 +223,7 @@ interface LiveStatus {
     totalVisits: number
     failedVisits: number
     activeThreads: number
+    threadsTotal: number
     threads: ThreadDetail[]
     effectiveNetworkMode?: 'direct' | 'fproxy' | 'static_proxy'
     networkState?: {
@@ -334,6 +343,7 @@ interface RuntimeStatusPayload {
     totalVisits?: number
     failedVisits?: number
     activeThreads?: number
+    threadsTotal?: number
     threads?: ThreadDetail[]
     effectiveNetworkMode?: 'direct' | 'fproxy' | 'static_proxy'
     networkState?: LiveStatus['networkState']
@@ -453,6 +463,50 @@ function formatCursorAction(value: string): string {
     return normalized
 }
 
+
+function formatThreadCountdown(totalSeconds: number): string {
+    const safe = Math.max(0, Math.floor(totalSeconds))
+    const m = Math.floor(safe / 60)
+    const s = safe % 60
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+
+function getThreadTimingNote(thread: ThreadDetail, nowMs: number): string {
+    if (thread.status === 'waiting' && thread.proxyRotateAt) {
+        const left = Math.max(0, Math.ceil((thread.proxyRotateAt - nowMs) / 1000))
+        // waiting_time only; ignore mirrored IP-life values (~30 min).
+        if (left > 300) {
+            return 'Waiting for proxy key...'
+        }
+        return left > 0
+            ? `Waiting for proxy rotation... ${left}s remaining`
+            : 'Proxy ready — rotating now...'
+    }
+    if (thread.currentAction && /Waiting for proxy rotation/i.test(thread.currentAction)) {
+        return thread.currentAction
+    }
+    // During visiting: prioritize live proxy timers (Xoay IP con & IP con) so it mirrors FProxy dashboard exactly.
+    if (thread.proxyRotateAt || thread.proxyIpExpiresAt) {
+        const rotateLeft = thread.proxyRotateAt ? Math.max(0, Math.ceil((thread.proxyRotateAt - nowMs) / 1000)) : 0
+        const ipLeft = thread.proxyIpExpiresAt ? Math.max(0, Math.ceil((thread.proxyIpExpiresAt - nowMs) / 1000)) : 0
+        const trustedRotate = rotateLeft > 0 && rotateLeft <= 300
+        if (trustedRotate && ipLeft > 0) {
+            return `Xoay IP con ${formatThreadCountdown(rotateLeft)} · IP con ${formatThreadCountdown(ipLeft)}`
+        }
+        if (trustedRotate) {
+            return `Xoay IP con ${formatThreadCountdown(rotateLeft)}`
+        }
+        if (ipLeft > 0) {
+            return `IP con ${formatThreadCountdown(ipLeft)}`
+        }
+    }
+    if (thread.visitSoftDeadlineAt) {
+        const left = Math.max(0, Math.ceil((thread.visitSoftDeadlineAt - nowMs) / 1000))
+        if (left > 0) return `Visit budget left ${formatThreadCountdown(left)}`
+    }
+    return (thread.timingLabel || '').trim()
+}
+
 function normalizeLiveStatus(payload: RuntimeStatusPayload | null | undefined): LiveStatus {
     const fallbackNetworkMode = payload?.networkState?.mode
     const useProxySetting = payload?.networkState?.useProxySetting
@@ -471,6 +525,7 @@ function normalizeLiveStatus(payload: RuntimeStatusPayload | null | undefined): 
         totalVisits: Number(payload?.totalVisits || 0),
         failedVisits: Number(payload?.failedVisits || 0),
         activeThreads: Number(payload?.activeThreads || 0),
+        threadsTotal: Number(payload?.threadsTotal || payload?.activeThreads || 0),
         threads: Array.isArray(payload?.threads) ? payload!.threads : [],
         effectiveNetworkMode,
         networkState: payload?.networkState
@@ -1222,7 +1277,11 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
     onRefresh: () => void
 }) {
     const { t } = useI18n()
-    const [fproxyInfo, setFproxyInfo] = useState<{ ip: string; port: string; location: string; expiresIn: number; user: string; nextRotateIn: number; autoRotate: boolean } | null>(null)
+    const [nowMs, setNowMs] = useState(() => Date.now())
+    useEffect(() => {
+        const timer = setInterval(() => setNowMs(Date.now()), 1000)
+        return () => clearInterval(timer)
+    }, [])
     const lastThreadActionRef = useRef<Record<number, string>>({})
     const [cursorClickVersion, setCursorClickVersion] = useState<Record<number, number>>({})
     const effectiveMode = status?.effectiveNetworkMode || status?.networkState?.mode || 'direct'
@@ -1245,25 +1304,6 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
             setCursorClickVersion(nextVersions)
         }
     }, [status?.threads])
-
-    // Poll FProxy info every 5 seconds when campaign is running or paused (to keep timer display in sync on resume)
-    useEffect(() => {
-        if ((!status?.isRunning && !status?.isPaused) || effectiveMode !== 'fproxy') {
-            setFproxyInfo(null)
-            return
-        }
-        const fetchInfo = async () => {
-            try {
-                const info = await (window as any).electronAPI.fproxy.getInfo()
-                setFproxyInfo(info)
-            } catch {
-                setFproxyInfo(null)
-            }
-        }
-        fetchInfo()
-        const interval = setInterval(fetchInfo, 5000)
-        return () => clearInterval(interval)
-    }, [status?.isRunning, status?.isPaused, effectiveMode])
 
     const isMonitorActive = !!(status && (status.isRunning || status.isPaused))
 
@@ -1333,48 +1373,28 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                 <ProgressBar value={progress} tone="emerald" />
             </Panel>
 
-            {/* Proxy Status Banner */}
-            <Panel tone={effectiveMode === 'fproxy' ? 'emerald' : effectiveMode === 'static_proxy' ? 'cyan' : 'slate'} className="p-3 flex items-center gap-3">
-                <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${effectiveMode === 'fproxy' ? 'bg-emerald-100' : effectiveMode === 'static_proxy' ? 'bg-cyan-100' : 'bg-[#f4f1fa]'}`}>
-                    <Globe className={`w-4 h-4 ${effectiveMode === 'fproxy' ? 'text-emerald-600' : effectiveMode === 'static_proxy' ? 'text-cyan-600' : 'text-[#908a9e]'}`} />
-                </div>
-                {effectiveMode === 'fproxy' ? (
-	                    <div className="max-h-72 overflow-y-auto">
-                        <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-emerald-700 text-sm font-semibold">Proxy đang hoạt động</span>
-                            <Badge tone="emerald">FProxy</Badge>
-                            {fproxyInfo?.autoRotate && (
-                                <Badge tone="cyan">Auto-Rotate</Badge>
-                            )}
-                        </div>
-                        <div className="flex items-center gap-3 mt-1 text-xs flex-wrap">
-                            <span className="text-[#17171f] font-mono">{fproxyInfo?.ip || '...'}:{fproxyInfo?.port || '...'}</span>
-                            <span className="text-[#908a9e]">-</span>
-                            <span className="text-cyan-600">{fproxyInfo?.location || '...'}</span>
-                            <span className="text-[#908a9e]">-</span>
-                            <span className={`${(fproxyInfo?.expiresIn || 0) > 60 ? 'text-emerald-600' : 'text-amber-600'}`}>
-                                {Math.floor((fproxyInfo?.expiresIn || 0) / 60)}:{String((fproxyInfo?.expiresIn || 0) % 60).padStart(2, '0')}
-                            </span>
-                            {fproxyInfo?.autoRotate && (fproxyInfo?.nextRotateIn || 0) > 0 && (
-                                <>
-                                    <span className="text-[#908a9e]">-</span>
-                                    <span className={`${(fproxyInfo?.nextRotateIn || 0) > 30 ? 'text-[#735bd6]' : 'text-amber-600 animate-pulse'}`}>
-                                        Rotate {Math.floor((fproxyInfo?.nextRotateIn || 0) / 60)}:{String((fproxyInfo?.nextRotateIn || 0) % 60).padStart(2, '0')}
-                                    </span>
-                                </>
-                            )}
-                        </div>
+            {/* Proxy Status */}
+            {effectiveMode === 'fproxy' ? (
+                <FProxyRuntimePoolPanel
+                    active={isMonitorActive}
+                    requestedThreads={status.threadsTotal}
+                />
+            ) : (
+                <Panel tone={effectiveMode === 'static_proxy' ? 'cyan' : 'slate'} className="flex items-center gap-3 p-3">
+                    <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${
+                        effectiveMode === 'static_proxy' ? 'bg-cyan-100' : 'bg-[#f4f1fa]'
+                    }`}>
+                        <Globe className={`h-4 w-4 ${
+                            effectiveMode === 'static_proxy' ? 'text-cyan-600' : 'text-[#908a9e]'
+                        }`} />
                     </div>
-	                ) : (
-                    <div className="flex-1">
-	                        <span className="text-[#5f5a6d] text-sm">
-	                            {effectiveMode === 'static_proxy'
-	                                ? `Proxy tinh dang hoat dong${status.networkState?.proxyInfo ? `: ${status.networkState.proxyInfo}` : ''}`
-	                                : 'Khong co proxy -- Ket noi truc tiep'}
-	                        </span>
-                    </div>
-                )}
-            </Panel>
+                    <span className="text-sm text-[#5f5a6d]">
+                        {effectiveMode === 'static_proxy'
+                            ? `Proxy tinh dang hoat dong${status.networkState?.proxyInfo ? `: ${status.networkState.proxyInfo}` : ''}`
+                            : 'Khong co proxy -- Ket noi truc tiep'}
+                    </span>
+                </Panel>
+            )}
 
             {/* Thread Status */}
             <SectionPanel icon={Users} title={t('traffic.activeThreads')} tone="violet">
@@ -1409,6 +1429,17 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                                         </>
                                     )}
                                 </div>
+                                {(() => {
+                                    const note = getThreadTimingNote(thread, nowMs)
+                                    if (!note) return null
+                                    const waiting = thread.status === 'waiting'
+                                    return (
+                                        <div className={`flex items-center gap-2 text-xs mt-1 font-mono tabular-nums ${waiting ? 'text-amber-700' : 'text-[#735bd6]'}`}>
+                                            <Clock className="w-3 h-3 shrink-0" />
+                                            <span>{note}</span>
+                                        </div>
+                                    )
+                                })()}
                                 {thread.proxyInfo && (
                                     <div className="flex items-center gap-2 text-xs mt-1">
                                         <span className="text-emerald-600">Proxy:</span>
@@ -2470,6 +2501,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             />
                         </div>
                     </div>
+                    <FProxyCapacityNotice threads={threadsCount} />
 
                     {/* Delay Settings */}
                     <div className="grid grid-cols-2 gap-4">

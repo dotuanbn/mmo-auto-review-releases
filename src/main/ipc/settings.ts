@@ -757,12 +757,18 @@ export function registerSettingsHandlers() {
         return maskSettingsForRenderer(settings)
     }))
 
-    // Save all settings at once — unknown keys rejected; extra disk keys preserved
+    // Save all settings at once — unknown keys stripped before strict parse; extra disk keys preserved
     // Secret semantics: mask = keep, empty = clear, other = replace+encrypt
     // Path semantics: dataDir / analyticsKeyFilePath share guards with settings:set
     ipcMain.handle('settings:saveAll', withIpcValidation('settings:saveAll', async (_event, newSettings: unknown) => {
         return withSettingsWrite(async () => {
-            const patch = parseIpcPayload('settings:saveAll', settingsPatchSchema, newSettings)
+            // Strip unknown keys first so legacy UI/disk extras (googleOAuth*, geminiApiKey)
+            // never fail strict schema validation. Known keys are still schema-checked.
+            const incoming = (newSettings && typeof newSettings === 'object' && !Array.isArray(newSettings))
+                ? (newSettings as Record<string, unknown>)
+                : {}
+            const stripped = pickWhitelistedPatch(incoming)
+            const patch = parseIpcPayload('settings:saveAll', settingsPatchSchema, stripped)
             const safePatch = pickWhitelistedPatch(patch as Record<string, unknown>)
             const pathGuarded = applySettingsPathGuards('settings:saveAll', safePatch)
             const current = loadSettings()

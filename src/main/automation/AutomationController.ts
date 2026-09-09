@@ -17,6 +17,10 @@ import { browserService } from './BrowserService'
 import { googleAuthHandler } from './GoogleAuthHandler'
 import { googleMapsReviewHandler } from './GoogleMapsReviewHandler'
 import { proxyService } from '../services/ProxyService'
+import {
+    fproxyPoolService,
+    type FProxyLease,
+} from '../services/FProxyPoolService'
 import { getDatabase } from '../database'
 import * as schema from '../database/schema'
 import { eq } from 'drizzle-orm'
@@ -189,6 +193,7 @@ class AutomationController {
     private threads: ThreadState[] = []
     private currentCampaignId?: number
     private mainWindow: BrowserWindow | null = null
+    private readonly proxyAcquireControllers = new Set<AbortController>()
 
     constructor() {
         this.initProfilesPath()
@@ -255,9 +260,31 @@ class AutomationController {
             }
 
             const globalSettings = loadSettings()
+            let threadCount = globalSettings.maxConcurrentBrowsers || 3
+            if (globalSettings.useProxy === true) {
+                try {
+                    const poolSnapshot = await fproxyPoolService.getSnapshot()
+                    const enabledSlots = poolSnapshot.slots.filter(slot => slot.enabled && slot.hasSecret).length
+                    if (enabledSlots > 0 && poolSnapshot.policy.strictUnique) {
+                        const before = threadCount
+                        threadCount = Math.max(1, Math.min(threadCount, enabledSlots))
+                        if (threadCount !== before) {
+                            logToFile(
+                                `[loadConfig] FProxy strict pool capacity clamp threads ${before} -> ${threadCount} ` +
+                                `(enabledSlots=${enabledSlots})`,
+                            )
+                        }
+                    }
+                } catch (error) {
+                    logToFile(
+                        `[loadConfig] FProxy pool capacity check skipped: ` +
+                        `${error instanceof Error ? error.message : String(error)}`,
+                    )
+                }
+            }
 
             this.config = {
-                threads: globalSettings.maxConcurrentBrowsers || 3,
+                threads: threadCount,
                 maxReviewsPerAccountPerDay: parseInt(getValue('max_reviews_per_day', '5')),
                 delayMin: parseInt(getValue('delay_min', '30')),
                 delayMax: parseInt(getValue('delay_max', '120')),
@@ -272,7 +299,7 @@ class AutomationController {
             // Also update job queue config
             await jobQueue.loadConfig()
 
-            logToFile(`[loadConfig] Config loaded. profilesPath: ${this.config.profilesPath}, headless: ${this.config.headless}`)
+            logToFile(`[loadConfig] Config loaded. profilesPath: ${this.config.profilesPath}, headless: ${this.config.headless}, threads: ${this.config.threads}`)
         } catch (error) {
             console.error('[AutomationController] Failed to load config:', error)
         }
@@ -868,6 +895,8 @@ class AutomationController {
         thread.currentJobId = job.id
         this.sendStatus()
 
+        let proxyLease: FProxyLease | null = null
+        let proxyLeaseAbortHandler: (() => void) | null = null
         try {
             const account = await accountService.getById(job.accountId)
 
@@ -978,11 +1007,40 @@ class AutomationController {
             thread.accountEmail = account.email
             this.sendStatus()
 
+            const globalSettings = loadSettings()
             let proxy = null
             if (this.config.proxyMode !== 'none') {
-                const proxies = await proxyService.getActive()
-                if (proxies.length > 0) {
-                    proxy = proxies[thread.id % proxies.length]
+                const poolSnapshot = await fproxyPoolService.getSnapshot()
+                const hasEnabledPool = globalSettings.useProxy === true
+                    && poolSnapshot.slots.some(slot => slot.enabled && slot.hasSecret)
+
+                if (hasEnabledPool) {
+                    const acquireController = new AbortController()
+                    this.proxyAcquireControllers.add(acquireController)
+                    try {
+                        proxyLease = await fproxyPoolService.acquire({
+                            owner: {
+                                kind: 'automation_job',
+                                id: `campaign-${job.campaignId ?? 0}:account-${account.id}`,
+                                threadId: thread.id,
+                            },
+                            timeoutMs: 180_000,
+                            minRemainingMs: 60_000,
+                            signal: acquireController.signal,
+                        })
+                    } finally {
+                        this.proxyAcquireControllers.delete(acquireController)
+                    }
+                    proxy = proxyLease.proxySnapshot
+                    logToFile(
+                        `[Thread ${thread.id}] FProxy slot ${proxyLease.slotId} leased ` +
+                        `(egress ${proxyLease.observedIp})`,
+                    )
+                } else {
+                    const proxies = await proxyService.getActive()
+                    if (proxies.length > 0) {
+                        proxy = proxies[thread.id % proxies.length]
+                    }
                 }
             }
 
@@ -1004,8 +1062,6 @@ class AutomationController {
             logToFile(`[Thread ${thread.id}] Starting job ${job.id} for ${account.email}`)
             logToFile(`[Thread ${thread.id}] Profile: ${profilePath}`)
 
-            const globalSettings = loadSettings()
-
             const browserConfig = {
                 viewport: globalSettings.randomizeViewport ? browserService.getRandomViewport() : { width: 1366, height: 768 },
                 userAgent: globalSettings.randomizeUserAgent ? browserService.getRandomUserAgent() : undefined,
@@ -1025,6 +1081,15 @@ class AutomationController {
             thread.contextId = globalSettings.saveProfiles !== false
                 ? await browserService.createContext(browserConfig)
                 : await browserService.createEphemeralContext(browserConfig)
+            if (proxyLease) {
+                proxyLeaseAbortHandler = () => {
+                    const contextId = thread.contextId
+                    if (contextId != null) {
+                        void browserService.closeContext(contextId).catch(() => { })
+                    }
+                }
+                proxyLease.signal.addEventListener('abort', proxyLeaseAbortHandler, { once: true })
+            }
             thread.context = browserService.getContext(thread.contextId)
             let page = browserService.getPage(thread.contextId)
             if (!thread.context || !page) {
@@ -1140,6 +1205,10 @@ class AutomationController {
             } else if (thread.context) {
                 await thread.context.close().catch(() => { })
             }
+            if (proxyLease && proxyLeaseAbortHandler) {
+                proxyLease.signal.removeEventListener('abort', proxyLeaseAbortHandler)
+            }
+            await proxyLease?.release('automation_job_finished')
 
             thread.status = 'idle'
             thread.currentJobId = undefined
@@ -1611,6 +1680,7 @@ class AutomationController {
     // Pause automation
     async pause(): Promise<void> {
         this.paused = true
+        this.abortPendingProxyAcquires()
         if (this.currentCampaignId) {
             const db = getDatabase()
             await db.update(schema.campaigns)
@@ -1639,6 +1709,7 @@ class AutomationController {
     private async finishCampaignNaturally(): Promise<void> {
         this.shouldStop = true
         this.running = false
+        this.abortPendingProxyAcquires()
 
         for (const thread of this.threads) {
             if (thread.contextId != null) {
@@ -1666,6 +1737,7 @@ class AutomationController {
         console.log('[AutomationController] Stopping...')
         this.shouldStop = true
         this.running = false
+        this.abortPendingProxyAcquires()
 
         for (const thread of this.threads) {
             if (thread.contextId != null) {
@@ -1697,6 +1769,13 @@ class AutomationController {
 
     isPaused(): boolean {
         return this.paused
+    }
+
+    private abortPendingProxyAcquires(): void {
+        for (const controller of Array.from(this.proxyAcquireControllers)) {
+            controller.abort()
+        }
+        this.proxyAcquireControllers.clear()
     }
 }
 

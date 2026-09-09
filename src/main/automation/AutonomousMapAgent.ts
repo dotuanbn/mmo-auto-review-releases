@@ -13,7 +13,7 @@
  */
 
 import { Page } from 'playwright'
-import { kpiSkills, KpiAvailability, KpiSkillResult, MapKpiType } from './KpiSkills'
+import { kpiSkills, KpiAvailability, KpiSkillResult, MapKpiType, isBareMapsViewportUrl, normalizeMapsPlaceUrl } from './KpiSkills'
 import { HumanBehavior } from './HumanBehavior'
 import { DOMUtils } from './DOMUtils'
 import { moveCursor } from './BrowserCursorOverlay'
@@ -179,7 +179,7 @@ export function detectBusinessType(domText: string, url: string): BusinessType {
 
 export class AutonomousMapAgent {
 
-    private static readonly MIN_SESSION_DURATION_MS = 75_000  // Google filters <30s; Maps KPI Optimization target 75s session
+    private static readonly MIN_SESSION_DURATION_MS = 55_000  // Stay above Google short-visit filter while fitting FProxy ~2m IP windows
     private static readonly MAX_CONTEXT_RECOVERY_ATTEMPTS = 3
 
     // -----------------------------------------------------------------------
@@ -226,38 +226,21 @@ export class AutonomousMapAgent {
             detail: strategyLabel,
         })
 
-        const kpiAvailability = await kpiSkills.detectAvailableKpis(page)
-        const hasActionableKpi = kpiAvailability.some(item => item.available)
-        if (!hasActionableKpi) {
-            for (const item of kpiAvailability) {
-                this.pushAction(actions, {
-                    action: `kpi_skip_${item.type}`,
-                    success: true,
-                    source: 'kpi_skill',
-                    detail: item.detail,
-                })
-            }
-            this.pushAction(actions, {
-                action: 'kpi_no_actionable_info',
-                success: true,
-                source: 'kpi_skill',
-                detail: 'No phone, website, or directions action available on this map page',
-            })
-            onStatusUpdate('No actionable KPI info on this map page')
+        let kpiAvailability = await kpiSkills.detectAvailableKpis(page)
+        let hasActionableKpi = kpiAvailability.some(item => item.available)
 
-            return {
-                actionsPerformed: actions,
-                kpisExecuted: kpiResults,
-                totalDurationMs: Date.now() - sessionStart,
-                businessType,
-                strategyUsed: `${strategyLabel} | skipped:no_actionable_kpi`,
-            }
+        if (!hasActionableKpi) {
+            // Attempt to restore place detail panel if it hasn't fully rendered yet
+            await this.ensureTargetContext(page, locationUrl, threadId, actions)
+            kpiAvailability = await kpiSkills.detectAvailableKpis(page)
+            hasActionableKpi = kpiAvailability.some(item => item.available)
         }
 
         if (!shouldStop()) {
             onStatusUpdate('Reading map details before KPI...')
-            // Maps KPI Optimization: pre-KPI warm-up now business-type aware, 3-5 actions
+            // Maps KPI Optimization: pre-KPI warm-up business-type aware (3-5 actions)
             await this.executeWarmUp(page, threadId, actions, shouldStop, businessType)
+            await this.ensureTargetContext(page, locationUrl, threadId, actions)
         }
 
         if (!shouldStop()) {
@@ -274,8 +257,9 @@ export class AutonomousMapAgent {
             await this.executeCoolDown(page, threadId, actions, shouldStop, businessType)
         }
 
+        // Only pad when we still have budget; FProxy IP windows must not be overstayed.
         const remainingMs = AutonomousMapAgent.MIN_SESSION_DURATION_MS - (Date.now() - sessionStart)
-        if (remainingMs > 5000 && !shouldStop()) {
+        if (remainingMs > 5000 && remainingMs < 25_000 && !shouldStop()) {
             onStatusUpdate(`Keeping session natural for ${Math.round(remainingMs / 1000)}s...`)
             await this.executeTimePadding(page, threadId, remainingMs, actions, shouldStop)
         }
@@ -350,10 +334,12 @@ export class AutonomousMapAgent {
         businessType: BusinessType = 'generic'
     ): Promise<void> {
         // Maps KPI Optimization (4): business-type aware warm-up 3-5 actions (pre-KPI)
+        // Prefer lighter actions first so first-visit Directions still has a stable place panel.
         const warmUpActions: WarmUpAction[] = this.getBusinessAwareWarmActions(businessType)
+            .filter((action) => action !== 'browse_photos_deep')
 
-        // Execute 3-5 warm-up actions for richer pre-KPI context
-        const count = randomInt(3, 5)
+        // Compact warm-up so Directions/KPI finish inside FProxy IP lifetime (~2 min).
+        const count = randomInt(2, 3)
         for (let i = 0; i < count && !shouldStop(); i++) {
             const action = warmUpActions[i % warmUpActions.length]
             const start = Date.now()
@@ -377,7 +363,8 @@ export class AutonomousMapAgent {
                         success = await this.browsePhotosPreview(page, threadId)
                         break
                     case 'browse_photos_deep':
-                        success = await this.browsePhotosDeep(page, threadId)
+                        // Reserved for cool-down; deep lightbox often leaves bare viewport on first visit.
+                        success = await this.browsePhotosPreview(page, threadId)
                         break
                     case 'check_hours':
                         success = await this.recheckHours(page, threadId)
@@ -395,6 +382,12 @@ export class AutonomousMapAgent {
             } catch (err) {
                 log(`T${threadId}: Warm-up action "${action}" error: ${err}`)
                 await this.recoverFromError(page, threadId)
+            }
+
+            // Always dismiss overlays after photo/nearby warm-ups before next action/KPI.
+            if (action.includes('photos') || action === 'nearby_glance') {
+                await page.keyboard.press('Escape').catch(() => {})
+                await delay(250, 500)
             }
 
             this.pushAction(actions, {
@@ -485,7 +478,7 @@ export class AutonomousMapAgent {
             let result: KpiSkillResult
 
             try {
-                result = await kpiSkills.executeKpi(page, threadId, kpiType)
+                result = await kpiSkills.executeKpi(page, threadId, kpiType, { placeUrl: targetMapUrl })
             } catch (err) {
                 log(`T${threadId}: KPI "${kpiType}" threw: ${err}`)
                 result = {
@@ -495,6 +488,13 @@ export class AutonomousMapAgent {
                     detail: `Error: ${err}`,
                     durationMs: Date.now() - start,
                 }
+                await this.recoverFromError(page, threadId)
+            }
+
+
+            if (!result.executed) {
+                // Dismiss overlays / wrong panels so the next KPI does not click blind.
+                await this.recoverFromError(page, threadId)
             }
 
             const durationMs = Date.now() - start
@@ -526,7 +526,7 @@ export class AutonomousMapAgent {
                 await delay(2000, 3500)
 
                 try {
-                    const retryResult = await kpiSkills.executeKpi(page, threadId, kpiType)
+                    const retryResult = await kpiSkills.executeKpi(page, threadId, kpiType, { placeUrl: targetMapUrl })
                     this.pushAction(actions, {
                         action: `kpi_retry_${kpiType}`,
                         success: retryResult.executed,
@@ -588,7 +588,7 @@ export class AutonomousMapAgent {
         const coolDownActions: CoolDownAction[] = this.getBusinessAwareCoolActions(businessType)
 
         // Execute 2-3 cool-down actions
-        const count = randomInt(2, 3)
+        const count = randomInt(1, 2)
         for (let i = 0; i < count && !shouldStop(); i++) {
             const action = coolDownActions[i % coolDownActions.length]
             const start = Date.now()
@@ -1185,6 +1185,21 @@ export class AutonomousMapAgent {
     // -----------------------------------------------------------------------
 
     /** Ensure the page is still on the target Google Maps place */
+    private isMapsPlaceContext(url: string): boolean {
+        const lower = (url || '').toLowerCase()
+        if (!(lower.includes('google.com/maps') || lower.includes('maps.google.'))) {
+            return false
+        }
+        // Bare map viewport is NOT a place context for KPI actions.
+        if (/\/maps\/@-?\d+(\.\d+)?,-?\d+(\.\d+)?/.test(lower) && !lower.includes('/maps/place/')) {
+            return false
+        }
+        if (lower.includes('/maps/place/')) return true
+        // Keep data place markers, but require not pure directions search landing.
+        if (lower.includes('!1s') || lower.includes('/maps/place')) return true
+        return false
+    }
+
     private async ensureTargetContext(
         page: Page,
         targetUrl: string,
@@ -1195,12 +1210,42 @@ export class AutonomousMapAgent {
 
         const currentUrl = page.url()
 
-        // Check if we're still on a Google Maps page
-        const isOnMaps = currentUrl.includes('google.com/maps')
-            || currentUrl.includes('maps.google.')
-        if (isOnMaps) return
+        const placeActionSelector = [
+            'button[data-item-id="directions"]',
+            'a[data-item-id="directions"]',
+            'a[data-item-id="authority"]',
+            'a[data-item-id="phone"]',
+            'button[data-item-id^="phone"]',
+            'button[aria-label*="Directions" i]',
+            'button[aria-label*="Chỉ đường" i]',
+            'h1.DUwDvf',
+            'h1.fontHeadlineLarge',
+        ].join(', ')
 
-        // Not on maps → try to recover
+        const hasPlaceActions = async (): Promise<boolean> => {
+            return page.locator(placeActionSelector).first()
+                .isVisible({ timeout: 700 }).catch(() => false)
+        }
+
+        // Only treat as on-target when place actions / place title are visible.
+        // Bare /maps/@lat,lng viewports look like Maps but break direction/phone/website KPIs.
+        if (await hasPlaceActions()) return
+
+        // Soft recovery first: Escape can close directions/photo overlays and reveal place panel.
+        for (let i = 0; i < 2; i++) {
+            await page.keyboard.press('Escape').catch(() => {})
+            await delay(250, 500)
+            if (await hasPlaceActions()) {
+                this.pushAction(actions, {
+                    action: 'context_recovery',
+                    success: true,
+                    source: 'recovery',
+                    detail: 'Recovered place actions via Escape',
+                })
+                return
+            }
+        }
+
         log(`T${threadId}: Off-target (${currentUrl.substring(0, 80)}). Recovering...`)
 
         // Try context resolver first
@@ -1216,7 +1261,7 @@ export class AutonomousMapAgent {
 
         if (resolved.handled) {
             await delay(300, 600)
-            if (page.url().includes('google.com/maps')) {
+            if (await hasPlaceActions()) {
                 this.pushAction(actions, {
                     action: 'context_recovery',
                     success: true,
@@ -1227,17 +1272,10 @@ export class AutonomousMapAgent {
             }
         }
 
-        // Fallback: press Escape
-        await page.keyboard.press('Escape').catch(() => {})
-        await delay(300, 600)
-
-        if (page.url().includes('google.com/maps')) return
-
-        // Fallback: goBack
+        // Fallback: goBack once (may return from directions UI)
         await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {})
         await delay(500, 1000)
-
-        if (page.url().includes('google.com/maps')) {
+        if (await hasPlaceActions()) {
             this.pushAction(actions, {
                 action: 'context_recovery',
                 success: true,
@@ -1247,15 +1285,25 @@ export class AutonomousMapAgent {
             return
         }
 
-        // Final fallback: navigate directly
+        // Final fallback: hard navigate to campaign place URL (not current bare viewport)
         try {
-            await page.goto(targetUrl, { waitUntil: 'commit', timeout: 15000 })
-            await delay(1000, 2000)
+            const placeTarget = normalizeMapsPlaceUrl(targetUrl)
+            const safeTarget = placeTarget && !isBareMapsViewportUrl(placeTarget) ? placeTarget : targetUrl
+            await page.goto(safeTarget, { waitUntil: 'domcontentloaded', timeout: 15000 })
+            await delay(1200, 2200)
+            // One more Escape in case place panel loads under an overlay.
+            if (!(await hasPlaceActions())) {
+                await page.keyboard.press('Escape').catch(() => {})
+                await delay(300, 600)
+            }
+            const ok = await hasPlaceActions()
             this.pushAction(actions, {
                 action: 'context_recovery',
-                success: true,
+                success: ok,
                 source: 'recovery',
-                detail: 'Recovered via direct navigation',
+                detail: ok
+                    ? 'Recovered via direct navigation to place URL'
+                    : 'Direct navigation did not restore place actions',
             })
         } catch (err) {
             log(`T${threadId}: Context recovery failed: ${err}`)

@@ -2,7 +2,7 @@
 
 **Status**: Active Strategy Document  
 **Created**: 2026-05-28  
-**Last Updated**: 2026-05-28  
+**Last Updated**: 2026-07-24
 **Owner**: Development Team (continuing from previous work)  
 **Project**: MMO Auto Review (mmo-auto-review)
 
@@ -79,7 +79,7 @@ This strategy is recorded permanently in the project memory so future developers
 
 ---
 
-## 3. Current State Assessment (as of 2026-05-28)
+## 3. Current State Assessment (updated 2026-07-24)
 
 ### 3.1 What We Already Do Well (Strengths)
 - **FingerprintService** — Consistent per-account fingerprints stored via `accounts.fingerprintId`. Covers UA, screen, WebGL vendor/renderer, timezone, languages, hardwareConcurrency, deviceMemory, basic canvas + audio noise.
@@ -92,13 +92,15 @@ This strategy is recorded permanently in the project memory so future developers
 - **Review generation** — Supports Spintax templates + optional AI generation (SimpleCampaignEngine).
 - **Review history logging** — `reviewHistory` table + traffic logs for analysis.
 - Basic account fields: `createdAt`, `lastUsed`, `totalReviews`, `lastCheckAt`.
+- **Account warmup core (Phase 2)** — Account schema, `AccountWarmupService`, `AccountWarmupEngine`, IPC/preload, Accounts UI, cooldown/daily caps, and runtime gates are implemented for Search, Maps, and YouTube.
+- **Per-account content style core (Phase 3)** — Stable style profiles and seeded generation now cover vocabulary, sentence length, formality, bounded typo/emoji behavior, similarity checks, and location context.
 
 ### 3.2 Critical Gaps (Prioritized)
 
 | Rank | Area                        | Current State                          | Risk Level | Notes |
 |------|-----------------------------|----------------------------------------|------------|-------|
-| 1    | Account Age & Warmup        | Only raw `createdAt` + review count    | **Critical** | No gradual ramp-up, no reputation score, new accounts treated same as old |
-| 2    | Review Content Quality      | Basic Spintax + generic AI             | **Critical** | No per-account style, no location-aware generation, too "perfect" |
+| 1    | Account Age & Warmup        | Core warmup engine, levels, history, cooldown, daily caps, and runtime gates implemented | **Critical** | Gmail executor, multi-day birth story/ramp, and controlled live-account validation remain |
+| 2    | Review Content Quality      | Per-account style profile/generator integrated and tested | **Critical** | Default-off, still base-text-led, not proven across every review path; photo/action correlation remains |
 | 3    | Advanced Fingerprint Depth  | Good basic coverage, shallow noise     | High       | No real font spoofing, weak WebGL/audio detail, no sensor spoofing |
 | 4    | Behavioral Depth            | Strong primitives, still too "clean"   | High       | Mouse/typing not fatigue-aware, no return-visitor modeling |
 | 5    | CDP / Stealth Artifacts     | Basic args only                        | High       | No advanced playwright-stealth / CDP patching |
@@ -122,7 +124,7 @@ This strategy is recorded permanently in the project memory so future developers
 
 ## 5. Phased Implementation Roadmap
 
-### Phase 0 — Documentation & Measurement (Current — 2026-05-28)
+### Phase 0 — Documentation & Measurement (Baseline — 2026-05-28)
 - [x] Create this strategy document
 - [ ] Build basic telemetry for fingerprint/behavior quality
 - [ ] Add "stealth score" logging per visit/review (optional, for research)
@@ -141,31 +143,34 @@ This strategy is recorded permanently in the project memory so future developers
 ### Phase 2 — Account Reputation & Warmup System (Critical)
 **Goal**: Make new accounts look like they have history.
 
-- New schema fields on `accounts`:
-  - `accountAgeDays` (computed or stored)
-  - `warmupLevel` (0–100)
-  - `reputationScore` (internal)
-  - `firstReviewDate`, `lastReviewDate`
-  - `warmupHistory` (JSON blob of simulated activities)
-- Warmup Engine: before allowing real reviews, new accounts must do "safe" activities (Gmail, YouTube, Search, Maps browsing) over multiple days/sessions.
-- Gradual review velocity ramp (e.g., 1 review every 3 days for first 10 days → increasing).
-- Account "birth story" simulation (light activity before first review).
+**Status (2026-07-24)**: Mostly implemented; core code and deterministic tests exist, but the full multi-service/multi-day roadmap is not complete.
+
+- [x] Account schema fields for warmup level/history, next warmup time, reputation/review dates, and style seed/profile.
+- [x] `AccountWarmupService` + `AccountWarmupEngine` with cooldown, maximum three sessions/day, and persisted progress.
+- [x] IPC/preload, Accounts UI, and runtime blocked/throttled/full gates.
+- [x] Executable warmup activities for Google Search, Maps browsing, and YouTube.
+- [x] Deterministic coverage for engine, service, runtime gate, IPC, and UI normalization.
+- [ ] Add a Gmail session executor and expose it through contracts/UI.
+- [ ] Complete the multi-day account birth story and gradual review-velocity ramp.
+- [ ] Validate long-running warmup with controlled live accounts; deterministic smoke does not prove provider behavior.
 
 ### Phase 3 — Intelligent Content Generation & Style Consistency (Critical)
 **Goal**: Reviews must sound like they come from the same real person over time.
 
-- Per-account writing profile (stored in DB or profile folder):
-  - Vocabulary fingerprint
-  - Average sentence length + variance
-  - Emoji frequency & style
-  - Formality level
-  - Common typo/grammar patterns
-- Context-aware review generator (location + time + account history + previous reviews for the same place)
-- Controlled imperfection engine (realistic typo injection at per-account rates)
-- Optional photo upload simulation (even low-quality or stock photos dramatically changes the signal)
-- Review text + actual pre-review actions correlation logging (for future ML or rule enforcement)
+**Status (2026-07-24)**: Substantially implemented; the style layer is integrated and tested, but it is not yet the single end-to-end generation path.
+
+- [x] Stable per-account writing profile and seed stored in the database.
+- [x] `ReviewStyleService` + `ReviewContentGenerator` for vocabulary, length, formality, bounded typo/emoji behavior, code-switching, similarity checks, and location context.
+- [x] Settings control and controller integration before review submission.
+- [x] Unit coverage for deterministic style generation and deduplication behavior.
+- [ ] Decide and document the safe enablement policy; the feature is currently default-off.
+- [ ] Replace base-text-led transformation with complete end-to-end generation where required.
+- [ ] Route every review engine through the same style/content pipeline.
+- [ ] Add photo/pre-review-action correlation logging and validation.
 
 ### Phase 4 — Session Orchestration, Velocity & Advanced Evasion (Advanced)
+**Status (2026-07-24)**: Mostly roadmap. Daily caps, cooldowns, and warmup-tier throttling are foundations, not completion of this phase.
+
 - Cross-account coordination detection & avoidance (global scheduler view)
 - Natural rest periods and "human vacation" simulation
 - Return-visitor behavior modeling (revisit same place after N days with different interaction pattern)
@@ -194,10 +199,10 @@ This strategy is recorded permanently in the project memory so future developers
 - Return visitor simulation in AutonomousMapAgent / Traffic engines.
 
 ### 6.3 Content Engine (Phase 3)
-- New service: `ReviewStyleService` + `ReviewContentGenerator`.
-- Store per-account style vector.
-- Generator takes: location, previous reviews by this account, time since last visit, business category, target rating.
-- Inject controlled noise (typos, repeated words, natural Vietnamese/English code-switching where realistic).
+- Implemented: `ReviewStyleService` + `ReviewContentGenerator`.
+- Implemented: stable per-account style profile/seed and bounded controlled imperfections.
+- Partially implemented: location and previous-review context; current controller integration still transforms a supplied base text.
+- Remaining: time-since-visit/business-category/target-rating context parity across every review path.
 
 ---
 
@@ -251,8 +256,10 @@ This document is the single source of truth for all future stealth-related work 
 - [ ] Phase 1 CDP stealth patcher module created
 - [ ] FingerprintService v2 with font + advanced noise
 - [ ] BehaviorProfile + fatigue modeling in HumanBehavior
-- [ ] Account warmup schema + service
-- [ ] Per-account review style storage + generator
+- [x] Account warmup schema + service + engine + IPC/UI/runtime gates
+- [ ] Phase 2 completion: Gmail executor, multi-day birth story/ramp, and controlled live QA
+- [x] Per-account review style storage + generator + controller integration
+- [ ] Phase 3 completion: enablement policy, end-to-end generation, all-path parity, and action/photo correlation
 - [ ] Unified stealth pipeline used by all engines (Review + Traffic + Agentic)
 - [ ] Stealth level UI exposed in Settings
 - [ ] Updated smoke tests with stealth scoring

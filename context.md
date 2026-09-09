@@ -1,30 +1,23 @@
 stack: Electron 28 + Vite 5 + React 19 + TypeScript + SQLite/Drizzle + Playwright
 structure: main=src/main; preload=src/preload; renderer=src/renderer/src; shared=src/shared; tests=tests
-conventions: strict IPC validation; public DTOs redact secrets; minimal diffs; comments in English; no any mới
-phase: production release hardening + operational durability complete
-verification: gate:quick pass; 845 tests pass; source/unpacked/NSIS smoke 23/23; NSIS+portable build pass on 2026-07-15
+conventions: strict IPC validation; public DTOs redact secrets; minimal diffs; comments in English; no any moi
+phase: v1.0.12; map search direct fallback & realtime timer parity release
+verification: 2026-09-09 55/55 test files pass (873 tests); typecheck pass; ready for release packaging
 ---
 recent_decisions:
-- [2026-07-15] Packaged smoke configures temp-only data root before runtime imports -> never touches real app data
-- [2026-07-15] Backup/restore requires RESTORE, checksums, SQLite integrity, pre-snapshot, and symlink-safe targets
-- [2026-07-15] Review submitting/unconfirmed intents require atomic manual reconciliation before retry/success
-- [2026-07-15] Traffic uses durable per-visit seed/claim/lease/retry/recovery with terminal-state counters
-- [2026-07-15] Release jobs depend on reusable quality gate and upload only after unpacked + NSIS smoke
+- [2026-08-28] Map search & organic search fallback cleanly navigates directly to map URL + executes full warm-up/KPI/cool-down
+- [2026-08-28] Thread timing card prioritizes live proxyRotateAt/proxyIpExpiresAt over internal watchdog buffer
+- [2026-08-28] Leased slot refresh preserves active rotate countdown when getCurrent returns 0
+- [2026-07-24] UI/runtime split: Xoay IP=waiting_time, IP con=time_die; visit budget uses rotate window only
+- [2026-07-24] Settings save whitelist-only + FProxy encrypted multi-key pool
 ---
 active_tasks:
-- [x] Durable Review JobQueue, crash recovery, atomic claim, terminal-state protection
-- [x] Harden Review auth/idempotency/photo/style and Browser/Profile/Proxy lifecycle
-- [x] Make Scheduler start/resume real automation with in-flight guard and retry backoff
-- [x] Add Warmup engine/UI/gates and crash-recovery operator banner
-- [x] Harden high-risk IPC boundaries and filesystem/profile paths
-- [x] Harden Website SEO flow, safe actions, URL security, quality metrics, presets, ETA, pause UX, and smoke coverage
-- [x] Fix stealth P0/P1 from Worker5 audit (double inject, UA desync, CDP CH, WebGL OS)
-- [x] Durable CAPTCHA metrics backend (IPC + SQLite + preload + unit tests)
-- [x] Wire solver metrics, image-grid provider chain, Settings dashboard, and Electron smoke coverage
-- [x] Add manual reconciliation UI for submitting/unconfirmed review intents
-- [x] Add packaged win-unpacked/NSIS smoke and make release workflow depend on quality gates
-- [x] Add user-facing backup/restore and compliance audit history
-- [x] Durable per-visit Traffic atomic claim/recovery (seed/claim/complete/pause/resume/stop)
-- [x] Add rollback parity for remaining JobQueue transitions
+- [x] Map search / organic search fallback to direct map navigation with full KPI engagement
+- [x] Fix leased slot refresh in FProxyPoolService
+- [x] Align Thread timer in Traffic UI to Xoay IP con & IP con
+- [x] Rebuild win-unpacked (2026-08-28 14:49)
+- [ ] User retest: live countdown parity with sv1.fproxy.me dashboard
+- [ ] Multi-IP same-map concurrent QA
+- [ ] Aeon first-visit Directions QA
 
-blockers: none
+blockers: User live retest; never store API keys in docs/memory/logs

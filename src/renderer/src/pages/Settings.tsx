@@ -11,7 +11,6 @@ import {
     Star,
     Car,
     Globe,
-    RotateCw,
     Trash2,
     AlertTriangle,
     Monitor,
@@ -43,8 +42,10 @@ import {
 } from '../components/ui/surface'
 import { useTheme } from '../contexts/ThemeContext'
 import { SETTINGS_SECRET_MASK } from '../../../shared/types'
+import { SETTINGS_KEYS, type SettingsKey } from '../../../shared/ipc-schemas'
 import { CaptchaMetricsPanel } from '../components/captcha'
 import { BackupRestorePanel, ComplianceAuditPanel } from '../components/backup'
+import { FProxyPoolSettings } from '../components/proxy/FProxyPoolSettings'
 
 interface AppSettings {
     // Browser
@@ -214,6 +215,39 @@ const DEFAULTS: AppSettings = {
     analyticsKeyFilePath: '',
 }
 
+function buildSettingsPatch(settings: AppSettings): Partial<Record<SettingsKey, string | number | boolean>> {
+    const patch: Partial<Record<SettingsKey, string | number | boolean>> = {}
+    for (const key of SETTINGS_KEYS) {
+        if (!Object.prototype.hasOwnProperty.call(settings, key)) continue
+        const value = settings[key as keyof AppSettings]
+        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            patch[key] = value
+        }
+    }
+    return patch
+}
+
+function buildRuntimePolicyPatch(settings: AppSettings) {
+    return {
+        captchaMode: settings.captchaMode,
+        captchaAutoSkipMaxStrikes: settings.captchaAutoSkipMaxStrikes,
+        captchaManualWaitSeconds: settings.captchaManualWaitSeconds,
+        queueConcurrency: settings.queueConcurrency,
+        queueIntervalMs: settings.queueIntervalMs,
+        networkRetryMax: settings.networkRetryMax,
+        uiRetryMax: settings.uiRetryMax,
+        logLevel: settings.logLevel,
+        ragEnabled: settings.ragEnabled,
+        ragTopK: settings.ragTopK,
+        ragMaxContextChars: settings.ragMaxContextChars,
+        ragWriteMode: settings.ragWriteMode,
+        ragLatencyBudgetMs: settings.ragLatencyBudgetMs,
+        ragMinScore: settings.ragMinScore,
+        ragEntryTtlHours: settings.ragEntryTtlHours,
+        ragDedupeWindowMinutes: settings.ragDedupeWindowMinutes,
+    }
+}
+
 export function Settings() {
     const { t, language, setLanguage } = useTranslation()
     const { isDark, toggleTheme } = useTheme()
@@ -230,10 +264,6 @@ export function Settings() {
     // Update state (live from main via onState)
     const [updateState, setUpdateState] = useState<any>(null)
     const [checkingUpdate, setCheckingUpdate] = useState(false)
-    // Proxy API test (Settings specific: test endpoint + live connect)
-    const [proxyApiTesting, setProxyApiTesting] = useState(false)
-    const [proxyApiStatus, setProxyApiStatus] = useState<'idle' | 'success' | 'error'>('idle')
-    const [proxyApiResult, setProxyApiResult] = useState<string>('')
     const [showResetConfirm, setShowResetConfirm] = useState(false)
     const [hasChanges, setHasChanges] = useState(false)
     const [originalSettings, setOriginalSettings] = useState<AppSettings>({ ...DEFAULTS })
@@ -275,7 +305,10 @@ export function Settings() {
             setLoading(true)
             const data = await window.electronAPI.settings.getAll()
             if (data) {
-                const merged = { ...DEFAULTS, ...data }
+                // Whitelist only known settings keys so UI state never carries
+                // legacy/extra disk fields that later fail strict save validation.
+                const patch = buildSettingsPatch(data as unknown as AppSettings)
+                const merged = { ...DEFAULTS, ...patch } as AppSettings
                 setSettings(merged)
                 setOriginalSettings(merged)
             }
@@ -307,37 +340,35 @@ export function Settings() {
     const handleSave = async () => {
         try {
             setSaving(true)
-            // Secret fields: mask = keep prior, '' = clear, other = replace+encrypt (main enforces).
-            const saved = await window.electronAPI.settings.saveAll(settings)
+            // Only whitelist keys go over IPC. Extra UI/disk fields would fail .strict() saveAll.
+            // Secret fields: mask = keep prior, empty = clear, other = replace+encrypt (main enforces).
+            const patch = buildSettingsPatch(settings)
+            const saved = await window.electronAPI.settings.saveAll(patch)
             if (window.electronAPI.runtime?.updatePolicy) {
-                await window.electronAPI.runtime.updatePolicy({
-                    captchaMode: settings.captchaMode,
-                    captchaAutoSkipMaxStrikes: settings.captchaAutoSkipMaxStrikes,
-                    captchaManualWaitSeconds: settings.captchaManualWaitSeconds,
-                    queueConcurrency: settings.queueConcurrency,
-                    queueIntervalMs: settings.queueIntervalMs,
-                    networkRetryMax: settings.networkRetryMax,
-                    uiRetryMax: settings.uiRetryMax,
-                    logLevel: settings.logLevel,
-                    ragEnabled: settings.ragEnabled,
-                    ragTopK: settings.ragTopK,
-                    ragMaxContextChars: settings.ragMaxContextChars,
-                    ragWriteMode: settings.ragWriteMode,
-                    ragLatencyBudgetMs: settings.ragLatencyBudgetMs,
-                    ragMinScore: settings.ragMinScore,
-                    ragEntryTtlHours: settings.ragEntryTtlHours,
-                    ragDedupeWindowMinutes: settings.ragDedupeWindowMinutes,
-                })
+                try {
+                    await window.electronAPI.runtime.updatePolicy(buildRuntimePolicyPatch(settings))
+                } catch (policyError) {
+                    // Settings already persisted; policy sync is best-effort and must not
+                    // report a full save failure for simple toggles like headless.
+                    console.warn('Runtime policy sync failed after settings save:', policyError)
+                }
             }
             // Re-hydrate from masked public view so secret inputs stay as mask, not raw.
-            const next = saved ? { ...DEFAULTS, ...saved } as AppSettings : { ...settings }
+            const savedPatch = saved ? buildSettingsPatch(saved as unknown as AppSettings) : patch
+            const next = { ...DEFAULTS, ...savedPatch } as AppSettings
             setSettings(next)
             setOriginalSettings(next)
             setHasChanges(false)
             showMsg('success', t('settings.saved'))
         } catch (error) {
             console.error('Failed to save:', error)
-            showMsg('error', t('settings.saveFailed'))
+            const detail = error instanceof Error && error.message
+                ? error.message
+                : (typeof error === 'string' ? error : '')
+            const shortDetail = detail && detail.length > 0 && detail.length <= 180
+                ? ` (${detail})`
+                : ''
+            showMsg('error', `${t('settings.saveFailed')}${shortDetail}`)
         } finally {
             setSaving(false)
         }
@@ -346,7 +377,7 @@ export function Settings() {
     const handleReset = async () => {
         try {
             const data = await window.electronAPI.settings.resetDefaults()
-            const merged = { ...DEFAULTS, ...data }
+            const merged = { ...DEFAULTS, ...buildSettingsPatch((data || {}) as unknown as AppSettings) } as AppSettings
             setSettings(merged)
             setOriginalSettings(merged)
             setHasChanges(false)
@@ -387,38 +418,6 @@ export function Settings() {
     /** True when the field holds a real user-entered secret (not empty / not IPC mask). */
     const isEditableSecret = (value: string): boolean =>
         value.trim().length > 0 && value !== SETTINGS_SECRET_MASK
-
-    // Proxy API test (calls fproxy:testApi via main; no full key ever logged/returned to UI)
-    const handleTestProxyApi = async () => {
-        // When only mask is shown, test uses the key already configured in main (fproxy:testApi).
-        // When user typed a new key, save first so main has the plaintext then test.
-        setProxyApiTesting(true)
-        setProxyApiStatus('idle')
-        setProxyApiResult('')
-        try {
-            if (isEditableSecret(settings.fproxyApiKey)) {
-                await window.electronAPI.settings.saveAll({ fproxyApiKey: settings.fproxyApiKey })
-            } else if (!settings.fproxyApiKey || settings.fproxyApiKey === '') {
-                return
-            }
-            const res = await window.electronAPI.fproxy?.testApi?.()
-            if (res?.success) {
-                setProxyApiStatus('success')
-                const ipPart = res.ip ? `IP: ${res.ip}` : ''
-                const lat = typeof res.latencyMs === 'number' ? ` • ${res.latencyMs}ms` : ''
-                setProxyApiResult(`${t('settings.testSuccess')} ${ipPart}${lat}${res.location ? ` (${res.location})` : ''}`.trim())
-            } else {
-                setProxyApiStatus('error')
-                setProxyApiResult(res?.message ? t('settings.testFailed') + ': ' + res.message : t('settings.testFailed'))
-            }
-        } catch (e: unknown) {
-            setProxyApiStatus('error')
-            const msg = e instanceof Error ? e.message : 'Lỗi kết nối'
-            setProxyApiResult(msg.slice(0, 120))
-        } finally {
-            setProxyApiTesting(false)
-        }
-    }
 
     const handleTestApiKey = async () => {
         // Only test a newly typed key — mask is not the real secret.
@@ -753,38 +752,11 @@ export function Settings() {
                 <FormRow icon={<Globe className="h-4 w-4 text-cyan-500" />} label={t('settings.useProxy')} description={t('settings.useProxyDesc')}>
                     <DSToggle checked={settings.useProxy} onChange={() => update('useProxy', !settings.useProxy)} />
                 </FormRow>
-                <FormRow icon={<Key className="h-4 w-4 text-cyan-600" />} label={t('settings.fproxyApiKey')} description={t('settings.fproxyApiKeyDesc')}>
-                    <div className="flex gap-2 w-full max-w-md">
-                        <input
-                            type="password"
-                            value={settings.fproxyApiKey || ''}
-                            onChange={(e) => update('fproxyApiKey', e.target.value)}
-                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
-                            placeholder={settings.fproxyApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'fproxy.me key'}
-                            autoComplete="off"
-                        />
-                        <PrimaryButton
-                            icon={proxyApiTesting ? RefreshCw : TestTube2}
-                            onClick={handleTestProxyApi}
-                            disabled={(!settings.fproxyApiKey.trim() && settings.fproxyApiKey !== SETTINGS_SECRET_MASK) || proxyApiTesting}
-                            className={proxyApiTesting ? '[&_svg]:animate-spin' : ''}
-                        >{t('settings.test')}</PrimaryButton>
-                    </div>
-                </FormRow>
-                {proxyApiStatus !== 'idle' && (
-                    <AlertBanner type={proxyApiStatus === 'success' ? 'success' : 'error'}>
-                        {proxyApiResult}
-                    </AlertBanner>
-                )}
+                <FProxyPoolSettings />
                 {settings.useProxy && (
-                    <>
-                        <FormRow icon={<RotateCw className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.rotateProxyPerSession')} description={t('settings.rotateProxyPerSessionDesc')}>
-                            <DSToggle checked={settings.rotateProxyPerSession} onChange={() => update('rotateProxyPerSession', !settings.rotateProxyPerSession)} />
-                        </FormRow>
-                        <FormRow icon={<Trash2 className="h-4 w-4 text-rose-500" />} label={t('settings.autoRemoveDeadProxies')} description={t('settings.autoRemoveDeadProxiesDesc')}>
-                            <DSToggle checked={settings.autoRemoveDeadProxies} onChange={() => update('autoRemoveDeadProxies', !settings.autoRemoveDeadProxies)} />
-                        </FormRow>
-                    </>
+                    <FormRow icon={<Trash2 className="h-4 w-4 text-rose-500" />} label={t('settings.autoRemoveDeadProxies')} description={t('settings.autoRemoveDeadProxiesDesc')}>
+                        <DSToggle checked={settings.autoRemoveDeadProxies} onChange={() => update('autoRemoveDeadProxies', !settings.autoRemoveDeadProxies)} />
+                    </FormRow>
                 )}
             </SectionPanel>
 
@@ -907,7 +879,7 @@ export function Settings() {
                     <NumberInput value={settings.defaultVisitsPerLocation} onChange={(v) => update('defaultVisitsPerLocation', v)} min={1} max={100} />
                 </FormRow>
                 <FormRow icon={<Zap className="h-4 w-4 text-amber-500" />} label={t('settings.actionsPerVisit')} description="">
-                    <NumberInput value={settings.defaultActionsPerVisit} onChange={(v) => update('defaultActionsPerVisit', v)} min={1} max={100} />
+                    <NumberInput value={settings.defaultActionsPerVisit} onChange={(v) => update('defaultActionsPerVisit', v)} min={1} max={50} />
                 </FormRow>
                 <div className="mt-2 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
                     <div className="mb-2 text-sm font-medium">{t('settings.visitDelayRange')}</div>

@@ -12,6 +12,7 @@ import {
 } from 'fs'
 import * as schema from './schema'
 import { runVersionedMigrations, type SqliteTableInfoRow } from './migrations'
+import { ensureFproxyPoolSchema } from './migrations/005_fproxy_pool'
 
 type AppDatabase = ReturnType<typeof drizzle<typeof schema>>
 
@@ -275,6 +276,9 @@ function createTables() {
       created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
     )
   `)
+
+  // Encrypted multi-key FProxy pool (fresh DB parity with migration v5)
+  ensureFproxyPoolSchema(sqlite)
 
   // Campaigns table
   sqlite.exec(`

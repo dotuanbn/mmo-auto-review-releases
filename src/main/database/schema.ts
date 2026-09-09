@@ -61,6 +61,25 @@ export const proxies = sqliteTable('proxies', {
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
 })
 
+// Encrypted FProxy API-key slots. Runtime proxy/lease state is intentionally not persisted.
+export const fproxyKeys = sqliteTable(
+    'fproxy_keys',
+    {
+        id: integer('id').primaryKey({ autoIncrement: true }),
+        label: text('label').notNull(),
+        apiKeyCiphertext: text('api_key_ciphertext').notNull(),
+        enabled: integer('enabled', { mode: 'boolean' }).default(true).notNull(),
+        createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+        updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+    },
+    (table) => ({
+        enabledIdx: index('idx_fproxy_keys_enabled').on(table.enabled),
+    })
+)
+
+export type FproxyKeyRow = typeof fproxyKeys.$inferSelect
+export type NewFproxyKeyRow = typeof fproxyKeys.$inferInsert
+
 // Locations table - Google Maps locations to review
 export const locations = sqliteTable('locations', {
     id: integer('id').primaryKey({ autoIncrement: true }),
