@@ -5,10 +5,10 @@
  * resolve under allowed roots (userData / home / documents / cwd / appPath).
  */
 
-import { chromium, Browser, BrowserContext, Page } from 'playwright'
+import { BrowserContext, Page } from 'playwright'
 import { app, BrowserWindow } from 'electron'
 import type { AutomationScript, ScriptAction, ScriptExecutionResult, ScriptError } from './ScriptTypes'
-import { profileLockService } from '../services/ProfileLockService'
+import { browserService } from './BrowserService'
 import * as path from 'path'
 import * as fs from 'fs'
 
@@ -65,7 +65,6 @@ function assertSafeLocalPath(rawPath: string, label: string): string {
 }
 
 export class ScriptRunner {
-    private browser: Browser | null = null
     private context: BrowserContext | null = null
     private page: Page | null = null
     private shouldStop = false
@@ -144,80 +143,38 @@ export class ScriptRunner {
         // Add timestamp variable
         this.variables['timestamp'] = Date.now()
 
-        // Track raw persistent-profile ownership (released in finally; ephemeral path never locks).
-        let profileLockToken: string | null = null
-        let lockedProfilePath: string | null = null
+        // BrowserService owns persistent-profile locks; ephemeral path never locks.
+        let contextId: number | undefined
 
         try {
-            // Launch browser
+            // Launch browser via BrowserService (stealth applied automatically)
             this.log('Launching browser...')
             this.sendStatus('Khởi động trình duyệt...', 0)
 
-            const browserArgs = [
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-            ]
+            const browserConfig = {
+                headless: script.settings.headless,
+                viewport: script.settings.viewport,
+                ...(script.settings.userAgent ? { userAgent: script.settings.userAgent } : {}),
+            }
 
-            // If account has a profile path, use persistent context for cookies/sessions
+            // Persistent profile for logged-in user scripts; otherwise in-memory ephemeral
             if (accountOptions?.profilePath) {
                 const safeProfilePath = assertSafeLocalPath(accountOptions.profilePath, 'profilePath')
                 this.log(`Using profile: ${safeProfilePath}`)
                 this.sendStatus(`Dùng profile: ${accountOptions.email || 'Unknown'}`, 0)
 
-                // Drop stale locks for owners without a live context (safety net for orphaned tokens).
-                profileLockService.cleanupStale({ maxAgeMs: 6 * 60 * 60 * 1000 })
-
-                profileLockToken = `script_runner:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`
-                lockedProfilePath = safeProfilePath
-                await profileLockService.acquire(safeProfilePath, {
-                    ownerToken: profileLockToken,
-                    kind: 'script_runner',
-                    label: accountOptions.email
-                        ? `script:${accountOptions.email}`
-                        : 'script_runner',
+                contextId = await browserService.createContext({
+                    ...browserConfig,
+                    profilePath: safeProfilePath,
                 })
-
-                // Ensure profile directory exists
-                if (!fs.existsSync(safeProfilePath)) {
-                    fs.mkdirSync(safeProfilePath, { recursive: true })
-                }
-
-                this.context = await chromium.launchPersistentContext(safeProfilePath, {
-                    headless: script.settings.headless,
-                    args: browserArgs,
-                    viewport: script.settings.viewport,
-                    userAgent: script.settings.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    locale: script.settings.locale || 'vi-VN',
-                    timezoneId: script.settings.timezone || 'Asia/Ho_Chi_Minh',
-                })
-
-                // Anti-detection
-                await this.context.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
-                })
-
-                this.page = this.context.pages()[0] || await this.context.newPage()
             } else {
-                // Normal launch without persistent profile (no profile lock)
-                this.browser = await chromium.launch({
-                    headless: script.settings.headless,
-                    args: browserArgs,
-                })
+                contextId = await browserService.createEphemeralContext(browserConfig)
+            }
 
-                // Create context
-                this.context = await this.browser.newContext({
-                    viewport: script.settings.viewport,
-                    userAgent: script.settings.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    locale: script.settings.locale || 'vi-VN',
-                    timezoneId: script.settings.timezone || 'Asia/Ho_Chi_Minh',
-                })
-
-                // Anti-detection
-                await this.context.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
-                })
-
-                this.page = await this.context.newPage()
+            this.context = browserService.getContext(contextId) ?? null
+            this.page = browserService.getPage(contextId) ?? null
+            if (!this.context || !this.page) {
+                throw new Error('Browser context initialization failed')
             }
 
             // Execute actions
@@ -304,15 +261,11 @@ export class ScriptRunner {
                 screenshots: this.screenshots
             }
         } finally {
-            if (this.context) await this.context.close().catch(() => { })
-            if (this.browser) await this.browser.close().catch(() => { })
-            this.context = null
-            this.browser = null
-            this.page = null
-            // Always release persistent profile ownership after close / launch failure.
-            if (lockedProfilePath && profileLockToken) {
-                profileLockService.release(lockedProfilePath, profileLockToken)
+            if (contextId != null) {
+                await browserService.closeContext(contextId).catch(() => { })
             }
+            this.context = null
+            this.page = null
         }
     }
 

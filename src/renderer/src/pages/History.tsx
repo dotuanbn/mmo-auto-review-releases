@@ -136,7 +136,7 @@ export function History() {
                 {[1, 2, 3, 4, 5].map((star) => (
                     <Star
                         key={star}
-                        className={`h-3.5 w-3.5 ${star <= rating ? 'fill-amber-400 text-amber-400' : 'text-[#d7d2e3]'}`}
+                        className={`h-3.5 w-3.5 ${star <= rating ? 'fill-amber-400 text-amber-400' : 'text-[#d7d2e3] dark:text-[#9a8fba]'}`}
                     />
                 ))}
             </div>
@@ -190,17 +190,20 @@ export function History() {
         {
             key: 'location',
             header: t('history.location'),
-            render: (row: ReviewHistory) => (
-                <span className="text-sm font-medium text-[#17171f]">
-                    {row.location?.name || `Location #${row.locationId}`}
-                </span>
-            ),
+            render: (row: ReviewHistory) => {
+                const locationName = row.location?.name || `Location #${row.locationId}`
+                return (
+                    <span className="text-sm font-medium text-[#17171f] dark:text-[#f0ecff]" title={locationName}>
+                        {locationName}
+                    </span>
+                )
+            },
         },
         {
             key: 'account',
             header: t('history.account'),
             render: (row: ReviewHistory) => (
-                <span className="font-mono text-sm text-[#5f5a6d]">
+                <span className="font-mono text-sm text-[#5f5a6d] dark:text-[#c8c0d8]">
                     {row.account?.email || `Account #${row.accountId}`}
                 </span>
             ),
@@ -209,7 +212,7 @@ export function History() {
             key: 'rating',
             header: (
                 <button
-                    className="flex items-center gap-1 transition-colors hover:text-[#17171f]"
+                    className="flex items-center gap-1 transition-colors hover:text-[#17171f] dark:hover:text-[#f0ecff]"
                     onClick={() => toggleSort('rating')}
                     type="button"
                 >
@@ -226,7 +229,7 @@ export function History() {
             key: 'reviewText',
             header: t('history.reviewText'),
             render: (row: ReviewHistory) => (
-                <span className="block max-w-xs truncate text-sm text-[#908a9e]">
+                <span className="block max-w-xs truncate text-sm text-[#908a9e] dark:text-[#9a8fba]" title={row.reviewText || '-'}>
                     {row.reviewText || '-'}
                 </span>
             ),
@@ -235,7 +238,7 @@ export function History() {
             key: 'date',
             header: (
                 <button
-                    className="flex items-center gap-1 transition-colors hover:text-[#17171f]"
+                    className="flex items-center gap-1 transition-colors hover:text-[#17171f] dark:hover:text-[#f0ecff]"
                     onClick={() => toggleSort('date')}
                     type="button"
                 >
@@ -247,11 +250,11 @@ export function History() {
             ),
             render: (row: ReviewHistory) => (
                 <div>
-                    <div className="flex items-center gap-1.5 text-sm text-[#5f5a6d]">
+                    <div className="flex items-center gap-1.5 text-sm text-[#5f5a6d] dark:text-[#c8c0d8]">
                         <Calendar className="h-3 w-3" />
                         {new Date(row.createdAt).toLocaleDateString()}
                     </div>
-                    <div className="mt-0.5 text-xs text-[#908a9e]">
+                    <div className="mt-0.5 text-xs text-[#908a9e] dark:text-[#9a8fba]">
                         {new Date(row.createdAt).toLocaleTimeString()}
                     </div>
                 </div>
@@ -261,7 +264,7 @@ export function History() {
             key: 'expand',
             header: '',
             render: (row: ReviewHistory) => (
-                <Eye className={`h-4 w-4 transition-colors ${expandedReviewId === row.id ? 'text-[#8d74e8]' : 'text-[#908a9e]'}`} />
+                <Eye className={`h-4 w-4 transition-colors ${expandedReviewId === row.id ? 'text-[#8d74e8]' : 'text-[#908a9e] dark:text-[#9a8fba]'}`} />
             ),
             width: '40px',
         },
@@ -334,7 +337,7 @@ export function History() {
                         onChange={setFilter}
                     />
                 </div>
-                <span className="text-sm font-medium text-[#908a9e]">
+                <span className="text-sm font-medium text-[#908a9e] dark:text-[#9a8fba]">
                     {filteredReviews.length} / {reviews.length} {t('history.totalReviews').toLowerCase()}
                 </span>
             </div>
@@ -342,24 +345,24 @@ export function History() {
             {/* Reviews Table */}
             <Panel className="overflow-hidden p-0">
                 {loading && reviews.length === 0 ? (
-                    <div className="flex flex-col items-center gap-3 py-16 text-[#908a9e]">
+                    <div className="flex flex-col items-center gap-3 py-16 text-[#908a9e] dark:text-[#9a8fba]">
                         <RefreshCw className="h-6 w-6 animate-spin text-[#8d74e8]" />
                         <span className="text-sm">{t('history.loadingHistory')}</span>
                     </div>
                 ) : paginatedReviews.length === 0 ? (
-                    <div className="flex flex-col items-center gap-3 py-16 text-[#908a9e]">
-                        <FileText className="h-8 w-8 text-[#d7d2e3]" />
+                    <div className="flex flex-col items-center gap-3 py-16 text-[#908a9e] dark:text-[#9a8fba]">
+                        <FileText className="h-8 w-8 text-[#d7d2e3] dark:text-[#9a8fba]" />
                         <span className="text-sm">{searchQuery ? 'Khong tim thay ket qua' : t('history.noReviewsYet')}</span>
                     </div>
                 ) : (
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
                             <thead>
-                                <tr className="bg-[#f4f1fa]">
+                                <tr className="bg-[#f4f1fa] dark:bg-[#2a2540]">
                                     {columns.map((col) => (
                                         <th
                                             key={col.key}
-                                            className="px-4 py-3 text-xs font-bold uppercase tracking-wider text-[#6d6678]"
+                                            className="px-4 py-3 text-xs font-bold uppercase tracking-wider text-[#6d6678] dark:text-[#c8c0d8]"
                                             style={col.width ? { width: col.width } : undefined}
                                         >
                                             {col.header}
@@ -372,44 +375,44 @@ export function History() {
                                     <>
                                         <tr
                                             key={review.id}
-                                            className={`cursor-pointer border-t border-[#f0ecf7] bg-white transition-colors hover:bg-[#f8f6fc] ${
-                                                expandedReviewId === review.id ? 'bg-[#f8f6fc]' : ''
+                                            className={`cursor-pointer border-t border-[#f0ecf7] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] transition-colors hover:bg-[#f8f6fc] dark:hover:bg-[#352f4a] ${
+                                                expandedReviewId === review.id ? 'bg-[#f8f6fc] dark:bg-[#2a2540]' : ''
                                             }`}
                                             onClick={() => setExpandedReviewId(expandedReviewId === review.id ? null : review.id)}
                                         >
                                             {columns.map((col) => (
-                                                <td key={col.key} className="px-4 py-3 text-[#5f5a6d]">
+                                                <td key={col.key} className="px-4 py-3 text-[#5f5a6d] dark:text-[#c8c0d8]">
                                                     {col.render(review)}
                                                 </td>
                                             ))}
                                         </tr>
                                         {expandedReviewId === review.id && (
-                                            <tr key={`${review.id}-detail`} className="bg-[#f8f6fc]">
+                                            <tr key={`${review.id}-detail`} className="bg-[#f8f6fc] dark:bg-[#2a2540]">
                                                 <td colSpan={columns.length} className="px-4 py-4">
                                                     <div className="grid grid-cols-2 gap-4 text-sm">
                                                         <div>
-                                                            <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e]">Noi dung review</label>
-                                                            <p className="rounded-[16px] border border-[#e9e4f2] bg-white p-3 text-sm leading-relaxed text-[#5f5a6d]">
+                                                            <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e] dark:text-[#9a8fba]">Noi dung review</label>
+                                                            <p className="rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3 text-sm leading-relaxed text-[#5f5a6d] dark:text-[#c8c0d8]">
                                                                 {review.reviewText || 'Khong co noi dung'}
                                                             </p>
                                                         </div>
                                                         <div className="space-y-3">
                                                             <div>
-                                                                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e]">Campaign ID</label>
-                                                                <p className="text-[#5f5a6d]">#{review.campaignId}</p>
+                                                                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e] dark:text-[#9a8fba]">Campaign ID</label>
+                                                                <p className="text-[#5f5a6d] dark:text-[#c8c0d8]">#{review.campaignId}</p>
                                                             </div>
                                                             {review.errorMessage && (
                                                                 <div>
-                                                                    <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e]">Loi</label>
-                                                                    <p className="flex items-start gap-2 rounded-[16px] border border-rose-200 bg-rose-50 p-3 text-sm text-rose-600">
+                                                                    <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e] dark:text-[#9a8fba]">Loi</label>
+                                                                    <p className="flex items-start gap-2 rounded-[16px] border border-rose-200 dark:border-rose-800/60 bg-rose-50 dark:bg-rose-950/40 p-3 text-sm text-rose-600 dark:text-rose-300">
                                                                         <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
                                                                         {review.errorMessage}
                                                                     </p>
                                                                 </div>
                                                             )}
                                                             <div>
-                                                                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e]">Thoi gian chinh xac</label>
-                                                                <p className="text-[#5f5a6d]">{new Date(review.createdAt).toLocaleString()}</p>
+                                                                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-[#908a9e] dark:text-[#9a8fba]">Thoi gian chinh xac</label>
+                                                                <p className="text-[#5f5a6d] dark:text-[#c8c0d8]">{new Date(review.createdAt).toLocaleString()}</p>
                                                             </div>
                                                         </div>
                                                     </div>
@@ -426,7 +429,7 @@ export function History() {
 
             {/* Pagination + Footer */}
             <div className="flex items-center justify-between">
-                <span className="text-sm text-[#908a9e]">
+                <span className="text-sm text-[#908a9e] dark:text-[#9a8fba]">
                     Hien thi {filteredReviews.length > 0 ? (page - 1) * ITEMS_PER_PAGE + 1 : 0}-{Math.min(page * ITEMS_PER_PAGE, filteredReviews.length)} / {filteredReviews.length} ban ghi
                 </span>
                 <Pagination

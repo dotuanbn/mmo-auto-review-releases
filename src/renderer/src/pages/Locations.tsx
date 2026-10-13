@@ -312,8 +312,8 @@ export function Locations() {
                                         <MapPin className="h-4 w-4" />
                                     </div>
                                     <div className="min-w-0">
-                                        <h3 className="max-w-[180px] truncate text-sm font-semibold text-[#17171f]">{location.name}</h3>
-                                        <p className="max-w-[180px] truncate text-xs text-[#908a9e]">{location.address || t('locations.noAddress')}</p>
+                                        <h3 className="max-w-[180px] truncate text-sm font-semibold text-[#17171f]" title={location.name}>{location.name}</h3>
+                                        <p className="max-w-[180px] truncate text-xs text-[#908a9e]" title={location.address || t('locations.noAddress')}>{location.address || t('locations.noAddress')}</p>
                                     </div>
                                 </div>
                                 <div className="flex flex-col items-end gap-1">

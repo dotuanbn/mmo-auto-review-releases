@@ -187,7 +187,7 @@ function MetricsPanel() {
         return (
             <div className="flex items-center justify-center py-20">
                 <RefreshCw className="w-6 h-6 text-[#8d74e8] animate-spin" />
-                <span className="text-[#8e899b] ml-3">Dang tai metrics...</span>
+                <span className="text-[#8e899b] dark:text-[#9a8fba] ml-3">Dang tai metrics...</span>
             </div>
         )
     }
@@ -269,16 +269,16 @@ function MetricsPanel() {
                     {metrics && Object.keys(metrics.byTask).length > 0 ? (
                         <div className="space-y-3">
                             {Object.entries(metrics.byTask).map(([task, data]) => (
-                                <div key={task} className="rounded-[16px] border border-[#ece7f5] bg-white p-3">
+                                <div key={task} className="rounded-[16px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3">
                                     <div className="flex items-center justify-between mb-2">
-                                        <span className="text-[#17171f] text-sm font-medium">{task}</span>
-                                        <span className="text-[#8e899b] text-xs">{data.calls} calls</span>
+                                        <span className="text-[#17171f] dark:text-[#f0ecff] text-sm font-medium">{task}</span>
+                                        <span className="text-[#8e899b] dark:text-[#9a8fba] text-xs">{data.calls} calls</span>
                                     </div>
                                     <div className="flex items-center gap-4 text-xs">
-                                        <span className={data.successRate >= 90 ? 'text-emerald-600' : 'text-amber-600'}>
+                                        <span className={data.successRate >= 90 ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}>
                                             {data.successRate.toFixed(0)}% success
                                         </span>
-                                        <span className="text-[#e9e4f2]">|</span>
+                                        <span className="text-[#e9e4f2] dark:text-[#9a8fba]">|</span>
                                         <span className="text-[#735bd6]">{data.avgDurationMs.toFixed(0)}ms avg</span>
                                     </div>
                                     <ProgressBar value={data.successRate} tone="emerald" size="sm" className="mt-2" />
@@ -298,7 +298,7 @@ function MetricsPanel() {
                     {history.length > 0 ? (
                         <div className="space-y-2 max-h-80 overflow-y-auto pr-2">
                             {history.map(h => (
-                                <div key={h.id} className="flex items-center gap-3 p-2.5 rounded-[14px] border border-[#ece7f5] bg-white">
+                                <div key={h.id} className="flex items-center gap-3 p-2.5 rounded-[14px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e]">
                                     {h.success ? (
                                         <CheckCircle className="w-4 h-4 text-emerald-500 shrink-0" />
                                     ) : (
@@ -306,20 +306,20 @@ function MetricsPanel() {
                                     )}
                                     <div className="flex-1 min-w-0">
                                         <div className="flex items-center gap-2">
-                                            <span className="text-[#17171f] text-xs font-medium">{h.task}</span>
-                                            <span className="text-[#908a9e] text-[10px]">{h.modelId}</span>
+                                            <span className="text-[#17171f] dark:text-[#f0ecff] text-xs font-medium">{h.task}</span>
+                                            <span className="text-[#908a9e] dark:text-[#9a8fba] text-[10px]" title={h.modelId}>{h.modelId}</span>
                                         </div>
                                         <div className="flex items-center gap-3 mt-0.5">
                                             <span className="text-[#735bd6] text-[10px]">{h.durationMs}ms</span>
                                             {h.memoryMB && (
-                                                <span className="text-cyan-600 text-[10px]">{h.memoryMB}MB</span>
+                                                <span className="text-cyan-600 dark:text-cyan-300 text-[10px]">{h.memoryMB}MB</span>
                                             )}
                                             {h.errorMessage && (
-                                                <span className="text-rose-500 text-[10px] truncate max-w-[150px]">{h.errorMessage}</span>
+                                                <span className="text-rose-500 text-[10px] truncate max-w-[150px]" title={h.errorMessage}>{h.errorMessage}</span>
                                             )}
                                         </div>
                                     </div>
-                                    <span className="text-[#908a9e] text-[10px] shrink-0">
+                                    <span className="text-[#908a9e] dark:text-[#9a8fba] text-[10px] shrink-0">
                                         {formatMetricTime(h.createdAt)}
                                     </span>
                                 </div>
@@ -467,7 +467,7 @@ function DatasetPanel() {
 
                 {/* Quick access */}
                 <div className="flex items-center gap-2 mt-3">
-                    <span className="text-[#908a9e] text-xs">Goi y:</span>
+                    <span className="text-[#908a9e] dark:text-[#9a8fba] text-xs">Goi y:</span>
                     {sampleDatasets.map(d => (
                         <PrimaryButton
                             key={d.id}
@@ -491,10 +491,10 @@ function DatasetPanel() {
             {/* Dataset Info */}
             {datasetSize && (
                 <div className="flex items-center gap-4 text-sm">
-                    <span className="text-[#5f5a6d]">
+                    <span className="text-[#5f5a6d] dark:text-[#c8c0d8]">
                         Config: <Badge tone="violet">{selectedConfig}</Badge>
                     </span>
-                    <span className="text-[#5f5a6d]">
+                    <span className="text-[#5f5a6d] dark:text-[#c8c0d8]">
                         Split: <Badge tone="violet">{selectedSplit}</Badge>
                     </span>
                     {configs.length > 1 && (
@@ -542,7 +542,7 @@ function DatasetPanel() {
                                 header: '#',
                                 width: '60px',
                                 render: (_row: any, idx: number) => (
-                                    <span className="text-[#908a9e] text-xs">{offset + idx + 1}</span>
+                                    <span className="text-[#908a9e] dark:text-[#9a8fba] text-xs">{offset + idx + 1}</span>
                                 ),
                             },
                             ...columns.slice(0, 6).map(col => ({
@@ -553,13 +553,17 @@ function DatasetPanel() {
                                         <ArrowUpDown className="w-3 h-3 opacity-50" />
                                     </span>
                                 ),
-                                render: (row: any) => (
-                                    <span className="text-xs max-w-[300px] truncate block">
-                                        {typeof row[col] === 'object'
-                                            ? JSON.stringify(row[col]).slice(0, 100)
-                                            : String(row[col] ?? '').slice(0, 200)}
-                                    </span>
-                                ),
+                                render: (row: any) => {
+                                    const raw = typeof row[col] === 'object'
+                                        ? JSON.stringify(row[col])
+                                        : String(row[col] ?? '')
+                                    const shown = typeof row[col] === 'object' ? raw.slice(0, 100) : raw.slice(0, 200)
+                                    return (
+                                        <span className="text-xs max-w-[300px] truncate block" title={raw}>
+                                            {shown}
+                                        </span>
+                                    )
+                                },
                             })),
                         ]}
                         data={rows.map((row, idx) => ({ id: idx, ...row }))}
@@ -567,7 +571,7 @@ function DatasetPanel() {
 
                     {/* Pagination */}
                     <div className="flex items-center justify-between">
-                        <span className="text-[#908a9e] text-xs">
+                        <span className="text-[#908a9e] dark:text-[#9a8fba] text-xs">
                             Rows {offset + 1} - {offset + rows.length}
                         </span>
                         <div className="flex gap-2">
@@ -659,7 +663,7 @@ function ToolsPanel() {
         return (
             <div className="flex items-center justify-center py-20">
                 <RefreshCw className="w-6 h-6 text-[#8d74e8] animate-spin" />
-                <span className="text-[#8e899b] ml-3">Dang tai tools...</span>
+                <span className="text-[#8e899b] dark:text-[#9a8fba] ml-3">Dang tai tools...</span>
             </div>
         )
     }
@@ -673,11 +677,11 @@ function ToolsPanel() {
                         <Panel key={tool.name} className="group transition-colors">
                             <div className="flex items-start justify-between">
                                 <div className="flex items-center gap-3">
-                                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-50 text-amber-600 shadow-[0_12px_22px_rgba(40,36,54,0.12)]">
+                                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-300 shadow-[0_12px_22px_rgba(40,36,54,0.12)]">
                                         <Terminal className="w-5 h-5" />
                                     </div>
                                     <div>
-                                        <h4 className="text-[#17171f] font-medium text-sm">{tool.name}</h4>
+                                        <h4 className="text-[#17171f] dark:text-[#f0ecff] font-medium text-sm">{tool.name}</h4>
                                         <Badge tone="slate">.{tool.ext}</Badge>
                                     </div>
                                 </div>
@@ -689,7 +693,7 @@ function ToolsPanel() {
                                     variant={runningTool === tool.name ? 'accent' : 'quiet'}
                                 />
                             </div>
-                            <div className="mt-3 text-[10px] text-[#908a9e] truncate">
+                            <div className="mt-3 text-[10px] text-[#908a9e] dark:text-[#9a8fba] truncate" title={tool.fullPath}>
                                 {tool.fullPath}
                             </div>
                             {runningTool === tool.name && (
@@ -702,7 +706,7 @@ function ToolsPanel() {
                 <EmptyState
                     icon={Terminal}
                     title="Chua co tools"
-                    subtitle={<>Them scripts vao <code className="rounded bg-[#f4f1fa] px-1.5 py-0.5 text-[#735bd6]">scripts/tools/</code></>}
+                    subtitle={<>Them scripts vao <code className="rounded bg-[#f4f1fa] dark:bg-[#2a2540] px-1.5 py-0.5 text-[#735bd6]">scripts/tools/</code></>}
                 />
             )}
 
@@ -710,19 +714,19 @@ function ToolsPanel() {
             {result && (
                 <SectionPanel icon={Terminal} title="Ket qua thuc thi" tone="amber">
                     <div className="flex items-center justify-end gap-3 text-xs mb-3">
-                        <span className={`flex items-center gap-1 ${result.exitCode === 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        <span className={`flex items-center gap-1 ${result.exitCode === 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
                             {result.exitCode === 0 ? <CheckCircle className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
                             Exit: {result.exitCode}
                         </span>
-                        <span className="text-[#908a9e]">{result.durationMs}ms</span>
+                        <span className="text-[#908a9e] dark:text-[#9a8fba]">{result.durationMs}ms</span>
                     </div>
                     {result.stdout && (
-                        <pre className="text-emerald-700 text-xs font-mono whitespace-pre-wrap max-h-60 overflow-y-auto bg-emerald-50 border border-emerald-100 p-3 rounded-[14px]">
+                        <pre className="text-emerald-700 dark:text-emerald-300 text-xs font-mono whitespace-pre-wrap max-h-60 overflow-y-auto bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-100 dark:border-emerald-800/60 p-3 rounded-[14px]">
                             {result.stdout}
                         </pre>
                     )}
                     {result.stderr && (
-                        <pre className="text-rose-700 text-xs font-mono whitespace-pre-wrap max-h-40 overflow-y-auto bg-rose-50 border border-rose-100 p-3 rounded-[14px] mt-2">
+                        <pre className="text-rose-700 dark:text-rose-300 text-xs font-mono whitespace-pre-wrap max-h-40 overflow-y-auto bg-rose-50 dark:bg-rose-950/40 border border-rose-100 dark:border-rose-800/60 p-3 rounded-[14px] mt-2">
                             {result.stderr}
                         </pre>
                     )}

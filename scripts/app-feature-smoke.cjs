@@ -143,6 +143,7 @@ async function main() {
       imageDir,
       expectedUserDataDir,
       requestedIsolatedRestore,
+      requireLaya,
     }) => {
       const api = window.electronAPI
       const results = []
@@ -198,6 +199,28 @@ async function main() {
         )
         return { version, userData: paths.userData }
       })
+
+      if (requireLaya) {
+        await step('laya.bundled-runtime-and-inference', async () => {
+          assert(api.laya && hasFn(api.laya, 'healthCheck'), 'Laya IPC API missing')
+          const health = await api.laya.healthCheck()
+          assert(health.online === true && health.tier1Ready === true, 'Bundled Laya did not start')
+          assert(health.version === 'laya-0.3.20-local', 'Unexpected Laya runtime')
+          const metrics = {
+            campaignId: 1, campaignName: 'Smoke', trafficMode: 'web_seo',
+            totalVisits: 20, completedVisits: 18, failedVisits: 2,
+            successRate: 0.9, consecutiveFailures: 0, currentThreadCount: 1,
+            avgVisitDurationMs: 5000, elapsedMs: 100000, locationCount: 1,
+          }
+          const decision = await api.laya.decide('campaign_optimization', metrics)
+          assert(decision.tier === 'laya-choice', 'Laya inference silently fell back')
+          assert(['aggressive', 'normal', 'cautious', 'pause'].includes(decision.decision), 'Invalid model choice')
+          assert(Number.isFinite(decision.confidence), 'Missing model confidence')
+          const pause = await api.laya.optimizeCampaign({ ...metrics, consecutiveFailures: 16 })
+          assert(pause.shouldContinue === false && pause.suggestedPacing === 'pause', 'Local hard pause gate was bypassed')
+          return { health, decision, hardPauseGate: true }
+        })
+      }
 
       await step('settings.crud', async () => {
         const before = await api.settings.getAll()
@@ -617,6 +640,7 @@ async function main() {
       imageDir,
       expectedUserDataDir: userDataDir,
       requestedIsolatedRestore,
+      requireLaya: Boolean(packagedExecutable) && process.platform === 'win32',
     })
 
     result.results = apiResults

@@ -16,6 +16,7 @@
  */
 
 import type { BrowserContext, CDPSession, Page } from 'playwright'
+import type { BehaviorProfile } from '../../shared/behavior-contracts'
 import { BrowserFingerprint } from '../services/FingerprintService'
 import { writeAgenticLog } from '../utils/agenticLog'
 
@@ -24,8 +25,8 @@ export type StealthLevel = 'off' | 'low' | 'medium' | 'high' | 'paranoid'
 export interface StealthOptions {
     level?: StealthLevel
     fingerprint?: BrowserFingerprint
-    /** Future: pass per-account behavior profile for fatigue / mood simulation */
-    behaviorProfile?: any
+    /** Per-account behavior profile for fatigue / mood simulation. */
+    behaviorProfile?: BehaviorProfile
 }
 
 interface UserAgentMetadata {

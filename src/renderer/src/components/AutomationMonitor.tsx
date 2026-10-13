@@ -93,13 +93,13 @@ export function AutomationMonitor({
         status.currentCampaignId === campaignId
 
     const shellClass = embedded
-        ? `rounded-[18px] border border-emerald-200 bg-gradient-to-br from-emerald-50 to-cyan-50 p-5 ${className}`
+        ? `rounded-[18px] border border-emerald-200 dark:border-emerald-800/60 bg-gradient-to-br from-emerald-50 dark:from-[#1a2a25] to-cyan-50 dark:to-[#1a2530] p-5 ${className}`
         : `rounded-xl border border-blue-500/30 bg-gradient-to-br from-blue-900/30 to-cyan-900/20 p-6 ${className}`
 
-    const muted = embedded ? 'text-[#908a9e]' : 'text-slate-400'
-    const strong = embedded ? 'text-[#17171f]' : 'text-white'
+    const muted = embedded ? 'text-[#908a9e] dark:text-[#9a8fba]' : 'text-slate-400'
+    const strong = embedded ? 'text-[#17171f] dark:text-[#f0ecff]' : 'text-white'
     const cardBg = embedded
-        ? 'bg-white/80 border border-[#e9e4f2]'
+        ? 'bg-white/80 dark:bg-[#1e1b2e]/80 border border-[#e9e4f2] dark:border-[#3d3558]'
         : 'bg-slate-800/60'
 
     if (loading && !status.running && !queueStats) {
@@ -147,17 +147,17 @@ export function AutomationMonitor({
             {/* Header */}
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-5">
                 <h2 className={`text-lg font-semibold flex items-center gap-2 flex-wrap ${strong}`}>
-                    <Activity className={`w-5 h-5 ${embedded ? 'text-emerald-600' : 'text-blue-400'}`} />
+                    <Activity className={`w-5 h-5 ${embedded ? 'text-emerald-600 dark:text-emerald-400' : 'text-blue-400'}`} />
                     {t('campaigns.monitorTitle', 'Automation Progress Monitor')}
                     {status.running && (
                         <span
                             className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
                                 status.paused
                                     ? embedded
-                                        ? 'bg-amber-100 text-amber-700'
+                                        ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300'
                                         : 'bg-yellow-500/20 text-yellow-400'
                                     : embedded
-                                        ? 'bg-emerald-100 text-emerald-700'
+                                        ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
                                         : 'bg-green-500/20 text-green-400'
                             }`}
                         >
@@ -209,7 +209,7 @@ export function AutomationMonitor({
                             onClick={() => void refresh()}
                             className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-sm transition-colors ${
                                 embedded
-                                    ? 'bg-white border border-[#e9e4f2] text-[#5f5a6d] hover:bg-[#f4f1fa]'
+                                    ? 'bg-white dark:bg-[#1e1b2e] border border-[#e9e4f2] dark:border-[#3d3558] text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]'
                                     : 'bg-slate-700 hover:bg-slate-600 text-slate-200'
                             }`}
                             title={t('common.refresh', 'Refresh')}
@@ -246,21 +246,21 @@ export function AutomationMonitor({
                     </div>
                 </div>
                 <div className={`${cardBg} rounded-lg p-3 text-center`}>
-                    <div className="text-2xl font-bold text-emerald-600">{completedJobs}</div>
+                    <div className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{completedJobs}</div>
                     <div className={`text-xs mt-1 flex items-center justify-center gap-1 ${muted}`}>
                         <CheckCircle className="w-3 h-3" />
                         {t('campaigns.monitorCompleted', 'Completed')}
                     </div>
                 </div>
                 <div className={`${cardBg} rounded-lg p-3 text-center`}>
-                    <div className="text-2xl font-bold text-rose-600">{failedJobs}</div>
+                    <div className="text-2xl font-bold text-rose-600 dark:text-rose-400">{failedJobs}</div>
                     <div className={`text-xs mt-1 flex items-center justify-center gap-1 ${muted}`}>
                         <XCircle className="w-3 h-3" />
                         {t('campaigns.monitorFailed', 'Failed')}
                     </div>
                 </div>
                 <div className={`${cardBg} rounded-lg p-3 text-center`}>
-                    <div className="text-2xl font-bold text-blue-600">{pendingJobs}</div>
+                    <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">{pendingJobs}</div>
                     <div className={`text-xs mt-1 flex items-center justify-center gap-1 ${muted}`}>
                         <Clock className="w-3 h-3" />
                         {t('campaigns.monitorPending', 'Pending')}
@@ -278,7 +278,7 @@ export function AutomationMonitor({
                 </div>
                 <div
                     className={`h-3 rounded-full overflow-hidden ${
-                        embedded ? 'bg-[#e9e4f2]' : 'bg-slate-700'
+                        embedded ? 'bg-[#e9e4f2] dark:bg-[#352f4a]' : 'bg-slate-700'
                     }`}
                 >
                     <div
@@ -314,14 +314,14 @@ export function AutomationMonitor({
                                 className={`p-3 rounded-lg text-xs border ${
                                     thread.status === 'running'
                                         ? embedded
-                                            ? 'bg-emerald-50 border-emerald-200'
+                                            ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800/60'
                                             : 'bg-green-500/20 border-green-500/30'
                                         : thread.status === 'error'
                                             ? embedded
-                                                ? 'bg-rose-50 border-rose-200'
+                                                ? 'bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-800/60'
                                                 : 'bg-red-500/20 border-red-500/30'
                                             : embedded
-                                                ? 'bg-white border-[#e9e4f2]'
+                                                ? 'bg-white dark:bg-[#1e1b2e] border-[#e9e4f2] dark:border-[#3d3558]'
                                                 : 'bg-slate-700/50 border-slate-600/50'
                                 }`}
                             >
@@ -341,7 +341,7 @@ export function AutomationMonitor({
                                 </div>
                                 <div className={`${muted} truncate`}>{threadJobLabel(thread)}</div>
                                 {thread.status === 'error' && thread.lastError && (
-                                    <div className="mt-1 text-rose-600 truncate" title={thread.lastError}>
+                                    <div className="mt-1 text-rose-600 dark:text-rose-400 truncate" title={thread.lastError}>
                                         {thread.lastError}
                                     </div>
                                 )}
@@ -356,7 +356,7 @@ export function AutomationMonitor({
                 <div
                     className={`mb-4 p-3 rounded-lg text-sm ${
                         embedded
-                            ? 'bg-rose-50 border border-rose-200 text-rose-700'
+                            ? 'bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300'
                             : 'bg-red-500/20 border border-red-500/30 text-red-400'
                     }`}
                 >
@@ -376,7 +376,7 @@ export function AutomationMonitor({
                         onClick={() => void handleClearCompleted()}
                         className={`text-xs transition-colors ${
                             embedded
-                                ? 'text-[#908a9e] hover:text-[#5f5a6d]'
+                                ? 'text-[#908a9e] dark:text-[#9a8fba] hover:text-[#5f5a6d] dark:hover:text-[#c8c0d8]'
                                 : 'text-slate-400 hover:text-white'
                         }`}
                     >
@@ -389,7 +389,7 @@ export function AutomationMonitor({
                 <div
                     className={`mt-4 p-3 rounded-lg text-sm ${
                         embedded
-                            ? 'bg-rose-50 border border-rose-200 text-rose-700'
+                            ? 'bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300'
                             : 'bg-red-500/20 border border-red-500/30 text-red-400'
                     }`}
                 >

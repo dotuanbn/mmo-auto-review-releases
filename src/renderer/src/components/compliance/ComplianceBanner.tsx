@@ -34,7 +34,7 @@ export function ComplianceBanner({
 
     return (
         <div
-            className="border-b border-amber-200 bg-amber-50 px-3 py-2.5 sm:px-5"
+            className="border-b border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 px-3 py-2.5 sm:px-5"
             role="status"
             aria-live="polite"
         >
@@ -45,8 +45,8 @@ export function ComplianceBanner({
                     </span>
                     <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-1.5">
-                            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
-                            <span className="text-sm font-semibold text-amber-900">
+                            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                            <span className="text-sm font-semibold text-amber-900 dark:text-amber-200">
                                 {t(
                                     'compliance.bannerTitle',
                                     'Compliance: manual review submit pending'
@@ -56,18 +56,26 @@ export function ComplianceBanner({
                         <ul className="mt-1.5 space-y-1.5">
                             {visible.map((item) => {
                                 const busy = actingId === item.requestId
+                                const locationLabel = item.locationName || item.locationUrl
+                                const accountLabel = item.accountEmail || t('compliance.unknownAccount', 'Unknown account')
+                                const metaLabel = [
+                                    accountLabel,
+                                    formatComplianceTimestamp(item.createdAt),
+                                    item.expiresAt
+                                        ? `${t('compliance.expires', 'expires')} ${formatComplianceTimestamp(item.expiresAt)}`
+                                        : null,
+                                ].filter(Boolean).join(' · ')
                                 return (
                                     <li
                                         key={item.requestId}
-                                        className="flex flex-col gap-1.5 rounded-xl border border-amber-200/80 bg-white/80 px-2.5 py-2 sm:flex-row sm:items-center sm:justify-between"
+                                        className="flex flex-col gap-1.5 rounded-xl border border-amber-200/80 dark:border-amber-900/40 bg-white/80 dark:bg-[#2a2540] px-2.5 py-2 sm:flex-row sm:items-center sm:justify-between"
                                     >
                                         <div className="min-w-0">
-                                            <p className="truncate text-xs font-medium text-[#17171f]">
-                                                {item.locationName || item.locationUrl}
+                                            <p className="truncate text-xs font-medium text-[#17171f] dark:text-[#f0ecff]" title={locationLabel}>
+                                                {locationLabel}
                                             </p>
-                                            <p className="truncate text-[11px] text-[#908a9e]">
-                                                {item.accountEmail ||
-                                                    t('compliance.unknownAccount', 'Unknown account')}
+                                            <p className="truncate text-[11px] text-[#908a9e] dark:text-[#9a8fba]" title={metaLabel}>
+                                                {accountLabel}
                                                 {' · '}
                                                 {formatComplianceTimestamp(item.createdAt)}
                                                 {item.expiresAt && (
@@ -109,7 +117,7 @@ export function ComplianceBanner({
                 <button
                     type="button"
                     onClick={onOpenCampaigns}
-                    className="inline-flex shrink-0 items-center justify-center gap-1.5 self-start rounded-full border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-800 shadow-sm transition hover:bg-amber-100"
+                    className="inline-flex shrink-0 items-center justify-center gap-1.5 self-start rounded-full border border-amber-300 dark:border-amber-800/60 bg-white dark:bg-[#1e1b2e] px-3 py-1.5 text-xs font-semibold text-amber-800 dark:text-amber-200 shadow-sm transition hover:bg-amber-100 dark:hover:bg-amber-950/40"
                 >
                     <ExternalLink className="h-3.5 w-3.5" />
                     {t('compliance.openCampaigns', 'Open Campaigns')}

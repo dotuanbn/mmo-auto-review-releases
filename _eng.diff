@@ -1,0 +1,295 @@
+diff --git a/src/main/automation/TrafficBoostEngine.ts b/src/main/automation/TrafficBoostEngine.ts
+index 7460411..2b63d7f 100644
+--- a/src/main/automation/TrafficBoostEngine.ts
++++ b/src/main/automation/TrafficBoostEngine.ts
+@@ -12,5 +12,5 @@ import { runtimePolicyService } from '../runtime/v2/runtimePolicy'
+ import { getDatabase } from '../database'
+ import * as schema from '../database/schema'
+-import { eq } from 'drizzle-orm'
++import { desc, eq } from 'drizzle-orm'
+ import { Page } from 'playwright'
+ import { join } from 'path'
+@@ -1290,4 +1290,6 @@ export class TrafficBoostEngine {
+     /** Campaign-local account/profile exclusivity: one concurrent visit per account/profile. */
+     private campaignAccountLocks: Map<string, Promise<void>> = new Map()
++    /** Stuck locks auto-release so a crashed visit cannot pin an account forever. */
++    private readonly accountLockTimeoutMs = 10 * 60 * 1000
+ 
+     onStatus(listener: (status: TrafficBoostStatus) => void): () => void {
+@@ -1308,4 +1310,59 @@ export class TrafficBoostEngine {
+     }
+ 
++    /**
++     * Reject when `promise` does not settle within `ms`.
++     * `onTimeout` runs first so the caller can release a stuck lock.
++     */
++    private withTimeout<T>(promise: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
++        return new Promise<T>((resolve, reject) => {
++            const timer = setTimeout(() => {
++                try {
++                    onTimeout?.()
++                } catch (error: unknown) {
++                    console.error('[TrafficBoost] withTimeout handler failed:', error)
++                }
++                reject(new Error(`timeout after ${ms}ms`))
++            }, ms)
++            if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
++                (timer as { unref: () => void }).unref()
++            }
++            const clear = (): void => {
++                clearTimeout(timer)
++            }
++            promise.then(
++                (value) => {
++                    clear()
++                    resolve(value)
++                },
++                (error: unknown) => {
++                    clear()
++                    reject(error instanceof Error ? error : new Error(String(error)))
++                },
++            )
++        })
++    }
++
++    /** Lock promise that auto-releases after accountLockTimeoutMs. */
++    private createTimedAccountLock(key: string): { guarded: Promise<void>; release: () => void } {
++        let releaseOuter!: () => void
++        const gate = new Promise<void>((resolve) => {
++            releaseOuter = resolve
++        })
++        let guarded!: Promise<void>
++        const release = (): void => {
++            if (this.campaignAccountLocks.get(key) === guarded) {
++                this.campaignAccountLocks.delete(key)
++            }
++            releaseOuter()
++        }
++        guarded = this.withTimeout(gate, this.accountLockTimeoutMs, () => {
++            console.warn(
++                `[TrafficBoost] Auto-released stuck account lock after ${this.accountLockTimeoutMs}ms: ${key}`,
++            )
++            release()
++        })
++        return { guarded, release }
++    }
++
+     /**
+      * Campaign-local exclusivity for persistent Chromium profiles only.
+@@ -1330,5 +1387,7 @@ export class TrafficBoostEngine {
+                 break
+             }
+-            await pending.catch(() => { /* previous holder released or failed */ })
++            await this.withTimeout(pending, this.accountLockTimeoutMs).catch(() => {
++                /* previous holder released, failed, or timed out */
++            })
+         }
+         if (this.shouldStop) {
+@@ -1336,9 +1395,6 @@ export class TrafficBoostEngine {
+         }
+ 
+-        let releaseOuter!: () => void
+-        const gate = new Promise<void>((resolve) => {
+-            releaseOuter = resolve
+-        })
+-        this.campaignAccountLocks.set(key, gate)
++        const { guarded, release } = this.createTimedAccountLock(key)
++        this.campaignAccountLocks.set(key, guarded)
+ 
+         let released = false
+@@ -1348,8 +1404,5 @@ export class TrafficBoostEngine {
+             }
+             released = true
+-            if (this.campaignAccountLocks.get(key) === gate) {
+-                this.campaignAccountLocks.delete(key)
+-            }
+-            releaseOuter()
++            release()
+         }
+     }
+@@ -1791,7 +1844,15 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+     getActionTrace(campaignId?: number, limit: number = 500): Array<Record<string, unknown>> {
+         const db = getDatabase()
++        const rowLimit = Math.max(1, Math.min(limit, 500))
+         const rows = campaignId
+-            ? db.select().from(schema.trafficLogs).where(eq(schema.trafficLogs.campaignId, campaignId)).all()
+-            : db.select().from(schema.trafficLogs).all()
++            ? db.select().from(schema.trafficLogs)
++                .where(eq(schema.trafficLogs.campaignId, campaignId))
++                .orderBy(desc(schema.trafficLogs.id))
++                .limit(rowLimit)
++                .all()
++            : db.select().from(schema.trafficLogs)
++                .orderBy(desc(schema.trafficLogs.id))
++                .limit(rowLimit)
++                .all()
+ 
+         const trace: Array<Record<string, unknown>> = []
+@@ -2695,15 +2756,4 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+         const fproxyPoolEnabled = proxyEnabled && enabledPoolSlotCount > 0
+         const strictFproxyPool = fproxyPoolEnabled && fproxyPoolSnapshot.policy.strictUnique
+-        if (strictFproxyPool) {
+-            const beforeThreads = safeThreadCount
+-            safeThreadCount = Math.min(safeThreadCount, enabledPoolSlotCount)
+-            if (safeThreadCount !== beforeThreads) {
+-                console.log(
+-                    '[TrafficBoost] FProxy strict pool capacity clamp threads ' +
+-                    beforeThreads + ' -> ' + safeThreadCount +
+-                    ' (enabledSlots=' + enabledPoolSlotCount + ')',
+-                )
+-            }
+-        }
+         this.networkState = await networkOrchestrator.resolveEffectiveMode()
+         if (proxyEnabled && runtimeProxySettings.fproxyApiKey && !fproxyService.getApiKey()) {
+@@ -2804,4 +2854,23 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+         // maps traffic (direct/organic/map_search) is multi-IP: concurrent visits are OK even with 1 account.
+         const mapsMultiIpTraffic = campaign.trafficMode !== 'web_seo'
++        if (strictFproxyPool) {
++            const beforeThreads = safeThreadCount
++            // Multi-map maps traffic: one enabled FProxy key can cover several maps
++            // concurrently (one location per worker). Single-map and web_seo stay
++            // capped at the number of enabled pool slots.
++            if (mapsMultiIpTraffic && locationIds.length > 1) {
++                safeThreadCount = Math.min(safeThreadCount, locationIds.length * enabledPoolSlotCount)
++            } else {
++                safeThreadCount = Math.min(safeThreadCount, enabledPoolSlotCount)
++            }
++            if (safeThreadCount !== beforeThreads) {
++                console.log(
++                    '[TrafficBoost] FProxy strict pool capacity clamp threads ' +
++                    beforeThreads + ' -> ' + safeThreadCount +
++                    ' (enabledSlots=' + enabledPoolSlotCount +
++                    ', maps=' + locationIds.length + ')',
++                )
++            }
++        }
+         if (campaign.trafficMode === 'web_seo' && usableAccountCount > 0) {
+             safeThreadCount = Math.min(safeThreadCount, usableAccountCount)
+@@ -2810,4 +2879,5 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+             `[TrafficBoost] Concurrency plan: threads=${safeThreadCount}, ` +
+             `enabledFProxySlots=${enabledPoolSlotCount}, accounts=${usableAccountCount || 0}, ` +
++            `maps=${locationIds.length}, ` +
+             `mode=${campaign.trafficMode || 'direct'}, mapsMultiIp=${mapsMultiIpTraffic}`,
+         )
+@@ -2972,4 +3042,6 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                                     `thread-${threadIdx}`,
+                                     DEFAULT_TRAFFIC_VISIT_LEASE_MS,
++                                    new Date(),
++                                    { disallowRunningLocations: mapsMultiIpTraffic },
+                                 )
+                                 if (!claimed) {
+@@ -3017,4 +3089,5 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                                     usePersistentProfile,
+                                 })
++                                let stopPageMonitor: (() => void) | null = null
+                                 try {
+                                 const depthNow = trafficVisitQueue.getCampaignCounters(campaignId)
+@@ -3086,4 +3159,6 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                                         }))
+                                     },
++                                    undefined,
++                                    task.location.id,
+                                 )
+                                 preSyncedAvailableMs = waitResult.availableMs
+@@ -3197,5 +3272,4 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                             let profilePath: string | undefined
+                             let contextId: number | null = null
+-                            let stopPageMonitor: (() => void) | null = null
+                             let watchdogTriggered = false
+                             let contextCleanupStarted = false
+@@ -3237,15 +3311,15 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+ 
+                             const recycleVisitContext = async (reason: 'watchdog_timeout' | 'visit_end') => {
+-                                if (contextCleanupStarted) {
+-                                    return
+-                                }
+-
+-                                contextCleanupStarted = true
+-
+                                 try {
+                                     stopPageMonitor?.()
++                                    stopPageMonitor = null
+                                 } catch {
+                                     // Ignore page monitor teardown errors.
+                                 }
++                                if (contextCleanupStarted) {
++                                    return
++                                }
++
++                                contextCleanupStarted = true
+ 
+                                 if (contextId !== null) {
+@@ -3363,4 +3437,5 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                                                  id: `campaign-${campaignId}:thread-${threadIdx}`,
+                                                  threadId: threadIdx,
++                                                 locationId: task.location.id,
+                                              },
+                                              // Wait through full provider cooldown if needed (rotate ~2 min + buffer).
+@@ -4584,7 +4659,4 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                                 }
+                             }
+-                                } finally {
+-                                    releaseAccountLock()
+-                                }
+ 
+                             // Update campaign progress
+@@ -4698,4 +4770,5 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+         } finally {
+             this.running = false
++            this.resetKeywordAndCaptchaStats()
+             this.abortPendingProxyAcquires()
+             this.campaignAccountLocks.clear()
+@@ -4744,4 +4817,5 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+         this.paused = false
+         this.running = false
++        this.resetKeywordAndCaptchaStats()
+         this.abortPendingProxyAcquires()
+         if (this.currentCampaignId) {
+@@ -4765,10 +4839,5 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                 .run()
+         }
+-        // Immediately close all active browser contexts
+-        for (const contextId of Array.from(this.activeContexts.keys())) {
+-            browserService.closeContext(contextId).catch(err => console.error('[TrafficBoost] Error closing context on stop:', err))
+-        }
+-        this.activeContexts.clear()
+-        this.threadContextIds.clear()
++        await this.closeActiveContexts('stop')
+         // Keep thread slots so late async callbacks do not crash on undefined entries.
+         this.threadDetails = this.threadDetails.map((thread, idx) => ({
+@@ -4819,9 +4888,5 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+                 .run()
+         }
+-        for (const contextId of Array.from(this.activeContexts.keys())) {
+-            browserService.closeContext(contextId).catch(err => console.error('[TrafficBoost] Error closing context on pause:', err))
+-        }
+-        this.activeContexts.clear()
+-        this.threadContextIds.clear()
++        await this.closeActiveContexts('pause')
+         this.threadDetails = []
+         this.currentQueueDepth = 0
+@@ -4890,4 +4955,24 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
+     isRunning(): boolean { return this.running }
+ 
++    private resetKeywordAndCaptchaStats(): void {
++        this._keywordCounters = {}
++        this.captchaThreadStats.clear()
++    }
++
++    /** Await context shutdown before dropping the maps so Chromium is not orphaned. */
++    private async closeActiveContexts(reason: 'stop' | 'pause'): Promise<void> {
++        const ids = Array.from(this.activeContexts.keys())
++        const results = await Promise.allSettled(
++            ids.map((id) => browserService.closeContext(id)),
++        )
++        for (const result of results) {
++            if (result.status === 'rejected') {
++                console.error(`[TrafficBoost] Error closing context on ${reason}:`, result.reason)
++            }
++        }
++        this.activeContexts.clear()
++        this.threadContextIds.clear()
++    }
++
+     private abortPendingProxyAcquires(): void {
+         for (const controller of Array.from(this.proxyAcquireControllers)) {

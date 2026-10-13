@@ -101,15 +101,15 @@ export function ReviewIntentReconcilePanel({
         <Panel tone="rose" className="space-y-3 p-4" key="review-intent-reconcile-panel">
             <div className="flex flex-wrap items-start justify-between gap-2">
                 <div className="flex min-w-0 items-start gap-2">
-                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600" />
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600 dark:text-rose-400" />
                     <div className="min-w-0">
-                        <div className="text-sm font-semibold text-rose-800">
+                        <div className="text-sm font-semibold text-rose-800 dark:text-rose-200">
                             {title}
                             {!loading && intents.length > 0 && (
                                 <span className="ml-1 font-bold">({intents.length})</span>
                             )}
                         </div>
-                        <p className="mt-0.5 text-xs text-rose-700/80">{subtitle}</p>
+                        <p className="mt-0.5 text-xs text-rose-700/80 dark:text-rose-300/80">{subtitle}</p>
                     </div>
                 </div>
                 {onRefresh && (
@@ -131,7 +131,7 @@ export function ReviewIntentReconcilePanel({
 
             {error && (
                 <div
-                    className="rounded-[14px] border border-rose-200 bg-white/80 px-3 py-2 text-xs text-rose-700"
+                    className="rounded-[14px] border border-rose-200 dark:border-rose-800/60 bg-white/80 dark:bg-[#2a2540] px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
                     role="alert"
                 >
                     {error}
@@ -139,13 +139,13 @@ export function ReviewIntentReconcilePanel({
             )}
 
             {loading && intents.length === 0 && (
-                <div className="rounded-[14px] border border-rose-100 bg-white/60 px-3 py-4 text-center text-xs text-rose-700/80">
+                <div className="rounded-[14px] border border-rose-100 dark:border-rose-900/50 bg-white/60 dark:bg-[#2a2540] px-3 py-4 text-center text-xs text-rose-700/80 dark:text-rose-300/80">
                     {t('compliance.intentLoading', 'Loading reconcilable intents…')}
                 </div>
             )}
 
             {isEmpty && (
-                <div className="rounded-[14px] border border-dashed border-rose-200 bg-white/50 px-3 py-4 text-center text-xs text-rose-700/70">
+                <div className="rounded-[14px] border border-dashed border-rose-200 dark:border-rose-800/60 bg-white/50 dark:bg-[#2a2540] px-3 py-4 text-center text-xs text-rose-700/70 dark:text-rose-300/70">
                     {t(
                         'compliance.intentEmpty',
                         'No submitting or unconfirmed review intents. Nothing to reconcile.'
@@ -159,35 +159,34 @@ export function ReviewIntentReconcilePanel({
                         const busy = actingId === item.historyId
                         const confirming =
                             confirmingId === item.historyId && pendingOutcome != null
+                        const locationLabel = item.locationName || item.locationUrl || `Location #${item.locationId}`
                         return (
                             <div
                                 key={item.historyId}
-                                className="rounded-[14px] border border-[#e9e4f2] bg-white/70 p-3"
+                                className="rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white/70 dark:bg-[#2a2540] p-3"
                             >
                                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                                     <div className="min-w-0 flex-1">
                                         <div className="flex flex-wrap items-center gap-2">
-                                            <span className="truncate text-sm font-medium text-[#17171f]">
-                                                {item.locationName ||
-                                                    item.locationUrl ||
-                                                    `Location #${item.locationId}`}
+                                            <span className="truncate text-sm font-medium text-[#17171f] dark:text-[#f0ecff]" title={locationLabel}>
+                                                {locationLabel}
                                             </span>
                                             <span
                                                 className={
                                                     item.status === 'unconfirmed'
-                                                        ? 'inline-flex rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-700'
-                                                        : 'inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-800'
+                                                        ? 'inline-flex rounded-full bg-rose-100 dark:bg-rose-950/40 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-700 dark:text-rose-300'
+                                                        : 'inline-flex rounded-full bg-amber-100 dark:bg-amber-950/40 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-800 dark:text-amber-200'
                                                 }
                                             >
                                                 {statusLabel(item.status, t)}
                                             </span>
                                         </div>
                                         {item.locationUrl && (
-                                            <div className="mt-1 break-all text-xs text-[#908a9e]">
+                                            <div className="mt-1 break-all text-xs text-[#908a9e] dark:text-[#9a8fba]">
                                                 {item.locationUrl}
                                             </div>
                                         )}
-                                        <div className="mt-1 text-xs text-[#908a9e]">
+                                        <div className="mt-1 text-xs text-[#908a9e] dark:text-[#9a8fba]">
                                             {t('compliance.historyId', 'History')} #
                                             {item.historyId}
                                             {' · '}
@@ -210,19 +209,19 @@ export function ReviewIntentReconcilePanel({
                                             {formatComplianceTimestamp(item.createdAt)}
                                         </div>
                                         {item.reviewTextPreview && (
-                                            <div className="mt-1 line-clamp-2 text-xs text-[#565263]">
+                                            <div className="mt-1 line-clamp-2 text-xs text-[#565263] dark:text-[#c8c0d8]" title={item.reviewTextPreview}>
                                                 {item.reviewTextPreview}
                                             </div>
                                         )}
                                         {item.errorMessage && (
-                                            <div className="mt-1 text-xs text-rose-700/80">
+                                            <div className="mt-1 text-xs text-rose-700/80 dark:text-rose-300/80">
                                                 {t('compliance.reason', 'Reason')}:{' '}
                                                 {item.errorMessage}
                                             </div>
                                         )}
                                         {confirming && (
                                             <div className="mt-2">
-                                                <label className="block text-[11px] font-medium text-rose-800">
+                                                <label className="block text-[11px] font-medium text-rose-800 dark:text-rose-200">
                                                     {t(
                                                         'compliance.intentNote',
                                                         'Optional note (max 1000)'
@@ -241,13 +240,13 @@ export function ReviewIntentReconcilePanel({
                                                     maxLength={RECONCILE_NOTE_MAX}
                                                     rows={2}
                                                     disabled={busy}
-                                                    className="mt-1 w-full resize-y rounded-[10px] border border-rose-200 bg-white px-2 py-1.5 text-xs text-[#17171f] outline-none focus:border-rose-400"
+                                                    className="mt-1 w-full resize-y rounded-[10px] border border-rose-200 dark:border-rose-800/60 bg-white dark:bg-[#1e1b2e] px-2 py-1.5 text-xs text-[#17171f] dark:text-[#f0ecff] outline-none placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-rose-400"
                                                     placeholder={t(
                                                         'compliance.intentNotePlaceholder',
                                                         'e.g. verified on Google Maps'
                                                     )}
                                                 />
-                                                <div className="mt-0.5 text-right text-[10px] text-[#908a9e]">
+                                                <div className="mt-0.5 text-right text-[10px] text-[#908a9e] dark:text-[#9a8fba]">
                                                     {noteDraft.length}/{RECONCILE_NOTE_MAX}
                                                 </div>
                                             </div>
@@ -257,7 +256,7 @@ export function ReviewIntentReconcilePanel({
                                     <div className="flex shrink-0 flex-col items-stretch gap-2 sm:items-end">
                                         {confirming ? (
                                             <div className="flex flex-wrap items-center gap-2">
-                                                <span className="text-[11px] font-medium text-rose-800">
+                                                <span className="text-[11px] font-medium text-rose-800 dark:text-rose-200">
                                                     {pendingOutcome === 'confirmed_success'
                                                         ? t(
                                                               'compliance.intentConfirmingSuccess',
@@ -337,7 +336,7 @@ export function ReviewIntentReconcilePanel({
             )}
 
             {remaining > 0 && (
-                <p className="text-xs text-rose-700/80">
+                <p className="text-xs text-rose-700/80 dark:text-rose-300/80">
                     {t('compliance.intentMore', '+{n} more intents').replace(
                         '{n}',
                         String(remaining)

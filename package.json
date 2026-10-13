@@ -1,14 +1,17 @@
 {
   "name": "mmo-auto-review",
-  "version": "1.0.12",
+  "version": "1.0.16",
   "description": "MMO Auto Review Google Map - Electron App",
   "main": "dist-electron/main/index.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build && electron-builder",
-    "build:exe": "vite build && electron-builder --win dir",
-    "build:installer": "vite build && electron-builder --win nsis",
-    "release:github": "vite build && electron-builder --win --publish always && node scripts/archive-release.cjs",
+    "build:laya-sidecar": "pwsh -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\build-laya-sidecar.ps1",
+    "sign:laya-sidecar": "pwsh -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\sign-laya-sidecar.ps1",
+    "build:exe": "npm run verify:laya-sidecar && vite build && electron-builder --win dir",
+    "build:installer": "npm run verify:laya-sidecar && vite build && electron-builder --win nsis",
+    "release:unsigned": "npm run build:installer && node scripts/smoke-laya-sidecar.cjs --root=release/win-unpacked/resources/laya-sidecar && npm run smoke:packaged && node scripts/archive-release.cjs",
+    "release:github": "node scripts/verify-laya-sidecar.cjs --require-signature && vite build && electron-builder --win --publish never && node scripts/smoke-laya-sidecar.cjs --root=release/win-unpacked/resources/laya-sidecar && npm run smoke:packaged && node scripts/archive-release.cjs",
     "release:archive-local": "node scripts/archive-release.cjs",
     "preview": "vite preview",
     "electron:dev": "vite build && electron .",
@@ -24,6 +27,7 @@
     "smoke:packaged:unpacked": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\packaged-feature-smoke.ps1 -Mode unpacked",
     "smoke:packaged:nsis": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\packaged-feature-smoke.ps1 -Mode nsis",
     "smoke:packaged": "npm run smoke:packaged:unpacked && npm run smoke:packaged:nsis",
+    "verify:laya-sidecar": "node scripts/verify-laya-sidecar.cjs",
     "test": "vitest",
     "test:run": "vitest run"
   },
@@ -86,8 +90,23 @@
       "node_modules/onnxruntime-node/**/*",
       "node_modules/onnxruntime-common/**/*"
     ],
-    "extraResources": [],
     "win": {
+      "extraResources": [
+        {
+          "from": "resources/laya-sidecar",
+          "to": "laya-sidecar",
+          "filter": [
+            "laya-sidecar.exe",
+            "_internal/**/*",
+            "model/multilingual/encoder/config.json",
+            "model/multilingual/model.safetensors",
+            "model/multilingual/rl_agent_config.json",
+            "model/multilingual/tokenizer/tokenizer.json",
+            "model/multilingual/tokenizer/tokenizer_config.json",
+            "artifact-manifest.json"
+          ]
+        }
+      ],
       "target": [
         {
           "target": "nsis",

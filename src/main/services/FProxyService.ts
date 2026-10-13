@@ -1,7 +1,7 @@
 import * as https from 'https'
-import { appendFileSync } from 'fs'
 import { join } from 'path'
 import { app } from 'electron'
+import { getRotatingLogger } from '../utils/RotatingLogger'
 import { browserService } from '../automation/BrowserService'
 
 // FProxy.me API response format
@@ -34,7 +34,7 @@ function logFProxy(message: string) {
     console.log(message)
     try {
         const logPath = join(app.getPath('userData'), 'proxy-debug.log')
-        appendFileSync(logPath, line)
+        getRotatingLogger('fproxy', logPath).write(line)
     } catch {
         // ignore
     }

@@ -30,7 +30,7 @@ export function WarmupProgressBlock({
 
     return (
         <div className="min-w-[140px] max-w-[220px] space-y-1">
-            <div className="flex items-center justify-between gap-2 text-[10px] font-medium text-[#908a9e]">
+            <div className="flex items-center justify-between gap-2 text-[10px] font-medium text-[#908a9e] dark:text-[#9a8fba]">
                 <span className="truncate" title={tierDescription(tier, t)}>
                     {runStateLabel(status.state, t)}
                     {isRunning && status.activityType
@@ -40,14 +40,14 @@ export function WarmupProgressBlock({
                 <span className="shrink-0 tabular-nums">{Math.round(value)}%</span>
             </div>
             <ProgressBar value={value} max={100} tone={tone} size="sm" />
-            <div className="flex flex-col gap-0.5 text-[10px] leading-tight text-[#908a9e] sm:flex-row sm:flex-wrap sm:gap-x-2">
+            <div className="flex flex-col gap-0.5 text-[10px] leading-tight text-[#908a9e] dark:text-[#9a8fba] sm:flex-row sm:flex-wrap sm:gap-x-2">
                 <span className="truncate" title={formatWarmupDate(status.lastActivityAt, never)}>
                     {t('accounts.warmup.last', 'Last')}: {formatWarmupDate(status.lastActivityAt, never)}
                 </span>
                 <span
                     className={
                         cooldownActive
-                            ? 'truncate font-semibold text-amber-700'
+                            ? 'truncate font-semibold text-amber-700 dark:text-amber-300'
                             : 'truncate'
                     }
                     title={
@@ -65,7 +65,7 @@ export function WarmupProgressBlock({
                 </span>
             </div>
             <p
-                className="truncate text-[10px] leading-tight text-[#a39db3]"
+                className="truncate text-[10px] leading-tight text-[#a39db3] dark:text-[#9a8fba]"
                 title={t(
                     'accounts.warmup.dailyCapHint',
                     'Max {{cap}} warmup sessions per day',
@@ -78,7 +78,7 @@ export function WarmupProgressBlock({
             </p>
             {friendlyError && (
                 <p
-                    className="truncate text-[10px] text-rose-600"
+                    className="truncate text-[10px] text-rose-600 dark:text-rose-400"
                     title={friendlyError}
                 >
                     {friendlyError}

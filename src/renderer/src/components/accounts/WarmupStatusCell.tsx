@@ -24,7 +24,13 @@ export function WarmupStatusCell({
     onStart: (accountId: number, activityType: WarmupActivityType) => void
     onCancel: (accountId: number) => void
 }) {
-    const resolved = status ?? deriveWarmupFromAccount(account)
+    const base = status ?? deriveWarmupFromAccount(account)
+    const resolved = {
+        ...base,
+        birthStoryDay: base.birthStoryDay ?? account.birthStoryDay,
+        birthStoryCompleted: account.birthStoryCompleted,
+        autoWarmupEnabled: account.autoWarmupEnabled,
+    }
 
     return (
         <div className="flex min-w-[200px] max-w-[320px] flex-col gap-2 py-0.5 sm:min-w-[240px]">
@@ -35,6 +41,7 @@ export function WarmupStatusCell({
                 apiAvailable={apiAvailable}
                 actionLoading={actionLoading}
                 t={t}
+                autoWarmupEnabled={Boolean(account.autoWarmupEnabled)}
                 onStart={(activityType) => onStart(account.id, activityType)}
                 onCancel={() => onCancel(account.id)}
             />

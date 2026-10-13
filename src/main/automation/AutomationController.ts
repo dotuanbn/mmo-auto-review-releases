@@ -24,9 +24,11 @@ import {
 import { getDatabase } from '../database'
 import * as schema from '../database/schema'
 import { eq } from 'drizzle-orm'
+import { velocityController } from '../services/VelocityController'
 import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
-import { existsSync, mkdirSync, appendFileSync } from 'fs'
+import { existsSync, mkdirSync } from 'fs'
+import { getRotatingLogger } from '../utils/RotatingLogger'
 import { ollamaService } from '../services/OllamaService'
 import { agenticReviewHandler } from './AgenticReviewHandler'
 import { sendReviewProgress } from '../ipc/campaigns'
@@ -48,7 +50,7 @@ const LOG_FILE = join(app.getPath('userData'), 'automation-debug.log')
 function logToFile(msg: string): void {
     const timestamp = new Date().toISOString()
     try {
-        appendFileSync(LOG_FILE, `[${timestamp}] ${msg}\n`)
+        getRotatingLogger('automation', LOG_FILE).write(`[${timestamp}] ${msg}\n`)
     } catch { /* ignore */ }
     console.log(msg)
 }
@@ -194,6 +196,8 @@ class AutomationController {
     private currentCampaignId?: number
     private mainWindow: BrowserWindow | null = null
     private readonly proxyAcquireControllers = new Set<AbortController>()
+    /** Throttle "all remaining jobs are in cross-account cooldown" logs. */
+    private cooldownWaitLogAt = 0
 
     constructor() {
         this.initProfilesPath()
@@ -844,10 +848,14 @@ class AutomationController {
                 continue
             }
 
-            // Atomic claim: pending → running under JobQueue exclusivity (owner-only run/fail)
+            // Atomic claim: pending → running under JobQueue exclusivity (owner-only run/fail).
+            // Locations with a recent success from any account are not claimed; another job is preferred.
             let job: Job | null
+            const disallowedLocations = this.listCrossAccountCooldownLocationIds()
             try {
-                job = await jobQueue.claimNextJob(this.currentCampaignId)
+                job = await jobQueue.claimNextJob(this.currentCampaignId, {
+                    disallowRecentlyReviewedLocations: disallowedLocations,
+                })
             } catch (error) {
                 logToFile(
                     `[AutomationController] Failed to claim next job: ` +
@@ -858,6 +866,19 @@ class AutomationController {
             }
 
             if (!job) {
+                if (
+                    disallowedLocations.length > 0 &&
+                    !jobQueue.isEmpty(this.currentCampaignId)
+                ) {
+                    const nowMs = Date.now()
+                    if (nowMs - this.cooldownWaitLogAt >= 60_000) {
+                        this.cooldownWaitLogAt = nowMs
+                        console.warn(
+                            `[AutomationController] Waiting — cross-account cooldown on ` +
+                            `${disallowedLocations.length} location(s); eligible jobs will run when the window clears`
+                        )
+                    }
+                }
                 // Check if all done (no pending left — do not cancel completed work)
                 if (
                     jobQueue.isEmpty(this.currentCampaignId) &&
@@ -950,6 +971,11 @@ class AutomationController {
                     // Permanent failed (not cancel): cancelled is NOT in BLOCKING_STATUSES
                     await this.failJobTerminalNoRetry(job.id, reason)
                     thread.lastError = reason
+                    return
+                }
+
+                // Another account reviewed this location recently — wait, do not fail the job.
+                if (await this.deferClaimedJobForCrossAccountCooldown(thread, job)) {
                     return
                 }
             }
@@ -1156,6 +1182,14 @@ class AutomationController {
                 const reviewOutcome = await this.executeReviewJob(thread, page, job)
                 alreadySucceeded = reviewOutcome.alreadySucceeded === true
 
+                // Cooldown lost the race during login — release the claim, do not post or fail.
+                // executeReviewJob already logged the warning; do not re-check (a second
+                // read could disagree and leave the job stuck in running).
+                if (reviewOutcome.deferredCrossAccount === true) {
+                    await this.releaseDeferredReviewJob(thread, job)
+                    return
+                }
+
                 // Existing submitting/unconfirmed OR new unconfirmed after submitAttempted:
                 // permanent failed (not cancel) — cancelled is re-enqueued on restart churn.
                 // review_history gate still blocks auto re-post.
@@ -1310,6 +1344,96 @@ class AutomationController {
         return undefined
     }
 
+    /**
+     * Cooldown length in minutes. Missing or non-numeric settings fall back to 120.
+     * Zero or negative disables the window.
+     */
+    private readCrossAccountCooldownMinutes(): number {
+        return velocityController.readCooldownMinutes()
+    }
+
+    /**
+     * True when no other account has a successful review for this location inside
+     * the cooldown window. Sync because better-sqlite3 queries are synchronous.
+     * Check failures allow the review (do not block the queue on a bad read).
+     */
+    checkCrossAccountCooldown(locationId: number, currentAccountId: number): boolean {
+        try {
+            const minutes = this.readCrossAccountCooldownMinutes()
+            const decision = velocityController.checkCooldown(locationId, currentAccountId)
+            if (decision.allowed) return true
+
+            const count = decision.recentSuccessCount ?? 0
+            console.warn(
+                `[AutomationController] Cross-account cooldown: location ${locationId} has ` +
+                `${count} recent success review(s) from other accounts (window ${minutes}m); ` +
+                `account ${currentAccountId} must wait`
+            )
+            return false
+        } catch (error: unknown) {
+            console.warn(
+                '[AutomationController] Cross-account cooldown check failed; allowing review:',
+                error
+            )
+            return true
+        }
+    }
+
+    /**
+     * Location ids with any recent successful review. Passed into JobQueue so those
+     * review jobs are skipped (not failed) until the cooldown window clears.
+     * Empty when the check cannot run.
+     */
+    private listCrossAccountCooldownLocationIds(): number[] {
+        try {
+            return velocityController.getCooldownLocationIds()
+        } catch (error: unknown) {
+            console.warn(
+                '[AutomationController] Failed to list cross-account cooldown locations; allowing claims:',
+                error
+            )
+            return []
+        }
+    }
+
+    /**
+     * If the claimed review must wait, put it back to pending (no retry bump) and
+     * return true. Safe to call twice: the second call sees a non-running job.
+     */
+    private async deferClaimedJobForCrossAccountCooldown(thread: ThreadState, job: Job): Promise<boolean> {
+        if (job.type !== 'review') return false
+        if (this.checkCrossAccountCooldown(job.locationId, job.accountId)) return false
+
+        logToFile(
+            `[Thread ${thread.id}] Cross-account cooldown — defer job ${job.id} ` +
+            `location=${job.locationId} account=${job.accountId}`
+        )
+        try {
+            await jobQueue.deferRunningJob(job.id)
+        } catch (error: unknown) {
+            logToFile(
+                `[Thread ${thread.id}] Failed to defer job ${job.id}: ` +
+                `${error instanceof Error ? error.message : String(error)}`
+            )
+        }
+        return true
+    }
+
+    /** Put a claimed job back to pending after executeReviewJob already decided to wait. */
+    private async releaseDeferredReviewJob(thread: ThreadState, job: Job): Promise<void> {
+        logToFile(
+            `[Thread ${thread.id}] Releasing job ${job.id} to pending after cross-account cooldown`
+        )
+        try {
+            await jobQueue.deferRunningJob(job.id)
+        } catch (error: unknown) {
+            logToFile(
+                `[Thread ${thread.id}] Failed to defer job ${job.id}: ` +
+                `${error instanceof Error ? error.message : String(error)}`
+            )
+        }
+    }
+
     // Execute review job with submission intent (fail-closed idempotency)
     private async executeReviewJob(
         thread: ThreadState,
@@ -1317,9 +1441,19 @@ class AutomationController {
         job: Job,
     ): Promise<{
         alreadySucceeded?: boolean
+        deferredCrossAccount?: boolean
         blockedManualReconcile?: boolean
         blockReason?: string
     }> {
+        // Race: another account may have succeeded while this browser was logging in.
+        if (!this.checkCrossAccountCooldown(job.locationId, job.accountId)) {
+            logToFile(
+                `[Thread ${thread.id}] Defer review before post — cross-account cooldown ` +
+                `job=${job.id} location=${job.locationId} account=${job.accountId}`
+            )
+            return { deferredCrossAccount: true }
+        }
+
         const db = getDatabase()
         const location = await db.select().from(schema.locations)
             .where(eq(schema.locations.id, job.locationId))
@@ -1398,6 +1532,7 @@ class AutomationController {
         }
 
         const reviewSettings = loadSettings()
+        let wasStyled = false
         if (reviewSettings.enablePerAccountReviewStyle === true && processedReviewText) {
             try {
                 const styled = await reviewContentGenerator.generate({
@@ -1410,6 +1545,7 @@ class AutomationController {
                     generationSeed: job.id,
                 })
                 processedReviewText = styled.styledText
+                wasStyled = true
                 logToFile(
                     `[ReviewStyle] job=${job.id} account=${job.accountId} ` +
                     `typos=${styled.audit.typoCount} emoji=${styled.audit.emojiCount} ` +
@@ -1440,6 +1576,7 @@ class AutomationController {
             locationId: job.locationId,
             rating,
             reviewText: processedReviewText || job.reviewText || '',
+            styleApplied: wasStyled,
         })
         intentId = intent.id
         logToFile(

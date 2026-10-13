@@ -115,6 +115,10 @@ function AccountsTab() {
     const [loginStates, setLoginStates] = useState<Record<number, { status: LoginStatus; message?: string }>>({})
     const [checkingAll, setCheckingAll] = useState(false)
     const menuRef = useRef<HTMLDivElement | null>(null)
+    const watchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    const watchCancelledRef = useRef(false)
+    const warmupStatusesRef = useRef(warmupStatuses)
+    warmupStatusesRef.current = warmupStatuses
 
     // Normalize short email (no @) -> @gmail.com before save/login. Applied for add + import.
     const normalizeEmail = (email: string): string => {
@@ -130,14 +134,28 @@ function AccountsTab() {
     }, [])
 
     // Poll batch statuses while any warmup is running (single getAllStatuses, no N+1).
+    // The boolean flips only when a run starts or stops, so status payloads do not rebuild the timer.
+    const hasRunningWarmup = Object.values(warmupStatuses).some((status) => status.state === 'running')
     useEffect(() => {
-        const hasRunning = Object.values(warmupStatuses).some((s) => s.state === 'running')
-        if (!hasRunning || !warmupApiAvailable) return
+        if (!hasRunningWarmup || !warmupApiAvailable) return
         const timer = window.setInterval(() => {
+            const stillRunning = Object.values(warmupStatusesRef.current).some((status) => status.state === 'running')
+            if (!stillRunning) return
             void fetchWarmupStatuses()
         }, 4000)
         return () => window.clearInterval(timer)
-    }, [warmupStatuses, warmupApiAvailable, fetchWarmupStatuses])
+    }, [hasRunningWarmup, warmupApiAvailable, fetchWarmupStatuses])
+
+    useEffect(() => {
+        watchCancelledRef.current = false
+        return () => {
+            watchCancelledRef.current = true
+            if (watchTimerRef.current !== null) {
+                clearTimeout(watchTimerRef.current)
+                watchTimerRef.current = null
+            }
+        }
+    }, [])
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
@@ -173,6 +191,40 @@ function AccountsTab() {
     const filteredAccounts = accounts.filter(acc =>
         acc.email.toLowerCase().includes(searchQuery.toLowerCase())
     )
+
+    const watchAccountUntilActive = (accountId: number, attempts = 0) => {
+        if (watchCancelledRef.current) return
+        if (attempts > 120) return
+        void (async () => {
+            if (watchCancelledRef.current) return
+            try {
+                await fetchAccounts()
+                if (watchCancelledRef.current) return
+                const acc = useAccountStore.getState().accounts.find((account) => account.id === accountId)
+                if (acc && acc.status === 'active') {
+                    setLoginStates(prev => ({
+                        ...prev,
+                        [accountId]: { status: 'success', message: 'Dang nhap thu cong thanh cong!' },
+                    }))
+                    watchTimerRef.current = setTimeout(() => {
+                        if (watchCancelledRef.current) return
+                        setLoginStates(prev => {
+                            const next = { ...prev }
+                            delete next[accountId]
+                            return next
+                        })
+                    }, 4500)
+                    return
+                }
+            } catch {
+                // Retry until the safety cap or unmount.
+            }
+            if (watchCancelledRef.current) return
+            watchTimerRef.current = setTimeout(() => {
+                watchAccountUntilActive(accountId, attempts + 1)
+            }, 3000)
+        })()
+    }
 
     const handleAddAccount = async () => {
         if (!newAccount.email || !newAccount.password) return
@@ -212,24 +264,8 @@ function AccountsTab() {
                             ...prev,
                             [id]: { status: 'logging_in', message: 'Browser da mo - hay dang nhap!' }
                         }))
-                        // Watch for bg detect (poll + isGoogleLoggedIn + close in main): refetch until status=active (from store), flip loginStates success so pill shows 'active' immediately.
-                        const watchForActive = async (attempts = 0) => {
-                            if (attempts > 120) return // ~6min safety
-                            try {
-                                await fetchAccounts()
-                                const list = (useAccountStore as any).getState ? (useAccountStore as any).getState().accounts : accounts
-                                const acc = (list || []).find((a: any) => a && a.id === id)
-                                if (acc && acc.status === 'active') {
-                                    setLoginStates(prev => ({ ...prev, [id]: { status: 'success', message: 'Dang nhap thu cong thanh cong!' } }))
-                                    setTimeout(() => {
-                                        setLoginStates(prev => { const n = { ...prev }; delete n[id]; return n })
-                                    }, 4500)
-                                    return
-                                }
-                            } catch {}
-                            setTimeout(() => watchForActive(attempts + 1), 3000)
-                        }
-                        watchForActive(0)
+                        // Watch until main-process login detection marks the account active.
+                        watchAccountUntilActive(id)
                     } else {
                         setLoginStates(prev => ({
                             ...prev,
@@ -371,24 +407,7 @@ function AccountsTab() {
                     ...prev,
                     [id]: { status: 'logging_in', message: 'Browser da mo - hay dang nhap!' }
                 }))
-                // Watch for bg detect (dropdown manual open path)
-                const watchForActive = async (attempts = 0) => {
-                    if (attempts > 120) return
-                    try {
-                        await fetchAccounts()
-                        const list = (useAccountStore as any).getState ? (useAccountStore as any).getState().accounts : accounts
-                        const acc = (list || []).find((a: any) => a && a.id === id)
-                        if (acc && acc.status === 'active') {
-                            setLoginStates(prev => ({ ...prev, [id]: { status: 'success', message: 'Dang nhap thu cong thanh cong!' } }))
-                            setTimeout(() => {
-                                setLoginStates(prev => { const n = { ...prev }; delete n[id]; return n })
-                            }, 4500)
-                            return
-                        }
-                    } catch {}
-                    setTimeout(() => watchForActive(attempts + 1), 3000)
-                }
-                watchForActive(0)
+                watchAccountUntilActive(id)
             } else {
                 setLoginStates(prev => ({
                     ...prev,
@@ -763,7 +782,7 @@ function AccountsTab() {
                     <textarea
                         value={importText}
                         onChange={(e) => setImportText(e.target.value)}
-                        className="h-48 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 py-3 font-mono text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                        className="h-48 w-full rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 py-3 font-mono text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                         placeholder={"email1@gmail.com:password1:2faSECRETBASE32:auto\nemail2@gmail.com,password2,,manual\nemail,password,2FASECRET"}
                     />
                 </div>
@@ -779,7 +798,7 @@ function AccountsTab() {
                         ...getMenuPosition(anchorRect),
                         zIndex: 99999,
                     } as React.CSSProperties}
-                    className="w-52 overflow-hidden rounded-[16px] border border-[#e9e4f2] bg-white shadow-[0_20px_48px_rgba(27,24,38,0.18)]"
+                    className="w-52 overflow-hidden rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] shadow-[0_20px_48px_rgba(27,24,38,0.18)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]"
                     onClick={(e) => e.stopPropagation()}
                 >
                     {(() => {
@@ -789,30 +808,30 @@ function AccountsTab() {
                         return (
                             <>
                                 <button onClick={() => handleEdit(account)}
-                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors">
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a] hover:text-[#17171f] dark:hover:text-[#f0ecff] transition-colors">
                                     <Edit className="h-4 w-4" /> {t('accounts.editAccount')}
                                 </button>
                                 <button onClick={() => handleTestLogin(account.id)}
                                     disabled={isLogging}
-                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] hover:bg-[#f4f1fa] hover:text-[#17171f] transition-colors disabled:opacity-50">
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a] hover:text-[#17171f] dark:hover:text-[#f0ecff] transition-colors disabled:opacity-50">
                                     {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
                                     {account.loginType === 'manual' ? 'Thu cong (dung manual)' : t('accounts.testLogin')}
                                 </button>
                                 <button onClick={() => handleOpenManualLogin(account.id)}
                                     disabled={isLogging}
-                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-amber-600 hover:bg-amber-50 transition-colors disabled:opacity-50">
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/40 transition-colors disabled:opacity-50">
                                     {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
                                     {t('accounts.manualLogin', 'Dang nhap thu cong')}
                                 </button>
                                 <button onClick={() => handleCheck(account.id)}
                                     disabled={isLogging}
-                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 hover:bg-emerald-50 transition-colors disabled:opacity-50">
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 transition-colors disabled:opacity-50">
                                     {isLogging ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
                                     {t('accounts.checkAccount', 'Kiem tra')}
                                 </button>
                                 <Divider />
                                 <button onClick={() => handleDelete(account.id)}
-                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 hover:bg-rose-50 transition-colors">
+                                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors">
                                     <Trash2 className="h-4 w-4" /> {t('accounts.deleteAccount')}
                                 </button>
                             </>
@@ -1096,7 +1115,7 @@ function ProxiesTab() {
                     <textarea
                         value={importText}
                         onChange={(e) => setImportText(e.target.value)}
-                        className="h-48 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 py-3 font-mono text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                        className="h-48 w-full rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 py-3 font-mono text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                         placeholder={"192.168.1.1:8080\n192.168.1.2:8080:user:pass"}
                     />
                 </div>

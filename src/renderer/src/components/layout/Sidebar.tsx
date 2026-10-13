@@ -30,22 +30,22 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
     const ThemeIcon = isDark ? Moon : Sun
 
     return (
-        <aside className="app-sidebar flex max-h-[40vh] w-full shrink-0 flex-col border-b border-[#eeeaf8] lg:h-full lg:max-h-none lg:w-[224px] lg:border-b-0 lg:border-r">
+        <aside className="app-sidebar flex max-h-[40vh] w-full shrink-0 flex-col border-b border-[#eeeaf8] dark:border-[#3d3558] lg:h-full lg:max-h-none lg:w-[224px] lg:border-b-0 lg:border-r">
             <div className="px-5 pb-4 pt-5 lg:px-6 lg:pt-7">
                 <div className="flex items-center gap-3">
                     <div className="flex h-9 w-9 items-center justify-center rounded-full bg-[#8d74e8] text-white shadow-[0_12px_24px_rgba(141,116,232,0.28)]">
                         <Map className="h-5 w-5" />
                     </div>
                     <div className="min-w-0">
-                        <h1 className="truncate text-base font-semibold tracking-tight text-[#17171f]">MMO Review</h1>
-                        <p className="text-[11px] font-medium text-[#8b8798]">Maps Automation</p>
+                        <h1 className="truncate text-base font-semibold tracking-tight text-[#17171f] dark:text-white">MMO Review</h1>
+                        <p className="text-[11px] font-medium text-[#8b8798] dark:text-[#9a8fba]">Maps Automation</p>
                     </div>
                     <button
                         type="button"
                         onClick={toggleTheme}
                         aria-label={toggleTitle}
                         title={toggleTitle}
-                        className="theme-icon-toggle ml-auto inline-flex h-9 w-9 items-center justify-center rounded-full border border-[#eeeaf8] bg-white text-[#2a2933] shadow-sm transition-all hover:bg-[#f5f2fb] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 lg:hidden"
+                        className="theme-icon-toggle ml-auto inline-flex h-9 w-9 items-center justify-center rounded-full border border-[#eeeaf8] dark:border-[#3d3558] bg-white dark:bg-[#2a2540] text-[#2a2933] dark:text-[#f0ecff] shadow-sm transition-all hover:bg-[#f5f2fb] dark:hover:bg-[#352f4a] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 lg:hidden"
                     >
                         <ThemeIcon className="h-4 w-4" />
                     </button>
@@ -55,7 +55,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
             <nav className="flex-1 space-y-2 overflow-y-auto px-3 pb-3 lg:px-4">
                 {navigationSections.map((section) => (
                     <section key={section.titleKey}>
-                        <div className="px-3 pb-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#b4afc2]">
+                        <div className="px-3 pb-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#b4afc2] dark:text-[#9a8fba]">
                             {t(section.titleKey)}
                         </div>
                         <ul className="space-y-1">
@@ -76,17 +76,17 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
             </nav>
 
             <div className="hidden p-4 pt-1 lg:block">
-                <div className="rounded-[20px] bg-[#f6f4fa] p-2.5">
+                <div className="rounded-[20px] bg-[#f6f4fa] dark:bg-[#1e1b2e] p-2.5">
                     <div className="flex items-center gap-3">
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white text-sm font-semibold text-[#8d74e8] shadow-sm">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white dark:bg-[#2a2540] text-sm font-semibold text-[#8d74e8] shadow-sm">
                             K
                         </div>
                         <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-[#1d1c25]">Kiwi Operator</p>
-                            <p className="text-[11px] text-[#8b8798]">Local workspace</p>
+                            <p className="truncate text-sm font-semibold text-[#1d1c25] dark:text-[#f0ecff]">Kiwi Operator</p>
+                            <p className="text-[11px] text-[#8b8798] dark:text-[#9a8fba]">Local workspace</p>
                         </div>
                     </div>
-                    <div className="mt-2 flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs font-semibold text-emerald-600">
+                    <div className="mt-2 flex items-center gap-2 rounded-full bg-white dark:bg-[#2a2540] px-3 py-1.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
                         <ShieldCheck className="h-4 w-4" />
                         {t('common.active')}
                     </div>
@@ -95,13 +95,13 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
                         onClick={toggleTheme}
                         aria-pressed={isDark}
                         title={toggleTitle}
-                        className="theme-row-toggle mt-2 flex w-full items-center justify-between gap-3 rounded-full border border-[#eceaf2] bg-white px-3 py-2 text-xs font-semibold text-[#272530] shadow-sm transition-all hover:bg-[#f7f5fb] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40"
+                        className="theme-row-toggle mt-2 flex w-full items-center justify-between gap-3 rounded-full border border-[#eceaf2] dark:border-[#3d3558] bg-white dark:bg-[#2a2540] px-3 py-2 text-xs font-semibold text-[#272530] dark:text-[#f0ecff] shadow-sm transition-all hover:bg-[#f7f5fb] dark:hover:bg-[#352f4a] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40"
                     >
                         <span className="inline-flex min-w-0 items-center gap-2">
                             <ThemeIcon className="h-4 w-4 text-[#8d74e8]" />
                             <span className="truncate">{themeLabel}</span>
                         </span>
-                        <span className="theme-toggle-track relative h-5 w-9 shrink-0 rounded-full bg-[#ddd8e8]">
+                        <span className="theme-toggle-track relative h-5 w-9 shrink-0 rounded-full bg-[#ddd8e8] dark:bg-[#352f4a]">
                             <span
                                 className={[
                                     'theme-toggle-thumb absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform',
@@ -138,10 +138,10 @@ function SidebarItem({
                 onClick={() => onSelect(page)}
                 className={[
                     'group flex w-full items-center gap-3 rounded-full px-3 py-2 text-sm font-medium transition-all duration-200',
-                    'focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 focus:ring-offset-2 focus:ring-offset-white',
+                    'focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-[#111019]',
                     active
                         ? 'bg-[#8d74e8] text-white shadow-[0_16px_26px_rgba(141,116,232,0.28)]'
-                        : 'text-[#2a2933] hover:bg-[#f5f2fb] hover:text-[#17171f]',
+                        : 'text-[#2a2933] dark:text-[#c8c0d8] hover:bg-[#f5f2fb] dark:hover:bg-[#2a2540] hover:text-[#17171f] dark:hover:text-[#f0ecff]',
                 ].join(' ')}
             >
                 <Icon className={['h-[18px] w-[18px] transition-colors', active ? 'text-current' : iconClass].join(' ')} />

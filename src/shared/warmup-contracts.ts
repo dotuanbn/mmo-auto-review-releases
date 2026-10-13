@@ -1,10 +1,15 @@
-export type WarmupActivityInput =
-    | 'search'
-    | 'maps'
-    | 'youtube'
-    | 'google_search'
-    | 'maps_browse'
-    | 'youtube_browse'
+export const WARMUP_ACTIVITY_INPUTS = [
+    'search',
+    'maps',
+    'youtube',
+    'google_search',
+    'maps_browse',
+    'youtube_browse',
+    'gmail',
+    'photos_browse',
+] as const
+
+export type WarmupActivityInput = (typeof WARMUP_ACTIVITY_INPUTS)[number]
 
 export interface WarmupStartOptions {
     activityType?: WarmupActivityInput
@@ -33,6 +38,10 @@ export interface AccountWarmupStatusDto {
     lastWarmupAt: string | null
     nextWarmupAt: string | null
     isReady: boolean
+    /** 0 = not started; 1–7 = birth-story day. Optional for older status payloads. */
+    birthStoryDay?: number
+    birthStoryStartDate?: string | null
+    birthStoryCompleted?: boolean
 }
 
 export interface WarmupActionResultDto {

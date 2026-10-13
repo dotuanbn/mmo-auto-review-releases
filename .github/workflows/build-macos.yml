@@ -18,7 +18,7 @@ jobs:
     name: Windows build + packaged smoke + release upload
     needs: quality
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
       - name: Checkout code
@@ -36,6 +36,28 @@ jobs:
           # Electron smoke uses Playwright's Electron driver, not Chromium browsers
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
 
+      - name: Setup Python 3.13 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: 'x64'
+
+      - name: Build Laya sidecar
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-laya-sidecar.ps1
+
+      - name: Sign Laya sidecar
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\sign-laya-sidecar.ps1
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          WIN_CSC_THUMBPRINT: ${{ secrets.WIN_CSC_THUMBPRINT }}
+
+      - name: Verify signed Laya sidecar
+        shell: pwsh
+        run: node scripts/verify-laya-sidecar.cjs --require-signature
+
       - name: Build app (Vite)
         run: npx vite build
         env:
@@ -46,6 +68,8 @@ jobs:
         run: npx electron-builder --win --publish never
         env:
           NODE_OPTIONS: '--max_old_space_size=4096'
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
 
       - name: List Windows artifacts
         shell: pwsh
@@ -70,7 +94,11 @@ jobs:
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
 
-      # Upload only after both smoke steps succeed (previous steps must pass).
+      - name: Laya sidecar runtime smoke
+        shell: pwsh
+        run: node scripts/smoke-laya-sidecar.cjs --root=release/win-unpacked/resources/laya-sidecar
+
+      # Upload only after packaged smoke and the sidecar runtime smoke succeed.
       - name: Upload Windows artifacts to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2

@@ -1,5 +1,11 @@
 # QA Log
 
+## 2026-10-07 [release] [testing] [laya]
+
+Q: Có thể đóng gói Laya vào bản Windows để khách thử nghiệm chỉ cập nhật/cài app mà không cài Python hay Laya riêng không?
+
+A: Có cho kênh pilot unsigned. `resources/laya-sidecar` được đưa vào `build.win.extraResources`; app tự khởi động sidecar local trên loopback và model chạy offline. `npm run release:unsigned` đã build installer, sidecar smoke, unpacked smoke và silent NSIS smoke. Kết quả: sidecar inference pass; app packaged 24/24 ở cả unpacked và NSIS; 915/915 unit tests pass; không có page/console errors. Installer archive `release-history/v1.0.16-r2`, SHA-256 `8aedb209cd535a9444b87b2e712180de64a99168eb479761706dda77cd0f934b`. Artifact chưa ký Authenticode, nên Windows có thể yêu cầu `More info -> Run anyway`; chưa được publish OTA đại trà và chưa có clean VM/customer smoke.
+
 ## 2026-07-13 [architecture] [security] [testing] [ui] [deploy]
 
 Q: Sau Reliability/Security/Warmup/Review Style/Photo/Operations, dự án cần phát triển gì và các P0 nào phải đóng trước?

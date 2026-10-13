@@ -404,12 +404,12 @@ function ContentTab() {
                     </h3>
                     <div className="text-sm text-[#5f5a6d] space-y-2">
                         <p>Use <code className="bg-[#f4f1fa] px-1.5 py-0.5 rounded text-[#735bd6] text-xs font-mono">{'{option1|option2|option3}'}</code> to create variations</p>
-                        <div className="bg-white/60 p-3 rounded-[14px] border border-[#e9e4f2]">
-                            <p className="text-[#908a9e] text-xs mb-1">Example:</p>
+                        <div className="bg-white/60 dark:bg-[#1e1b2e]/60 p-3 rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558]">
+                            <p className="text-[#908a9e] dark:text-[#9a8fba] text-xs mb-1">Example:</p>
                             <code className="text-[#735bd6] text-xs">
                                 {'Dịch vụ {tuyệt vời|rất tốt|xuất sắc}! {Tôi|Mình} rất {hài lòng|thích}.'}
                             </code>
-                            <p className="text-[#908a9e] text-xs mt-2">
+                            <p className="text-[#908a9e] dark:text-[#9a8fba] text-xs mt-2">
                                 Could generate: "Dịch vụ tuyệt vời! Mình rất hài lòng."
                             </p>
                         </div>
@@ -490,7 +490,7 @@ function ContentTab() {
                                                     <Badge tone="slate">{t('common.inactive')}</Badge>
                                                 )}
                                             </div>
-                                            <div className="bg-[#f7f7f9] border border-[#e9e4f2] rounded-[14px] p-2.5 font-mono text-sm text-[#5f5a6d]">
+                                            <div className="bg-[#f7f7f9] dark:bg-[#2a2540] border border-[#e9e4f2] dark:border-[#3d3558] rounded-[14px] p-2.5 font-mono text-sm text-[#5f5a6d] dark:text-[#c8c0d8]">
                                                 {template.content.length > 200
                                                     ? template.content.substring(0, 200) + '...'
                                                     : template.content}
@@ -689,7 +689,7 @@ function ContentTab() {
                         <textarea
                             value={newTemplate.content}
                             onChange={(e) => setNewTemplate({ ...newTemplate, content: e.target.value })}
-                            className="w-full h-40 px-4 py-3 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] font-mono placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                            className="w-full h-40 px-4 py-3 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] font-mono placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                             placeholder="{Dịch vụ|Trải nghiệm} {tuyệt vời|rất tốt}! {Tôi|Mình} rất {hài lòng|thích}."
                         />
                     </div>
@@ -744,7 +744,7 @@ function ContentTab() {
                             <textarea
                                 value={editingTemplate.content}
                                 onChange={(e) => setEditingTemplate({ ...editingTemplate, content: e.target.value })}
-                                className="w-full h-40 px-4 py-3 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] font-mono focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                                className="w-full h-40 px-4 py-3 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] font-mono dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                             />
                         </div>
 
@@ -770,9 +770,9 @@ function ContentTab() {
                     {previewVariations.map((variation, index) => (
                         <div
                             key={index}
-                            className="bg-[#f7f7f9] border border-[#e9e4f2] p-3 rounded-[14px] flex items-start justify-between gap-3"
+                            className="bg-[#f7f7f9] dark:bg-[#2a2540] border border-[#e9e4f2] dark:border-[#3d3558] p-3 rounded-[14px] flex items-start justify-between gap-3"
                         >
-                            <p className="text-[#5f5a6d] text-sm flex-1">{variation}</p>
+                            <p className="text-[#5f5a6d] dark:text-[#c8c0d8] text-sm flex-1">{variation}</p>
                             <IconButton
                                 icon={Copy}
                                 label="Copy"

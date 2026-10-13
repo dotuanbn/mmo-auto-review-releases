@@ -56,7 +56,7 @@ describe('countWarmupSessionsOnLocalDate', () => {
             sessionActivity('google_search', new Date(2026, 5, 1, 9, 0, 0).toISOString()),
             sessionActivity('maps_browse', new Date(2026, 5, 1, 15, 0, 0).toISOString()),
             sessionActivity('youtube_browse', new Date(2026, 5, 1, 20, 0, 0).toISOString()),
-            sessionActivity('gmail', new Date(2026, 5, 1, 11, 0, 0).toISOString()), // not a session type
+            sessionActivity('other', new Date(2026, 5, 1, 11, 0, 0).toISOString()), // not a session type
             sessionActivity('google_search', new Date(2026, 5, 2, 9, 0, 0).toISOString()), // other day
         ]
         expect(countWarmupSessionsOnLocalDate(history, day)).toBe(3)

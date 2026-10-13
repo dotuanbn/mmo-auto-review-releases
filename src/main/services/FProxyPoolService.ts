@@ -45,7 +45,10 @@ type SlotRuntime = {
     epoch: number
     generation: number
     endpoint: FProxyEndpoint | null
-    lease: LeaseRecord | null
+    /** Active leases keyed by lease id. One slot may be shared across locations. */
+    leases: Map<string, LeaseRecord>
+    /** Compatibility: first active lease, if any. */
+    readonly lease: LeaseRecord | null
     busy: SlotBusyState
     operationAbort: AbortController | null
     rotationPending: boolean
@@ -116,6 +119,8 @@ export class FProxyPoolService {
     private draining = false
     private wakeTimer: ReturnType<typeof setTimeout> | null = null
     private autoRefreshTimer: ReturnType<typeof setInterval> | null = null
+    /** Consecutive 30s ticks skipped because no slot held a lease. */
+    private autoRefreshIdleSkips = 0
 
     constructor(apiClient: FProxyApiClient = new FProxyApiClient()) {
         this.apiClient = apiClient
@@ -214,22 +219,27 @@ export class FProxyPoolService {
         shouldStop: () => boolean,
         onStatus?: (msg: string) => void,
         signal?: AbortSignal,
+        locationId?: number,
     ): Promise<{ availableMs: number; nextRotateAt: number | null; readySlotIds: number[] }> {
         await this.ensurePolicyLoaded()
         const minRequired = Math.max(1, Math.floor(minTimeRequiredSec || 1))
+        const minRequiredMs = minRequired * 1000
 
         while (!shouldStop() && !signal?.aborted) {
             const snapshot = await this.getSnapshot()
             const now = Date.now()
-            // Free keys only (enabled, not leased/busy/disabled).
+            // Free keys, plus leased keys that another location can still share.
             const candidates = snapshot.slots.filter(slot =>
                 slot.enabled
                 && slot.hasSecret
-                && slot.status !== 'leased'
                 && slot.status !== 'disabled'
                 && slot.status !== 'testing'
                 && slot.status !== 'rotating'
                 && slot.status !== 'error'
+                && (
+                    slot.status !== 'leased'
+                    || canShareLeasedSlot(slot, locationId)
+                )
             )
 
             if (candidates.length === 0) {
@@ -256,8 +266,15 @@ export class FProxyPoolService {
                 }
             })
 
-            // Ready now: free slots whose rotate countdown is already 0 / not cooling.
-            const readyNow = withRemaining.filter(item => item.available || item.remainingSec <= 0)
+            // Ready now: free slots whose rotate countdown is already 0 / not cooling,
+            // or leased slots running a different location with enough IP lifetime left.
+            const readyNow = withRemaining.filter(item => {
+                if (item.slot.status === 'leased') {
+                    const remainingMs = (item.slot.ipExpiresAt ?? 0) - now
+                    return remainingMs >= minRequiredMs
+                }
+                return item.available || item.remainingSec <= 0
+            })
             if (readyNow.length > 0) {
                 // Visit budget should fit one rotate cycle (~2 min), not IP lifetime.
                 const intervalMs = 120_000
@@ -270,8 +287,9 @@ export class FProxyPoolService {
             }
 
             // All free keys still cooling: wait earliest trusted waiting_time.
+            // Leased share-candidates only lose remaining time, so they never become "more ready".
             const earliest = withRemaining
-                .filter(item => item.remainingSec > 0)
+                .filter(item => item.slot.status !== 'leased' && item.remainingSec > 0)
                 .sort((a, b) => a.remainingSec - b.remainingSec)[0]
 
             if (!earliest) {
@@ -380,16 +398,12 @@ export class FProxyPoolService {
         return this.changed()
     }
 
-    /** Start periodic auto-refresh (every 30s) for enabled slots. */
+    /** Start periodic auto-refresh (every 30s). Idle ticks skip the provider API. */
     startAutoRefresh(): void {
         if (this.autoRefreshTimer) return
+        this.autoRefreshIdleSkips = 0
         this.autoRefreshTimer = setInterval(() => {
-            const hasEnabled = this.getRows().some(row => row.enabled)
-            if (hasEnabled) {
-                void this.refreshAllSlots().catch(() => {
-                    // Auto-refresh failures are non-critical
-                })
-            }
+            this.runAutoRefreshTick()
         }, 30_000)
     }
 
@@ -398,6 +412,45 @@ export class FProxyPoolService {
         if (this.autoRefreshTimer) {
             clearInterval(this.autoRefreshTimer)
             this.autoRefreshTimer = null
+        }
+        this.autoRefreshIdleSkips = 0
+    }
+
+    /** True when any slot still has a caller holding a lease. */
+    private hasActiveLease(): boolean {
+        for (const runtime of Array.from(this.runtimes.values())) {
+            if (runtime.leases.size > 0) return true
+        }
+        return false
+    }
+
+    private noteIdleAutoRefreshSkip(): void {
+        this.autoRefreshIdleSkips += 1
+        const count = this.autoRefreshIdleSkips
+        if (count === 1 || count % 10 === 0) {
+            console.info(`[FProxyPool] Auto-refresh idle skip count=${count} (no active leases)`)
+        }
+    }
+
+    /**
+     * Keep the 30s timer armed, but call FProxy only while a lease is active
+     * so an idle app does not poll the provider forever.
+     */
+    private runAutoRefreshTick(): void {
+        try {
+            if (!this.hasActiveLease()) {
+                this.noteIdleAutoRefreshSkip()
+                return
+            }
+            this.autoRefreshIdleSkips = 0
+            const hasEnabled = this.getRows().some((row) => row.enabled)
+            if (!hasEnabled) return
+            void this.refreshAllSlots().catch(() => {
+                // Auto-refresh failures are non-critical
+            })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            console.error(`[FProxyPool] Auto-refresh tick failed: ${message}`)
         }
     }
 
@@ -511,10 +564,23 @@ export class FProxyPoolService {
 
     private async tryAcquire(request: FProxyLeaseRequest): Promise<FProxyLease | null> {
         const now = Date.now()
+        const minRemaining = clampMinRemaining(request.minRemainingMs)
         const rows = this.rankCandidates(this.getRows(), request.owner)
         for (const row of rows) {
             const runtime = this.runtimeFor(row.id)
-            if (!row.enabled || runtime.lease || runtime.busy) continue
+            if (!row.enabled || runtime.busy) continue
+
+            if (runtime.leases.size > 0) {
+                // Share a live slot across locations when no lease already covers this locationId
+                // and the current endpoint still has enough IP lifetime.
+                if (!canShareSlot(runtime, request.owner.locationId, minRemaining, now)) continue
+                const endpoint = runtime.endpoint
+                if (!endpoint) continue
+                const lease = this.commitLease(row, runtime, endpoint, readObservedIp(endpoint), request.owner)
+                this.emitSnapshot()
+                return lease
+            }
+
             // Skip cooling slots without locking them; wait for the earliest ready key instead.
             if (slotReadyAt(runtime, now) > now) continue
             const lease = await this.prepareLease(row, runtime, request)
@@ -704,12 +770,19 @@ export class FProxyPoolService {
         observedIp: string,
         owner: FProxyLeaseOwnerDto,
     ): FProxyLease {
-        this.acceptEndpoint(runtime, endpoint)
+        // First exclusive lease publishes the endpoint; extra location leases reuse it as-is
+        // so existing holders keep a stable generation.
+        if (runtime.leases.size === 0) {
+            this.acceptEndpoint(runtime, endpoint)
+        }
         const leaseId = randomUUID()
         const hardExpiresAt = Math.max(Date.now() + 1, endpoint.endpointExpiresAt - LEASE_EXPIRY_SAFETY_MS)
         const abortController = new AbortController()
-        const expiryTimer = setTimeout(() => abortController.abort(), hardExpiresAt - Date.now())
-        runtime.lease = {
+        const generation = runtime.generation
+        const expiryTimer = setTimeout(() => {
+            this.onLeaseExpired(row.id, leaseId, generation, abortController)
+        }, Math.max(0, hardExpiresAt - Date.now()))
+        const record: LeaseRecord = {
             id: leaseId,
             generation: runtime.generation,
             owner: sanitizeOwner(owner),
@@ -718,18 +791,18 @@ export class FProxyPoolService {
             abortController,
             expiryTimer,
         }
+        runtime.leases.set(leaseId, record)
         runtime.stickyOwnerId = owner.id
         runtime.lastLeaseAt = Date.now()
-        return this.makeLeaseHandle(row.id, runtime, endpoint, observedIp)
+        return this.makeLeaseHandle(row.id, endpoint, observedIp, record)
     }
 
     private makeLeaseHandle(
         slotId: number,
-        runtime: SlotRuntime,
         endpoint: FProxyEndpoint,
         observedIp: string,
+        lease: LeaseRecord,
     ): FProxyLease {
-        const lease = runtime.lease!
         let released = false
         return {
             leaseId: lease.id,
@@ -748,13 +821,47 @@ export class FProxyPoolService {
         }
     }
 
+    /**
+     * Expiry must drop the lease, not only abort the signal.
+     * Abort alone leaves a ghost entry that pins the slot forever.
+     */
+    private onLeaseExpired(
+        slotId: number,
+        leaseId: string,
+        generation: number,
+        abortController: AbortController,
+    ): void {
+        try {
+            abortController.abort()
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            console.error(`[FProxyPool] Abort on expired lease ${leaseId} failed: ${message}`)
+        }
+
+        const runtime = this.runtimes.get(slotId)
+        const active = runtime?.leases.get(leaseId)
+        if (!runtime || !active || active.generation !== generation) return
+
+        console.warn(`[FProxyPool] Force-released expired ghost lease ${leaseId} on slot ${slotId}`)
+        void this.releaseLease(slotId, leaseId, generation).catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error)
+            console.error(`[FProxyPool] Expired lease release failed on slot ${slotId}: ${message}`)
+        })
+    }
+
     private async releaseLease(slotId: number, leaseId: string, generation: number): Promise<void> {
         const runtime = this.runtimes.get(slotId)
-        const active = runtime?.lease
-        if (!runtime || !active) return
-        if (active.id !== leaseId || active.generation !== generation) return
+        if (!runtime) return
+        const active = runtime.leases.get(leaseId)
+        if (!active || active.generation !== generation) return
         clearTimeout(active.expiryTimer)
-        runtime.lease = null
+        runtime.leases.delete(leaseId)
+        // Other locations may still be using this IP; only the last release starts rotation.
+        if (runtime.leases.size > 0) {
+            await this.changed()
+            this.scheduleDrain()
+            return
+        }
         if (this.policy.rotationPolicy === 'rotate_per_visit') {
             runtime.rotationPending = true
             // Do not pin the next visit to this slot; pick the earliest-ready free key.
@@ -888,7 +995,8 @@ export class FProxyPoolService {
                 ? endpoint.rotateAllowedAt
                 : (cooldownUntil ?? null),
             currentEgress: readPublicEgress(endpoint),
-            leaseOwner: runtime.lease?.owner ?? null,
+            leaseOwner: getLease(runtime)?.owner ?? null,
+            activeLocationIds: collectLocationIds(runtime),
             lastTest: runtime.lastTest,
             error: runtime.error,
         }
@@ -962,12 +1070,12 @@ export class FProxyPoolService {
 
     private abortRuntime(runtime: SlotRuntime): void {
         this.abortOperation(runtime)
-        if (runtime.lease) {
-            clearTimeout(runtime.lease.expiryTimer)
-            runtime.lease.abortController.abort()
+        for (const record of Array.from(runtime.leases.values())) {
+            clearTimeout(record.expiryTimer)
+            record.abortController.abort()
         }
+        runtime.leases.clear()
         runtime.endpoint = null
-        runtime.lease = null
     }
 
     private async changed(): Promise<FProxyPoolSnapshotDto> {
@@ -997,7 +1105,10 @@ function createRuntime(): SlotRuntime {
         epoch: 0,
         generation: 0,
         endpoint: null,
-        lease: null,
+        leases: new Map<string, LeaseRecord>(),
+        get lease(): LeaseRecord | null {
+            return getLease(this)
+        },
         busy: null,
         operationAbort: null,
         rotationPending: false,
@@ -1008,6 +1119,50 @@ function createRuntime(): SlotRuntime {
     }
 }
 
+/** Compatibility helper: first active lease on the slot, if any. */
+function getLease(runtime: Pick<SlotRuntime, 'leases'>): LeaseRecord | null {
+    for (const record of Array.from(runtime.leases.values())) return record
+    return null
+}
+
+function collectLocationIds(runtime: SlotRuntime): number[] {
+    const ids: number[] = []
+    for (const record of Array.from(runtime.leases.values())) {
+        const locationId = record.owner.locationId
+        if (typeof locationId === 'number' && !ids.includes(locationId)) {
+            ids.push(locationId)
+        }
+    }
+    return ids
+}
+
+function hasLeaseForLocation(runtime: SlotRuntime, locationId: number): boolean {
+    for (const record of Array.from(runtime.leases.values())) {
+        if (record.owner.locationId === locationId) return true
+    }
+    return false
+}
+
+function canShareSlot(
+    runtime: SlotRuntime,
+    locationId: number | undefined,
+    minRemainingMs: number,
+    now: number,
+): boolean {
+    if (typeof locationId !== 'number') return false
+    if (runtime.leases.size === 0) return false
+    if (hasLeaseForLocation(runtime, locationId)) return false
+    const endpoint = runtime.endpoint
+    if (!endpoint) return false
+    return endpoint.endpointExpiresAt - now >= minRemainingMs
+}
+
+function canShareLeasedSlot(slot: FProxySlotPublicDto, locationId: number | undefined): boolean {
+    if (typeof locationId !== 'number') return false
+    if (slot.status !== 'leased') return false
+    return !(slot.activeLocationIds ?? []).includes(locationId)
+}
+
 function validateOwner(owner: FProxyLeaseOwnerDto): void {
     if (!owner.id.trim() || owner.id.length > 160 || owner.threadId < 0) {
         throw new FProxyPoolError('no_slot_available')
@@ -1015,11 +1170,15 @@ function validateOwner(owner: FProxyLeaseOwnerDto): void {
 }
 
 function sanitizeOwner(owner: FProxyLeaseOwnerDto): FProxyLeaseOwnerDto {
-    return {
+    const sanitized: FProxyLeaseOwnerDto = {
         kind: owner.kind,
         id: owner.id.replace(/[\0\r\n]/g, '').slice(0, 160),
         threadId: Math.max(0, Math.floor(owner.threadId)),
     }
+    if (typeof owner.locationId === 'number') {
+        sanitized.locationId = owner.locationId
+    }
+    return sanitized
 }
 
 function readObservedIp(endpoint: FProxyEndpoint): string {

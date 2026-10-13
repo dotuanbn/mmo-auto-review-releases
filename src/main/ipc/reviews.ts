@@ -3,8 +3,11 @@ import {
     reviewHistoryCampaignIdSchema,
     reviewHistoryFiltersInputSchema,
     reviewHistoryOptionalLimitSchema,
+    reviewVerificationQueueLimitSchema,
+    reviewVerificationRecordSchema,
 } from '../../shared/review-history-contracts'
 import { reviewService } from '../services/ReviewService'
+import { reviewVerificationService } from '../services/ReviewVerificationService'
 import { parseIpcPayload, withIpcValidation } from './validate'
 
 /** Re-export filter type for any legacy main-process imports. */
@@ -94,6 +97,30 @@ export function registerReviewHandlers(): void {
             }
 
             return reviews
+        }),
+    )
+
+    ipcMain.handle(
+        'reviews:getVerificationQueue',
+        withIpcValidation('reviews:getVerificationQueue', async (_event, limit?: unknown) => {
+            const parsedLimit = parseIpcPayload(
+                'reviews:getVerificationQueue',
+                reviewVerificationQueueLimitSchema,
+                limit,
+            )
+            return reviewVerificationService.getVerificationQueue(parsedLimit)
+        }),
+    )
+
+    ipcMain.handle(
+        'reviews:recordVerification',
+        withIpcValidation('reviews:recordVerification', async (_event, payload: unknown) => {
+            const parsed = parseIpcPayload(
+                'reviews:recordVerification',
+                reviewVerificationRecordSchema,
+                payload,
+            )
+            return reviewVerificationService.recordVerificationResult(parsed)
         }),
     )
 }

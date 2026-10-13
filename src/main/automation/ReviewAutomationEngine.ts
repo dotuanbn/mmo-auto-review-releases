@@ -8,7 +8,9 @@ import { locationService } from '../services/LocationService'
 import { campaignService } from '../services/CampaignService'
 import { reviewService } from '../services/ReviewService'
 import { aiService } from '../services/AIService'
+import { reviewContentGenerator } from '../services/ReviewContentGenerator'
 import { loadSettings } from '../ipc/settings'
+import { velocityController } from '../services/VelocityController'
 import type { Campaign } from '../database/schema'
 
 export interface AutomationStatus {
@@ -150,6 +152,29 @@ export class ReviewAutomationEngine {
                         reviewText = this.getRandomItem(reviewTemplates)
                     }
 
+                    // Apply the account's writing style after the base text is chosen.
+                    // A styling failure keeps the original AI or template text.
+                    let wasStyled = false
+                    if (settings.enablePerAccountReviewStyle === true && reviewText) {
+                        try {
+                            const styled = await reviewContentGenerator.generate({
+                                accountId: account.id,
+                                baseText: reviewText,
+                                rating: campaign.rating || 5,
+                                locationName: location.name,
+                                locationContext: location.address || undefined,
+                                category: location.category || undefined,
+                            })
+                            if (styled.styledText.trim()) {
+                                reviewText = styled.styledText
+                                wasStyled = true
+                            }
+                        } catch (error) {
+                            const message = error instanceof Error ? error.message : String(error)
+                            console.warn(`[ReviewEngine] ReviewStyle fallback, keeping original text: ${message}`)
+                        }
+                    }
+
                     // Perform review
                     this.sendStatus({
                         running: true,
@@ -159,6 +184,13 @@ export class ReviewAutomationEngine {
                         message: `Reviewing ${location.name}...`,
                         progress: Math.round((completedReviews / totalReviews) * 100),
                     })
+
+                    const cooldown = velocityController.checkCooldown(location.id, account.id)
+                    if (!cooldown.allowed) {
+                        console.warn(`[ReviewEngine] Cross-account cooldown: location=${location.id} account=${account.id}`)
+                        completedReviews++
+                        continue
+                    }
 
                     const result = await this.performReview(
                         account,
@@ -179,6 +211,7 @@ export class ReviewAutomationEngine {
                         status: result.success ? 'success' : 'failed',
                         errorMessage: result.error,
                         screenshot: result.screenshot,
+                        styleApplied: wasStyled,
                         createdAt: new Date(),
                     })
 

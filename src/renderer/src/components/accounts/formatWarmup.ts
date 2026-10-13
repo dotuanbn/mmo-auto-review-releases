@@ -140,6 +140,10 @@ export function activityLabel(type: WarmupActivityType | null, t: Translate): st
             return t('accounts.warmup.activityMaps', 'Maps')
         case 'youtube':
             return t('accounts.warmup.activityYoutube', 'YouTube')
+        case 'gmail':
+            return t('accounts.warmup.activityGmail', 'Gmail')
+        case 'photos_browse':
+            return t('accounts.warmup.activityPhotos', 'Photos')
         default:
             return t('accounts.warmup.activityNone', '—')
     }

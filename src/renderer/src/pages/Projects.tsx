@@ -327,21 +327,21 @@ export function Projects() {
                                         <button
                                             disabled={selectionMode}
                                             onClick={() => setActiveDropdown(activeDropdown === project.id ? null : project.id)}
-                                            className="rounded-full p-1 text-[#908a9e] opacity-0 transition-opacity hover:bg-[#f4f1fa] group-hover:opacity-100 [div:hover>&]:opacity-100"
+                                            className="rounded-full p-1 text-[#908a9e] opacity-0 transition-opacity hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a] group-hover:opacity-100 [div:hover>&]:opacity-100"
                                             type="button"
                                         >
                                             <MoreVertical className="h-4 w-4" />
                                         </button>
 
                                         {activeDropdown === project.id && (
-                                            <div className="absolute right-0 top-full z-10 mt-1 w-40 overflow-hidden rounded-[16px] border border-[#e9e4f2] bg-white shadow-[0_18px_48px_rgba(40,36,54,0.12)]">
+                                            <div className="absolute right-0 top-full z-10 mt-1 w-40 overflow-hidden rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] shadow-[0_18px_48px_rgba(40,36,54,0.12)] dark:shadow-[0_18px_48px_rgba(0,0,0,0.4)]">
                                                 <button
                                                     onClick={() => {
                                                         setSelectedProject(project)
                                                         setShowEditModal(true)
                                                         setActiveDropdown(null)
                                                     }}
-                                                    className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-[#5f5a6d] hover:bg-[#f4f1fa]"
+                                                    className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-[#5f5a6d] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]"
                                                     type="button"
                                                 >
                                                     <Edit className="h-4 w-4" />
@@ -352,7 +352,7 @@ export function Projects() {
                                                         handleArchive(project.id)
                                                         setActiveDropdown(null)
                                                     }}
-                                                    className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-[#5f5a6d] hover:bg-[#f4f1fa]"
+                                                    className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-[#5f5a6d] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]"
                                                     type="button"
                                                 >
                                                     <Archive className="h-4 w-4" />
@@ -363,7 +363,7 @@ export function Projects() {
                                                         handleDelete(project.id)
                                                         setActiveDropdown(null)
                                                     }}
-                                                    className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-rose-500 hover:bg-rose-50"
+                                                    className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
                                                     type="button"
                                                 >
                                                     <Trash2 className="h-4 w-4" />
@@ -458,7 +458,7 @@ export function Projects() {
                         <textarea
                             value={newProject.description}
                             onChange={(e) => setNewProject({ ...newProject, description: e.target.value })}
-                            className="h-20 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 py-3 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                            className="h-20 w-full rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 py-3 text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                             placeholder="Optional description..."
                         />
                     </div>
@@ -511,7 +511,7 @@ export function Projects() {
                             <textarea
                                 value={selectedProject.description || ''}
                                 onChange={(e) => setSelectedProject({ ...selectedProject, description: e.target.value })}
-                                className="h-20 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 py-3 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                                className="h-20 w-full rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 py-3 text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                             />
                         </div>
 

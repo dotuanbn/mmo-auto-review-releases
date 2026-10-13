@@ -49,6 +49,16 @@ export interface JobTransitionResult {
     reason?: string
 }
 
+/** Optional filters for peek/claim. Omitted fields keep the historical selection rules. */
+export interface JobClaimOptions {
+    /**
+     * Review jobs whose locationId is in this list are not eligible.
+     * Used for cross-account cooldown so a hot location is skipped, not failed.
+     * Traffic jobs are unaffected.
+     */
+    disallowRecentlyReviewedLocations?: number[]
+}
+
 const DEFAULT_CONFIG: JobQueueConfig = {
     maxRetriesPerJob: 3,
     maxReviewsPerAccountPerDay: 5,
@@ -73,6 +83,10 @@ interface JobMutationSnapshot {
     inHidden: boolean
     /** Index in accountQueues, or -1 if absent. */
     queueIndex: number
+    /** False when this mutation adopted a terminal row that was not in `jobs`. */
+    wasResident: boolean
+    /** True when adopting subtracted a visible terminal counter that rollback must restore. */
+    restoreTerminalCount: boolean
 }
 
 export function isImmutableTerminalStatus(status: JobStatus): boolean {
@@ -81,6 +95,19 @@ export function isImmutableTerminalStatus(status: JobStatus): boolean {
 
 export function isActiveJobStatus(status: JobStatus): boolean {
     return status === 'pending' || status === 'running'
+}
+
+function isTerminalJobStatus(status: string): status is 'done' | 'failed' | 'cancelled' {
+    return status === 'done' || status === 'failed' || status === 'cancelled'
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+    return (
+        typeof value === 'object' &&
+        value !== null &&
+        'then' in value &&
+        typeof (value as { then?: unknown }).then === 'function'
+    )
 }
 
 /**
@@ -98,6 +125,16 @@ class JobQueue {
     private accountQueues: Map<number, string[]> = new Map()
     private runningJobs: Set<string> = new Set()
     private hiddenTerminalJobs: Set<string> = new Set()
+    /** Status-only index for jobs removed from `jobs` after a terminal persist. */
+    private terminalStatus: Map<string, JobStatus> = new Map()
+    /**
+     * Terminal job objects the sync driver could not read back.
+     * Kept out of `jobs` so scheduling stays on active work only.
+     */
+    private archivedJobs: Map<string, Job> = new Map()
+    /** `${campaignId}|${accountId}:${locationId}` for done/failed rows not kept in RAM. */
+    private blockingPairs: Set<string> = new Set()
+    private terminalCounts: Map<string, { done: number; failed: number; cancelled: number }> = new Map()
     private loaded = false
     private loadPromise: Promise<void> | null = null
     /** Serializes status mutations so check+set+persist is atomic vs concurrent async. */
@@ -155,25 +192,19 @@ class JobQueue {
     }
 
     /**
-     * Load jobs from DB. Convert in-progress (running) → pending safely.
-     * Terminal jobs (done/failed/cancelled) stay loaded so we never re-enqueue them.
-     * Never requeues done/cancelled.
+     * Load pending/running jobs only. Terminal history stays in SQLite.
+     * Convert in-progress (running) → pending safely. Never requeues done/cancelled.
      * On failure: reset in-memory state, leave loaded=false, rethrow.
      */
     private async loadFromDatabase(): Promise<void> {
         try {
-            const db = getDatabase()
-            const rows = await db.select().from(schema.jobQueueEntries).all()
-
-            this.jobs.clear()
-            this.accountQueues.clear()
-            this.runningJobs.clear()
-            this.hiddenTerminalJobs.clear()
+            const partition = await this.selectRowsForLoad()
+            this.resetMemoryIndexes()
 
             let requeued = 0
-            for (const row of rows) {
+            for (const row of partition.active) {
                 const job = this.rowToJob(row)
-                // Only interrupted in-flight work is requeued; terminals stay history.
+                if (!isActiveJobStatus(job.status)) continue
                 if (job.status === 'running') {
                     job.status = 'pending'
                     job.startedAt = undefined
@@ -182,23 +213,242 @@ class JobQueue {
                 }
                 this.indexJob(job)
             }
+            for (const row of partition.terminal) {
+                this.rememberLoadedTerminal(this.rowToJob(row))
+            }
 
+            await this.loadTerminalJobIndexes()
             this.lastRequeuedRunningCount = requeued
             this.loaded = true
             console.log(
-                `[JobQueue] Loaded ${rows.length} jobs from DB` +
+                `[JobQueue] Loaded ${this.jobs.size} active jobs from DB` +
                 (requeued > 0 ? ` (requeued ${requeued} in-progress → pending)` : '')
             )
         } catch (error) {
             console.error('[JobQueue] Failed to load from database:', error)
-            this.jobs.clear()
-            this.accountQueues.clear()
-            this.runningJobs.clear()
-            this.hiddenTerminalJobs.clear()
+            this.resetMemoryIndexes()
             this.lastRequeuedRunningCount = 0
             this.loaded = false
             throw error
         }
+    }
+
+    private resetMemoryIndexes(): void {
+        this.jobs.clear()
+        this.accountQueues.clear()
+        this.runningJobs.clear()
+        this.hiddenTerminalJobs.clear()
+        this.terminalStatus.clear()
+        this.archivedJobs.clear()
+        this.blockingPairs.clear()
+        this.terminalCounts.clear()
+    }
+
+    /**
+     * Active rows for the resident map. Terminal rows are returned only when the
+     * query builder cannot filter (test doubles); a real driver keeps them in SQLite.
+     */
+    private async selectRowsForLoad(): Promise<{
+        active: schema.JobQueueEntry[]
+        terminal: schema.JobQueueEntry[]
+    }> {
+        const db = getDatabase()
+        const query = db.select().from(schema.jobQueueEntries)
+        const whereFn = (query as {
+            where?: (clause: unknown) => {
+                all: () => Promise<schema.JobQueueEntry[]> | schema.JobQueueEntry[]
+                groupBy?: unknown
+            }
+        }).where
+
+        const partition = (rows: schema.JobQueueEntry[]) => ({
+            active: rows.filter((row) => row.status === 'pending' || row.status === 'running'),
+            terminal: rows.filter((row) => isTerminalJobStatus(row.status)),
+        })
+
+        if (typeof whereFn === 'function') {
+            const filtered = whereFn.call(
+                query,
+                inArray(schema.jobQueueEntries.status, ['pending', 'running']),
+            )
+            // Drizzle's builder has groupBy. A stub `where()` that ignores the clause does not.
+            if (typeof filtered.groupBy === 'function') {
+                const rows = await filtered.all()
+                return { active: rows, terminal: [] }
+            }
+        }
+
+        const rows = await (query as {
+            all: () => Promise<schema.JobQueueEntry[]> | schema.JobQueueEntry[]
+        }).all()
+        return partition(rows)
+    }
+
+    /** Compact done/failed keys + counts. Full terminal job objects are not loaded. */
+    private async loadTerminalJobIndexes(): Promise<void> {
+        await this.loadBlockingPairs()
+        await this.loadTerminalJobCounts()
+    }
+
+    private async loadBlockingPairs(): Promise<void> {
+        const db = getDatabase()
+        const query = db.select({
+            campaignId: schema.jobQueueEntries.campaignId,
+            accountId: schema.jobQueueEntries.accountId,
+            locationId: schema.jobQueueEntries.locationId,
+        }).from(schema.jobQueueEntries)
+        const whereFn = (query as {
+            where?: (clause: unknown) => {
+                all: () => Promise<Array<{
+                    campaignId: number | null
+                    accountId: number
+                    locationId: number
+                }>> | Array<{
+                    campaignId: number | null
+                    accountId: number
+                    locationId: number
+                }>
+            }
+        }).where
+        if (typeof whereFn !== 'function') return
+        let rows: Array<{ campaignId: number | null; accountId: number; locationId: number }>
+        try {
+            rows = await whereFn.call(
+                query,
+                inArray(schema.jobQueueEntries.status, ['done', 'failed']),
+            ).all()
+        } catch (error) {
+            if (this.isMissingQueryMethod(error)) return
+            throw error
+        }
+        for (const row of rows) {
+            if (row.campaignId == null) continue
+            this.blockingPairs.add(this.blockingToken(row.campaignId, row.accountId, row.locationId))
+        }
+    }
+
+    private async loadTerminalJobCounts(): Promise<void> {
+        const db = getDatabase()
+        const query = db.select({
+            campaignId: schema.jobQueueEntries.campaignId,
+            status: schema.jobQueueEntries.status,
+            count: sql<number>`count(*)`,
+        }).from(schema.jobQueueEntries)
+        const whereFn = (query as {
+            where?: (clause: unknown) => {
+                groupBy: (...cols: unknown[]) => {
+                    all: () => Promise<Array<{ campaignId: number | null; status: string; count: unknown }>>
+                        | Array<{ campaignId: number | null; status: string; count: unknown }>
+                }
+            }
+        }).where
+        if (typeof whereFn !== 'function') return
+        let rows: Array<{ campaignId: number | null; status: string; count: unknown }>
+        try {
+            rows = await whereFn.call(
+                query,
+                inArray(schema.jobQueueEntries.status, ['done', 'failed', 'cancelled']),
+            ).groupBy(schema.jobQueueEntries.campaignId, schema.jobQueueEntries.status).all()
+        } catch (error) {
+            if (this.isMissingQueryMethod(error)) return
+            throw error
+        }
+        for (const row of rows) {
+            this.addTerminalCount(this.campaignKey(row.campaignId), row.status, this.coerceCount(row.count))
+        }
+    }
+
+    private isMissingQueryMethod(error: unknown): boolean {
+        const message = error instanceof Error ? error.message : String(error)
+        return /is not a function/i.test(message)
+    }
+
+    private campaignKey(campaignId: number | null | undefined): string {
+        return campaignId == null ? 'none' : String(campaignId)
+    }
+
+    private blockingToken(campaignId: number, accountId: number, locationId: number): string {
+        return `${campaignId}|${accountId}:${locationId}`
+    }
+
+    private coerceCount(value: unknown): number {
+        const n = typeof value === 'number' ? value : Number(value ?? 0)
+        return Number.isFinite(n) ? n : 0
+    }
+
+    private addTerminalCount(key: string, status: string, amount: number): void {
+        if (!Number.isFinite(amount) || amount === 0) return
+        const bucket = this.terminalCounts.get(key) ?? { done: 0, failed: 0, cancelled: 0 }
+        if (status === 'done') bucket.done += amount
+        else if (status === 'failed') bucket.failed += amount
+        else if (status === 'cancelled') bucket.cancelled += amount
+        else return
+        this.terminalCounts.set(key, bucket)
+    }
+
+    private rememberBlockingPair(job: Job): void {
+        if (job.campaignId == null) return
+        if (job.status !== 'done' && job.status !== 'failed') return
+        this.blockingPairs.add(this.blockingToken(job.campaignId, job.accountId, job.locationId))
+    }
+
+    /** Free the job object after SQLite has the terminal row. */
+    private forgetTerminalJob(job: Job): void {
+        if (!isTerminalJobStatus(job.status)) return
+        this.terminalStatus.set(job.id, job.status)
+        this.rememberBlockingPair(job)
+        this.addTerminalCount(this.campaignKey(job.campaignId), job.status, 1)
+        this.runningJobs.delete(job.id)
+        this.hiddenTerminalJobs.delete(job.id)
+        this.removeFromAccountQueue(job)
+        this.jobs.delete(job.id)
+        if (this.readJobFromDatabase(job.id)) {
+            this.archivedJobs.delete(job.id)
+            return
+        }
+        // Sync read missed. Keep the object out of `jobs` for getJob/getCampaignJobs.
+        this.archivedJobs.set(job.id, job)
+    }
+
+    /** Terminal history seen only because the loader could not filter in SQL. */
+    private rememberLoadedTerminal(job: Job): void {
+        if (!isTerminalJobStatus(job.status)) return
+        this.terminalStatus.set(job.id, job.status)
+        this.rememberBlockingPair(job)
+        this.addTerminalCount(this.campaignKey(job.campaignId), job.status, 1)
+        this.archivedJobs.set(job.id, job)
+    }
+
+    private subtractTerminalCount(key: string, status: string, amount: number): boolean {
+        if (!Number.isFinite(amount) || amount === 0) return false
+        const bucket = this.terminalCounts.get(key)
+        if (!bucket) return false
+        if (status === 'done') bucket.done = Math.max(0, bucket.done - amount)
+        else if (status === 'failed') bucket.failed = Math.max(0, bucket.failed - amount)
+        else if (status === 'cancelled') bucket.cancelled = Math.max(0, bucket.cancelled - amount)
+        else return false
+        return true
+    }
+
+    private rememberedTerminalResult(
+        jobId: string,
+        op: 'complete' | 'fail' | 'cancel' | 'permanent',
+    ): JobTransitionResult | null {
+        const status = this.terminalStatus.get(jobId)
+        if (!status) return null
+        if (op === 'complete' && status === 'done') {
+            return { applied: true, status: 'done', reason: 'already_done' }
+        }
+        if (op === 'fail' && status === 'failed') {
+            return { applied: true, status: 'failed', reason: 'already_failed' }
+        }
+        if (op === 'cancel' && status === 'cancelled') {
+            return { applied: true, status: 'cancelled', reason: 'already_cancelled' }
+        }
+        if (op === 'permanent' && status === 'failed') {
+            return { applied: true, status: 'failed', reason: 'already_failed' }
+        }
+        return { applied: false, status, reason: `blocked_by_${status}` }
     }
 
     /** How many running→pending conversions happened on the last load. */
@@ -258,6 +508,8 @@ class JobQueue {
             inRunning: this.runningJobs.has(job.id),
             inHidden: this.hiddenTerminalJobs.has(job.id),
             queueIndex: queue ? queue.indexOf(job.id) : -1,
+            wasResident: true,
+            restoreTerminalCount: false,
         }
     }
 
@@ -310,6 +562,17 @@ class JobQueue {
             await this.persistJob(job)
         } catch (error) {
             this.restoreMutationState(job, snap)
+            if (!snap.wasResident) {
+                this.jobs.delete(job.id)
+                this.runningJobs.delete(job.id)
+                this.hiddenTerminalJobs.delete(job.id)
+                this.removeFromAccountQueue(job)
+                this.archivedJobs.set(job.id, job)
+                this.terminalStatus.set(job.id, job.status)
+                if (snap.restoreTerminalCount) {
+                    this.addTerminalCount(this.campaignKey(job.campaignId), job.status, 1)
+                }
+            }
             throw error
         }
     }
@@ -429,6 +692,10 @@ class JobQueue {
                 keys.add(this.jobPairKey(job.accountId, job.locationId))
             }
         }
+        const prefix = `${campaignId}|`
+        for (const token of Array.from(this.blockingPairs)) {
+            if (token.startsWith(prefix)) keys.add(token.slice(prefix.length))
+        }
         return keys
     }
 
@@ -539,8 +806,18 @@ class JobQueue {
     /**
      * Select next eligible pending job (peek — does not mutate).
      * Skips accounts already at daily limit or with a running review (type=review).
+     * Review locations in `disallowRecentlyReviewedLocations` are skipped so the
+     * caller can pick a different job instead of starting a cooled-down location.
      */
-    private async findEligiblePendingJob(campaignId?: number): Promise<Job | null> {
+    private async findEligiblePendingJob(
+        campaignId?: number,
+        options?: JobClaimOptions,
+    ): Promise<Job | null> {
+        const disallowed = options?.disallowRecentlyReviewedLocations
+        const blockedLocations = disallowed && disallowed.length > 0
+            ? new Set<number>(disallowed)
+            : null
+
         const pendingJobs = Array.from(this.jobs.values())
             .filter(j =>
                 j.status === 'pending' &&
@@ -553,6 +830,13 @@ class JobQueue {
             })
 
         for (const job of pendingJobs) {
+            if (
+                job.type === 'review' &&
+                blockedLocations !== null &&
+                blockedLocations.has(job.locationId)
+            ) {
+                continue
+            }
             if (job.type === 'review' && this.accountHasRunningReview(job.accountId)) {
                 continue
             }
@@ -568,9 +852,9 @@ class JobQueue {
     }
 
     /** Peek next eligible job without claiming (non-mutating). */
-    async getNextJob(campaignId?: number): Promise<Job | null> {
+    async getNextJob(campaignId?: number, options?: JobClaimOptions): Promise<Job | null> {
         await this.ensureLoaded()
-        return this.findEligiblePendingJob(campaignId)
+        return this.findEligiblePendingJob(campaignId, options)
     }
 
     /**
@@ -580,10 +864,10 @@ class JobQueue {
      * On persist failure: roll back memory (status/runningJobs/startedAt) and rethrow
      * so AutomationController can handle separately (no half-claimed in-memory job).
      */
-    async claimNextJob(campaignId?: number): Promise<Job | null> {
+    async claimNextJob(campaignId?: number, options?: JobClaimOptions): Promise<Job | null> {
         await this.ensureLoaded()
         return this.runExclusive(async () => {
-            const job = await this.findEligiblePendingJob(campaignId)
+            const job = await this.findEligiblePendingJob(campaignId, options)
             if (!job) return null
             // Defensive: status may have changed only if exclusivity broken; re-check.
             if (job.status !== 'pending') return null
@@ -603,6 +887,39 @@ class JobQueue {
             }
             console.log(`[JobQueue] Claimed job ${job.id}`)
             return job
+        })
+    }
+
+    /**
+     * Return a claimed running job to pending without counting a retry or failure.
+     * Cross-account cooldown uses this so the job can be picked again later.
+     */
+    async deferRunningJob(jobId: string): Promise<JobTransitionResult> {
+        await this.ensureLoaded()
+        return this.runExclusive(async () => {
+            const job = this.jobs.get(jobId)
+            if (!job) {
+                return { applied: false, status: null, reason: 'not_found' }
+            }
+            if (job.status !== 'running') {
+                return { applied: false, status: job.status, reason: `invalid_from_${job.status}` }
+            }
+
+            const snap = this.captureMutationState(job)
+            job.status = 'pending'
+            job.startedAt = undefined
+            this.runningJobs.delete(jobId)
+            try {
+                await this.persistOrRollback(job, snap)
+            } catch (error) {
+                console.error(
+                    `[JobQueue] deferRunningJob persist failed for ${jobId}; rolled back memory:`,
+                    error
+                )
+                throw error
+            }
+            console.log(`[JobQueue] Deferred job ${jobId} back to pending`)
+            return { applied: true, status: 'pending' }
         })
     }
 
@@ -630,7 +947,9 @@ class JobQueue {
         return this.runExclusive(async () => {
             const job = this.jobs.get(jobId)
             if (!job) {
-                return { applied: false, status: null, reason: 'not_found' }
+                const remembered = this.terminalStatus.get(jobId)
+                if (!remembered) return { applied: false, status: null, reason: 'not_found' }
+                return { applied: false, status: remembered, reason: `invalid_from_${remembered}` }
             }
             if (job.status === 'running') {
                 // Not a new transition — caller must not treat as fresh claim.
@@ -660,7 +979,8 @@ class JobQueue {
         return this.runExclusive(async () => {
             const job = this.jobs.get(jobId)
             if (!job) {
-                return { applied: false, status: null, reason: 'not_found' }
+                return this.rememberedTerminalResult(jobId, 'complete')
+                    ?? { applied: false, status: null, reason: 'not_found' }
             }
             if (job.status === 'done') {
                 return { applied: true, status: 'done', reason: 'already_done' }
@@ -685,6 +1005,7 @@ class JobQueue {
             this.runningJobs.delete(jobId)
             this.removeFromAccountQueue(job)
             await this.persistOrRollback(job, snap)
+            this.forgetTerminalJob(job)
             console.log(`[JobQueue] Job ${jobId} completed`)
             return { applied: true, status: 'done' }
         })
@@ -698,7 +1019,8 @@ class JobQueue {
         return this.runExclusive(async () => {
             const job = this.jobs.get(jobId)
             if (!job) {
-                return { applied: false, status: null, reason: 'not_found' }
+                return this.rememberedTerminalResult(jobId, 'fail')
+                    ?? { applied: false, status: null, reason: 'not_found' }
             }
             if (job.status === 'failed') {
                 return { applied: true, status: 'failed', reason: 'already_failed' }
@@ -733,6 +1055,7 @@ class JobQueue {
             }
 
             await this.persistOrRollback(job, snap)
+            this.forgetTerminalJob(job)
             return { applied: true, status: job.status }
         })
     }
@@ -748,7 +1071,8 @@ class JobQueue {
         return this.runExclusive(async () => {
             const job = this.jobs.get(jobId)
             if (!job) {
-                return { applied: false, status: null, reason: 'not_found' }
+                return this.rememberedTerminalResult(jobId, 'permanent')
+                    ?? { applied: false, status: null, reason: 'not_found' }
             }
             if (job.status === 'failed') {
                 return { applied: true, status: 'failed', reason: 'already_failed' }
@@ -773,6 +1097,7 @@ class JobQueue {
             this.runningJobs.delete(jobId)
             this.removeFromAccountQueue(job)
             await this.persistOrRollback(job, snap)
+            this.forgetTerminalJob(job)
             console.log(`[JobQueue] Job ${jobId} marked permanently failed (no retry)`)
             return { applied: true, status: 'failed' }
         })
@@ -787,7 +1112,8 @@ class JobQueue {
         return this.runExclusive(async () => {
             const job = this.jobs.get(jobId)
             if (!job) {
-                return { applied: false, status: null, reason: 'not_found' }
+                return this.rememberedTerminalResult(jobId, 'cancel')
+                    ?? { applied: false, status: null, reason: 'not_found' }
             }
             if (job.status === 'cancelled') {
                 return { applied: true, status: 'cancelled', reason: 'already_cancelled' }
@@ -808,6 +1134,7 @@ class JobQueue {
             this.runningJobs.delete(jobId)
             this.removeFromAccountQueue(job)
             await this.persistOrRollback(job, snap)
+            this.forgetTerminalJob(job)
             console.log(`[JobQueue] Job ${jobId} cancelled`)
             return { applied: true, status: 'cancelled' }
         })
@@ -836,8 +1163,14 @@ class JobQueue {
     async retryJob(jobId: string): Promise<boolean> {
         await this.ensureLoaded()
         return this.runExclusive(async () => {
-            const job = this.jobs.get(jobId)
-            if (!job) return false
+            let job = this.jobs.get(jobId)
+            const wasResident = job != null
+            if (!job) job = this.archivedJobs.get(jobId)
+            if (!job) {
+                const hydrated = await this.rehydrateJob(jobId)
+                if (!hydrated) return false
+                job = hydrated
+            }
             if (job.status === 'done') {
                 console.warn(`[JobQueue] Refusing to retry completed job ${jobId}`)
                 return false
@@ -847,7 +1180,21 @@ class JobQueue {
                 return false
             }
 
+            let restoreTerminalCount = false
+            if (!wasResident) {
+                this.archivedJobs.delete(job.id)
+                restoreTerminalCount = this.subtractTerminalCount(
+                    this.campaignKey(job.campaignId),
+                    job.status,
+                    1,
+                )
+                this.terminalStatus.delete(job.id)
+                this.jobs.set(job.id, job)
+            }
+
             const snap = this.captureMutationState(job)
+            snap.wasResident = wasResident
+            snap.restoreTerminalCount = restoreTerminalCount
             job.status = 'pending'
             job.retryCount = 0
             job.error = undefined
@@ -860,6 +1207,93 @@ class JobQueue {
             console.log(`[JobQueue] Job ${jobId} requeued for retry (retryCount reset)`)
             return true
         })
+    }
+
+    /** Load one terminal row back when a manual retry needs the full job. Does not index it. */
+    private async rehydrateJob(jobId: string): Promise<Job | null> {
+        try {
+            return this.readJobFromDatabase(jobId) ?? null
+        } catch (error) {
+            console.error(`[JobQueue] rehydrateJob failed for ${jobId}:`, error)
+            return null
+        }
+    }
+
+    private isJobRow(row: unknown): row is schema.JobQueueEntry {
+        if (row == null || typeof row !== 'object' || isThenable(row)) return false
+        const candidate = row as {
+            id?: unknown
+            status?: unknown
+            accountId?: unknown
+            locationId?: unknown
+            type?: unknown
+        }
+        return (
+            typeof candidate.id === 'string' &&
+            typeof candidate.status === 'string' &&
+            typeof candidate.accountId === 'number' &&
+            typeof candidate.locationId === 'number' &&
+            typeof candidate.type === 'string'
+        )
+    }
+
+    /** Point read. Never inserts into `jobs`. */
+    private readJobFromDatabase(jobId: string): Job | undefined {
+        try {
+            const db = getDatabase()
+            const row = db
+                .select()
+                .from(schema.jobQueueEntries)
+                .where(eq(schema.jobQueueEntries.id, jobId))
+                .get()
+            if (!this.isJobRow(row)) {
+                if (isThenable(row)) {
+                    void Promise.resolve(row).then(
+                        () => undefined,
+                        () => undefined,
+                    )
+                }
+                return undefined
+            }
+            return this.rowToJob(row)
+        } catch (error) {
+            if (this.isMissingQueryMethod(error)) return undefined
+            console.error(`[JobQueue] SQLite job lookup failed for ${jobId}:`, error)
+            return undefined
+        }
+    }
+
+    /** Campaign rows for callers that still expect terminal history. Skips ids already in memory. */
+    private readCampaignJobsFromDatabase(campaignId: number): Job[] {
+        try {
+            const db = getDatabase()
+            const rows = db
+                .select()
+                .from(schema.jobQueueEntries)
+                .where(eq(schema.jobQueueEntries.campaignId, campaignId))
+                .all()
+            if (isThenable(rows)) {
+                void Promise.resolve(rows).then(
+                    () => undefined,
+                    () => undefined,
+                )
+                return []
+            }
+            if (!Array.isArray(rows)) return []
+            const jobs: Job[] = []
+            for (const row of rows) {
+                if (!this.isJobRow(row)) continue
+                jobs.push(this.rowToJob(row))
+            }
+            return jobs
+        } catch (error) {
+            if (this.isMissingQueryMethod(error)) return []
+            console.error(
+                `[JobQueue] SQLite campaign job lookup failed for ${campaignId}:`,
+                error,
+            )
+            return []
+        }
     }
 
     private removeFromAccountQueue(job: Job): void {
@@ -907,7 +1341,25 @@ class JobQueue {
             stats.byAccount.set(job.accountId, accountStats)
         }
 
+        this.addVisibleTerminalCounts(stats, campaignId)
+        stats.total = stats.pending + stats.running + stats.done + stats.failed + stats.cancelled
         return stats
+    }
+
+    private addVisibleTerminalCounts(
+        stats: { done: number; failed: number; cancelled: number },
+        campaignId?: number,
+    ): void {
+        const keys = campaignId == null
+            ? Array.from(this.terminalCounts.keys())
+            : [this.campaignKey(campaignId)]
+        for (const key of keys) {
+            const bucket = this.terminalCounts.get(key)
+            if (!bucket) continue
+            stats.done += bucket.done
+            stats.failed += bucket.failed
+            stats.cancelled += bucket.cancelled
+        }
     }
 
     getAllJobs(): Job[] {
@@ -915,12 +1367,25 @@ class JobQueue {
     }
 
     getJob(jobId: string): Job | undefined {
-        return this.jobs.get(jobId)
+        const resident = this.jobs.get(jobId)
+        if (resident) return resident
+        const archived = this.archivedJobs.get(jobId)
+        if (archived) return archived
+        return this.readJobFromDatabase(jobId)
     }
 
     getCampaignJobs(campaignId: number): Job[] {
-        return Array.from(this.jobs.values())
-            .filter(j => j.campaignId === campaignId)
+        const byId = new Map<string, Job>()
+        for (const job of Array.from(this.jobs.values())) {
+            if (job.campaignId === campaignId) byId.set(job.id, job)
+        }
+        for (const job of Array.from(this.archivedJobs.values())) {
+            if (job.campaignId === campaignId && !byId.has(job.id)) byId.set(job.id, job)
+        }
+        for (const job of this.readCampaignJobsFromDatabase(campaignId)) {
+            if (!byId.has(job.id)) byId.set(job.id, job)
+        }
+        return Array.from(byId.values())
     }
 
     /** Campaign IDs that still have pending work (for recovery). Never includes done-only. */
@@ -936,17 +1401,19 @@ class JobQueue {
     }
 
     /**
-     * Hide terminal rows from stats only — durable history stays indexed for
-     * idempotent pair-blocking (done) and audit.
+     * Drop terminal job objects from RAM. Durable rows stay in SQLite.
+     * Blocking pairs are kept so completed work is not enqueued again.
      */
     clearCompleted(campaignId?: number): void {
-        for (const [id, job] of Array.from(this.jobs.entries())) {
+        for (const [, job] of Array.from(this.jobs.entries())) {
             if (campaignId != null && job.campaignId !== campaignId) continue
             if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
-                this.hiddenTerminalJobs.add(id)
+                this.forgetTerminalJob(job)
             }
         }
-        console.log('[JobQueue] Hid completed jobs from stats; durable rows remain indexed')
+        if (campaignId == null) this.terminalCounts.clear()
+        else this.terminalCounts.delete(this.campaignKey(campaignId))
+        console.log('[JobQueue] Removed completed jobs from memory; durable rows remain in SQLite')
     }
 
     /** Optionally purge terminal rows from DB (explicit ops only). */
@@ -966,10 +1433,7 @@ class JobQueue {
     }
 
     clearAll(): void {
-        this.jobs.clear()
-        this.accountQueues.clear()
-        this.runningJobs.clear()
-        this.hiddenTerminalJobs.clear()
+        this.resetMemoryIndexes()
         this.lastRequeuedRunningCount = 0
         console.log('[JobQueue] Cleared all jobs from memory')
     }

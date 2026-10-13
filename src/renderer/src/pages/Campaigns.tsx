@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useAutomationStore, setupAutomationListeners } from '../stores'
 import {
     Plus,
@@ -204,6 +204,7 @@ export function Campaigns() {
     const [activeProxyCount, setActiveProxyCount] = useState(0)
     const [createStep, setCreateStep] = useState(1)
     const [creating, setCreating] = useState(false)
+    const [createError, setCreateError] = useState<string | null>(null)
     const [resumingRecoveryId, setResumingRecoveryId] = useState<number | null>(null)
     const {
         pending: pendingSubmissions,
@@ -240,7 +241,7 @@ export function Campaigns() {
     const fetchResources = useCallback(async () => {
         try {
             const [locationData, accountCount, proxyCount, accountsData, proxiesData] = await Promise.all([
-                window.electronAPI.locations.getPending(),
+                window.electronAPI.locations.getAll(),
                 window.electronAPI.accounts.getActiveCount(),
                 window.electronAPI.proxies.getActiveCount(),
                 window.electronAPI.accounts.getAll(),
@@ -282,6 +283,16 @@ export function Campaigns() {
         }
     }, [stats.running, automationStatus.running, fetchCampaigns, refreshAutomation])
 
+    // Drop the create error as soon as the user edits the form.
+    const skipClearCreateError = useRef(true)
+    useEffect(() => {
+        if (skipClearCreateError.current) {
+            skipClearCreateError.current = false
+            return
+        }
+        setCreateError(null)
+    }, [newCampaign])
+
     const recoveryCampaignLabels = useMemo(
         () => campaigns.map((c) => ({ id: c.id, name: c.name })),
         [campaigns],
@@ -305,6 +316,7 @@ export function Campaigns() {
         : 0
     const selectedLocationIds = useMemo(() => new Set(newCampaign.locationIds), [newCampaign.locationIds])
     const poolSummary = useMemo(() => getPoolSelectionSummary(newCampaign), [newCampaign])
+    const reviewTemplatesMissing = newCampaign.reviewTemplates.every((template) => !template.trim())
     const showLiveMonitor = automationStatus.running || automationStatus.paused || stats.running > 0
 
     const accountSelectOptions = useMemo(
@@ -333,10 +345,11 @@ export function Campaigns() {
     const resetCreateForm = () => {
         setNewCampaign({ ...EMPTY_CAMPAIGN_FORM })
         setCreateStep(1)
+        setCreateError(null)
     }
 
     const handleCreateCampaign = async () => {
-        if (!newCampaign.name || newCampaign.locationIds.length === 0 || creating) return
+        if (!newCampaign.name || newCampaign.locationIds.length === 0 || reviewTemplatesMissing || creating) return
 
         if (poolSummary.needsPoolConfirm) {
             const confirmText = buildPoolConfirmMessage({
@@ -361,13 +374,14 @@ export function Campaigns() {
         const payload = buildCampaignCreatePayload(newCampaign)
         try {
             setCreating(true)
+            setCreateError(null)
             await window.electronAPI.campaigns.create(payload)
             await fetchCampaigns()
             await fetchResources()
             resetCreateForm()
             setShowCreateModal(false)
         } catch (error) {
-            alert(t('campaigns.createFailed'))
+            setCreateError(error instanceof Error ? error.message : 'Tạo chiến dịch thất bại')
         } finally {
             setCreating(false)
         }
@@ -670,7 +684,7 @@ export function Campaigns() {
                         }
                         setSelectionMode(true)
                     }}
-                    className={selectionMode ? '!border-[#8d74e8] !bg-[#f4f0ff] !text-[#735bd6]' : ''}
+                    className={selectionMode ? '!border-[#8d74e8] !bg-[#f4f0ff] dark:!bg-[#2a2540] !text-[#735bd6]' : ''}
                 >
                     {selectionMode ? t('common.cancel') : t('common.selected')}
                 </PrimaryButton>
@@ -691,9 +705,8 @@ export function Campaigns() {
                 )}
             </div>
 
-            {/* Campaigns List */}
-            {!showCreateModal && (
-                <div className="space-y-3">
+            {/* Campaigns List - always mounted */}
+            <div className="space-y-3">
                     {loading && campaigns.length === 0 ? (
                         <EmptyState
                             icon={RefreshCw}
@@ -733,7 +746,7 @@ export function Campaigns() {
                                 <Panel
                                     key={campaign.id}
                                     tone="slate"
-                                    className={`p-0 overflow-hidden transition-all ${selectedIds.includes(campaign.id) ? '!border-[#8d74e8] !bg-[#f8f6ff]' : campaign.status === 'running' ? '!border-emerald-200' : campaign.status === 'error' ? '!border-rose-200' : ''}`}
+                                    className={`animate-fade-in motion-safe:animate-[fadeIn_200ms_ease-out] p-0 overflow-hidden transition-all ${selectedIds.includes(campaign.id) ? '!border-[#8d74e8] !bg-[#f8f6ff] dark:!bg-[#2a2540]' : campaign.status === 'running' ? '!border-emerald-200 dark:!border-emerald-800/60' : campaign.status === 'error' ? '!border-rose-200 dark:!border-rose-800/60' : ''}`}
                                 >
                                     {/* Main Row */}
                                     <div className="p-5">
@@ -783,19 +796,19 @@ export function Campaigns() {
 
                                         {/* Stats Row */}
                                         <div className="grid grid-cols-3 gap-3 mb-4">
-                                            <div className="bg-[#f7f7f9] rounded-[14px] border border-[#e9e4f2] p-2.5 text-center">
-                                                <div className="text-lg font-bold text-[#17171f]">{completed}</div>
-                                                <div className="text-xs text-[#908a9e]">{t('campaigns.sent')}</div>
+                                            <div className="bg-[#f7f7f9] dark:bg-[#1e1b2e] rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] p-2.5 text-center">
+                                                <div className="text-lg font-bold text-[#17171f] dark:text-[#f0ecff]">{completed}</div>
+                                                <div className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{t('campaigns.sent')}</div>
                                             </div>
-                                            <div className="bg-[#f7f7f9] rounded-[14px] border border-[#e9e4f2] p-2.5 text-center">
-                                                <div className={`text-lg font-bold ${successRate >= 80 ? 'text-emerald-600' : successRate >= 50 ? 'text-amber-600' : 'text-rose-600'}`}>
+                                            <div className="bg-[#f7f7f9] dark:bg-[#1e1b2e] rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] p-2.5 text-center">
+                                                <div className={`text-lg font-bold ${successRate >= 80 ? 'text-emerald-600 dark:text-emerald-400' : successRate >= 50 ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'}`}>
                                                     {successRate}%
                                                 </div>
-                                                <div className="text-xs text-[#908a9e]">{t('campaigns.successful')}</div>
+                                                <div className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{t('campaigns.successful')}</div>
                                             </div>
-                                            <div className="bg-[#f7f7f9] rounded-[14px] border border-[#e9e4f2] p-2.5 text-center">
-                                                <div className="text-lg font-bold text-[#5f5a6d]">{Math.max(0, (Number(campaign.totalReviews) || 0) - completed)}</div>
-                                                <div className="text-xs text-[#908a9e]">{t('campaigns.remaining')}</div>
+                                            <div className="bg-[#f7f7f9] dark:bg-[#1e1b2e] rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] p-2.5 text-center">
+                                                <div className="text-lg font-bold text-[#5f5a6d] dark:text-[#c8c0d8]">{Math.max(0, (Number(campaign.totalReviews) || 0) - completed)}</div>
+                                                <div className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{t('campaigns.remaining')}</div>
                                             </div>
                                         </div>
 
@@ -906,7 +919,6 @@ export function Campaigns() {
                         })
                     )}
                 </div>
-            )}
 
             {/* Create Campaign Modal - Step Wizard */}
             <Modal
@@ -958,8 +970,8 @@ export function Campaigns() {
                                         key={r}
                                         onClick={() => setNewCampaign({ ...newCampaign, rating: r })}
                                         className={`flex-1 py-2.5 rounded-full text-sm font-semibold transition-all ${newCampaign.rating === r
-                                            ? 'bg-amber-50 text-amber-700 border-2 border-amber-300'
-                                            : 'bg-[#f7f7f9] text-[#5f5a6d] border border-[#e9e4f2] hover:border-[#cbbff3]'
+                                            ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-2 border-amber-300 dark:border-amber-700/60'
+                                            : 'bg-[#f7f7f9] dark:bg-[#1e1b2e] text-[#5f5a6d] dark:text-[#c8c0d8] border border-[#e9e4f2] dark:border-[#3d3558] hover:border-[#cbbff3]'
                                             }`}
                                     >
                                         {r} sao
@@ -972,15 +984,19 @@ export function Campaigns() {
                             <textarea
                                 value={newCampaign.reviewTemplates.join('\n')}
                                 onChange={(e) => setNewCampaign({ ...newCampaign, reviewTemplates: e.target.value.split('\n') })}
-                                className="w-full h-28 px-4 py-3 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                                className={`w-full h-28 px-4 py-3 rounded-[16px] border bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 ${reviewTemplatesMissing ? 'border-red-400 focus:border-red-400' : 'border-[#e9e4f2] focus:border-[#cbbff3]'}`}
                                 placeholder={t('campaigns.reviewTemplatesPlaceholder')}
+                                aria-invalid={reviewTemplatesMissing}
                             />
+                            {reviewTemplatesMissing && (
+                                <p className="text-xs text-red-600 mt-1">Vui lòng nhập ít nhất 1 mẫu đánh giá</p>
+                            )}
                             <p className="text-xs text-[#908a9e] mt-1">{t('campaigns.templateHint')}</p>
                         </div>
                         <PrimaryButton
                             className="w-full"
                             onClick={() => setCreateStep(2)}
-                            disabled={!newCampaign.name}
+                            disabled={!newCampaign.name || reviewTemplatesMissing}
                         >
                             {t('common.next')}
                         </PrimaryButton>
@@ -1011,7 +1027,7 @@ export function Campaigns() {
                                     {newCampaign.locationIds.length === locations.length ? t('common.deselectAll') : t('common.selectAll')}
                                 </PrimaryButton>
                             )}
-                            <div className="max-h-56 overflow-y-auto bg-[#f7f7f9] rounded-[16px] p-2 space-y-1 border border-[#e9e4f2]">
+                            <div className="max-h-56 overflow-y-auto bg-[#f7f7f9] dark:bg-[#1e1b2e] rounded-[16px] p-2 space-y-1 border border-[#e9e4f2] dark:border-[#3d3558]">
                                 {locations.length === 0 ? (
                                     <div className="p-4 text-center">
                                         <MapPin className="w-8 h-8 mx-auto mb-2 text-[#cbbff3]" />
@@ -1019,7 +1035,7 @@ export function Campaigns() {
                                     </div>
                                 ) : (
                                     locations.map((loc) => (
-                                        <label key={loc.id} className={`flex items-center gap-3 p-2.5 rounded-[12px] cursor-pointer transition-colors ${selectedLocationIds.has(loc.id) ? 'bg-[#f4f0ff] border border-[#e6e0fb]' : 'hover:bg-white border border-transparent'
+                                        <label key={loc.id} className={`flex items-center gap-3 p-2.5 rounded-[12px] cursor-pointer transition-colors ${selectedLocationIds.has(loc.id) ? 'bg-[#f4f0ff] dark:bg-[#2a2540] border border-[#e6e0fb] dark:border-[#3d3558]' : 'hover:bg-white dark:hover:bg-[#352f4a] border border-transparent'
                                             }`}>
                                             <input
                                                 type="checkbox"
@@ -1035,7 +1051,7 @@ export function Campaigns() {
                                                 className="h-4 w-4 rounded accent-[#8d74e8]"
                                             />
                                             <MapPin className="w-4 h-4 text-amber-500 shrink-0" />
-                                            <span className="text-[#17171f] text-sm">{loc.name}</span>
+                                            <span className="text-[#17171f] dark:text-[#f0ecff] text-sm">{loc.name}</span>
                                         </label>
                                     ))
                                 )}
@@ -1166,6 +1182,10 @@ export function Campaigns() {
                             )}
                         </SectionPanel>
 
+                        {createError && (
+                            <AlertBanner type="error" title={createError} onDismiss={() => setCreateError(null)} />
+                        )}
+
                         <div className="flex gap-3">
                             <PrimaryButton variant="quiet" className="flex-1" onClick={() => setCreateStep(2)}>
                                 {t('common.back')}
@@ -1174,7 +1194,7 @@ export function Campaigns() {
                                 className="flex-1"
                                 icon={Rocket}
                                 onClick={() => void handleCreateCampaign()}
-                                disabled={!newCampaign.name || newCampaign.locationIds.length === 0 || creating}
+                                disabled={!newCampaign.name || newCampaign.locationIds.length === 0 || reviewTemplatesMissing || creating}
                             >
                                 {creating
                                     ? t('campaigns.creating', 'Creating...')

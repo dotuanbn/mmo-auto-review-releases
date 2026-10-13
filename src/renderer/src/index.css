@@ -799,10 +799,29 @@ textarea {
   [class~="bg-[#ddd8e8]"],
   [class~="bg-[#d7cef7]"],
   [class~="bg-[#dcd6ee]"],
-  [class~="bg-[#e7e2f2]"]
+  [class~="bg-[#e7e2f2]"],
+  [class~="bg-[#faf8ff]"],
+  [class~="bg-[#f9f7fe]"],
+  [class~="bg-[#f8f6ff]"],
+  [class~="bg-[#f8f6fc]"],
+  [class~="bg-[#f7f4ff]"],
+  [class~="bg-[#fbfaff]"],
+  [class~="bg-[#f0ecfb]"],
+  [class~="bg-[#eeebf5]"],
+  [class~="bg-[#ece7f5]"],
+  [class~="bg-[#e9e4f2]"],
+  [class~="!bg-[#f4f0ff]"],
+  [class~="!bg-[#f8f6ff]"]
 ) {
   background-color: var(--kiwi-surface-soft) !important;
-  color: var(--kiwi-text) !important;
+}
+
+.dark :is(.app-workspace, .app-sidebar) [class*="bg-white/"] {
+  background-color: var(--kiwi-surface-soft) !important;
+}
+
+.dark :is(.app-workspace, .app-sidebar) [role="switch"] span[class~="bg-white"] {
+  background-color: white !important;
 }
 
 .dark :is(.app-workspace, .app-sidebar) :is(
@@ -882,6 +901,10 @@ textarea {
   border-color: var(--kiwi-border) !important;
 }
 
+.dark :is(.app-workspace, .app-sidebar) [class*="divide-[#e9e4f2]"] > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--kiwi-border) !important;
+}
+
 .dark :is(.app-workspace, .app-sidebar) :is(
   [class~="text-[#17171f]"],
   [class~="text-[#1d1c25]"],
@@ -890,6 +913,7 @@ textarea {
   [class~="text-[#272530]"],
   [class~="text-[#2a2933]"],
   [class~="text-[#565263]"],
+  [class~="text-[#3f3a4d]"],
   [class~="text-[#1f1b12]"]
 ) {
   color: var(--kiwi-text) !important;
@@ -902,6 +926,7 @@ textarea {
   [class~="text-[#827b91]"],
   [class~="text-[#8b8798]"],
   [class~="text-[#8e899b]"],
+  [class~="text-[#5f5a6d]"],
   [class~="text-[#9a95a7]"],
   [class~="text-[#b4afc2]"],
   [class~="text-[#d7d2e3]"]
@@ -909,11 +934,21 @@ textarea {
   color: var(--kiwi-text-soft) !important;
 }
 
+.dark :is(.app-workspace, .app-sidebar) [class~="text-[#908a9e]"] {
+  color: var(--kiwi-text-muted) !important;
+}
+
 .dark :is(.app-workspace, .app-sidebar) :is(
   [class~="text-[#735bd6]"],
-  [class~="text-[#8d74e8]"]
+  [class~="text-[#8d74e8]"],
+  [class~="!text-[#735bd6]"],
+  [class~="!text-[#8d74e8]"]
 ) {
   color: var(--kiwi-accent) !important;
+}
+
+.dark :is(.app-workspace, .app-sidebar) [class~="!border-[#8d74e8]"] {
+  border-color: var(--kiwi-accent) !important;
 }
 
 .dark :is(.app-workspace, .app-sidebar) :is(
@@ -921,6 +956,37 @@ textarea {
   [class~="hover:bg-[#f7f5fb]"]
 ):hover {
   background-color: var(--kiwi-surface-muted) !important;
+}
+
+.dark :is(
+  [class~="hover:bg-[#f0ecfb]"],
+  [class~="hover:bg-[#faf8ff]"],
+  [class~="hover:bg-[#f4f1fa]"],
+  [class~="hover:bg-[#f4f0ff]"],
+  [class~="hover:bg-[#f7f7f9]"],
+  [class~="hover:bg-[#f8f6fc]"],
+  [class~="hover:bg-white"]
+):hover {
+  background-color: var(--kiwi-surface-muted) !important;
+}
+
+.dark [class~="hover:bg-amber-50"]:hover {
+  background-color: rgba(142, 97, 26, 0.22) !important;
+}
+
+.dark [class~="hover:bg-emerald-50"]:hover {
+  background-color: rgba(34, 120, 82, 0.22) !important;
+}
+
+.dark [class~="hover:bg-rose-50"]:hover {
+  background-color: rgba(151, 49, 68, 0.22) !important;
+}
+
+.dark :is(
+  [class~="hover:text-[#17171f]"],
+  [class~="hover:text-[#24222c]"]
+):hover {
+  color: var(--kiwi-text) !important;
 }
 
 .dark .app-workspace :is(
@@ -1011,6 +1077,11 @@ textarea {
   color: var(--kiwi-text-muted) !important;
 }
 
+.dark :is(.app-workspace, .app-sidebar) input::placeholder,
+.dark :is(.app-workspace, .app-sidebar) textarea::placeholder {
+  color: var(--kiwi-text-muted, #9a8fba) !important;
+}
+
 .dark .app-workspace option {
   background-color: var(--kiwi-surface);
   color: var(--kiwi-text);
@@ -1080,6 +1151,41 @@ textarea {
 
 .dark .app-sidebar .theme-toggle-thumb {
   background-color: var(--kiwi-accent) !important;
+}
+
+/* Light page gradients stay on the surface ramp. Saturated progress fills are left alone. */
+.dark :is(.app-workspace, .app-sidebar) [class*="from-emerald-50"],
+.dark :is(.app-workspace, .app-sidebar) [class*="from-[#f4f0ff]"],
+.dark :is(.app-workspace, .app-sidebar) [class*="bg-gradient"]:not([class*="from-blue-500"]) {
+  --tw-gradient-from: var(--kiwi-surface-soft) !important;
+  --tw-gradient-to: var(--kiwi-surface) !important;
+  --tw-gradient-stops: var(--tw-gradient-from), var(--kiwi-surface-muted), var(--tw-gradient-to) !important;
+}
+
+/* Portals mount on document.body, outside .app-workspace / .app-sidebar. */
+.dark [class~="bg-white"]:not(.app-workspace *):not(.app-sidebar *) {
+  background-color: var(--kiwi-surface) !important;
+  border-color: var(--kiwi-border) !important;
+}
+
+.dark [class*="bg-white/"]:not(.app-workspace *):not(.app-sidebar *) {
+  background-color: var(--kiwi-surface-soft) !important;
+}
+
+.dark [class~="text-[#17171f]"]:not(.app-workspace *) {
+  color: var(--kiwi-text) !important;
+}
+
+.dark [class~="text-[#24222c]"]:not(.app-workspace *) {
+  color: var(--kiwi-text) !important;
+}
+
+.dark [class~="text-[#5f5a6d]"] {
+  color: var(--kiwi-text-soft) !important;
+}
+
+.dark [class~="border-[#e9e4f2]"]:not(.app-workspace *) {
+  border-color: var(--kiwi-border) !important;
 }
 
 /* Custom scrollbar */
@@ -1182,4 +1288,51 @@ textarea {
   text-overflow: ellipsis;
   border: 1px solid rgba(139, 92, 246, 0.2);
   line-height: 1.5;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.animate-fade-in { animation: fadeIn 0.2s ease-out; }
+.animate-slide-up { animation: slideUp 0.25s ease-out; }
+.animate-slide-down { animation: slideDown 0.25s ease-out; }
+.animate-scale-in { animation: scaleIn 0.2s ease-out; }
+.animate-shimmer {
+  animation: shimmer 1.5s infinite linear;
+  background-size: 200% 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in,
+  .animate-slide-up,
+  .animate-slide-down,
+  .animate-scale-in,
+  .animate-shimmer,
+  .live-cursor-bot.is-active,
+  .live-cursor-bot.is-clicking .live-cursor-icon-shell,
+  .live-cursor-icon-shell {
+    animation: none !important;
+  }
 }

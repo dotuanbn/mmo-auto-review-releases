@@ -6,14 +6,15 @@ import {
     type Page,
 } from 'playwright'
 import { join } from 'path'
-import { existsSync, mkdirSync, appendFileSync, rmSync } from 'fs'
+import { existsSync, mkdirSync, rmSync } from 'fs'
+import { getRotatingLogger } from '../utils/RotatingLogger'
 import { app } from 'electron'
 import { injectCursorOverlay, setupAutoReinject } from './BrowserCursorOverlay'
 import { loadSettings } from '../ipc/settings'
 import { fingerprintService, BrowserFingerprint } from '../services/FingerprintService'
 import { proxyBridgeService, type ProxyBridgeMode } from '../services/ProxyBridgeService'
 import { profileLockService } from '../services/ProfileLockService'
-import { applyStealth } from './StealthPatcher'
+import { applyStealth, DEFAULT_STEALTH_LEVEL, type StealthLevel } from './StealthPatcher'
 import type { ProxyRuntimeReasonCode } from '../../shared/proxy-contracts'
 
 type PersistentContextOptions = NonNullable<
@@ -91,6 +92,15 @@ const getChromeArgs = () => {
     ]
 }
 
+function isStealthLevel(value: unknown): value is StealthLevel {
+    return value === 'off' || value === 'low' || value === 'medium' || value === 'high' || value === 'paranoid'
+}
+
+const resolveStealthLevel = (): StealthLevel => {
+    const settings = loadSettings()
+    return isStealthLevel(settings.stealthLevel) ? settings.stealthLevel : DEFAULT_STEALTH_LEVEL
+}
+
 // Legacy allow/block list kept only for future diagnostics.
 // Runtime resource blocking is intentionally disabled so Chrome can render
 // fonts, icons, stylesheets, images, and map tiles completely.
@@ -121,7 +131,7 @@ function logProxy(message: string) {
     console.log(message)
     try {
         const logPath = join(app.getPath('userData'), 'proxy-debug.log')
-        appendFileSync(logPath, line)
+        getRotatingLogger('fproxy', logPath).write(line)
     } catch { /* ignore */ }
 }
 
@@ -521,7 +531,7 @@ export class BrowserService {
             })
 
             // Single stealth path only (StealthPatcher) — no legacy double-inject
-            await applyStealth(context, { level: 'high', fingerprint })
+            await applyStealth(context, { level: resolveStealthLevel(), fingerprint })
 
             this.contexts.set(contextId, context)
             // Persistent — never mark as ephemeral.
@@ -623,7 +633,7 @@ export class BrowserService {
             context = await this.browser.newContext(contextOptions)
 
             // Single stealth path only (StealthPatcher) — no legacy double-inject
-            await applyStealth(context, { level: 'high', fingerprint })
+            await applyStealth(context, { level: resolveStealthLevel(), fingerprint })
 
             this.contexts.set(contextId, context)
             this.ephemeralContextIds.add(contextId)

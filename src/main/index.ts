@@ -1,7 +1,9 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { join } from 'path'
-import { appendFileSync, existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync } from 'fs'
 import { dataRootService } from './services/DataRootService'
+import { getRotatingLogger } from './utils/RotatingLogger'
+import { layaSidecarManager } from './services/LayaSidecarManager'
 
 type RuntimeServices = {
     soakTestService: typeof import('./services/SoakTestService')['soakTestService']
@@ -21,7 +23,6 @@ let mainWindow: BrowserWindow | null = null
 let closeDatabaseRef: (() => void) | null = null
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 let rendererRecoveryAttempts = 0
-let lastMainWindowBlurAt = 0
 let runtimeServices: RuntimeServices | null = null
 
 function openExternalUrl(url: string): Promise<void> {
@@ -31,7 +32,6 @@ function openExternalUrl(url: string): Promise<void> {
     }
     return shell.openExternal(parsed.toString())
 }
-let lastForegroundReloadAt = 0
 
 function getBootstrapLogPath(): string {
     try {
@@ -55,7 +55,7 @@ function stringifyError(error: unknown): string {
 function logBootstrap(message: string, error?: unknown): void {
     const line = `[${new Date().toISOString()}] ${message}${error ? `\n${stringifyError(error)}` : ''}\n`
     try {
-        appendFileSync(getBootstrapLogPath(), line)
+        getRotatingLogger('bootstrap', getBootstrapLogPath()).write(line)
     } catch {
         // Last-resort logging: keep startup path resilient.
     }
@@ -90,13 +90,6 @@ function reloadRenderer(reason: string): void {
         logBootstrap('Failed to reload renderer', error)
     }
     focusMainWindow()
-}
-
-function hasActiveAutomationWindowWork(): boolean {
-    return Boolean(
-        runtimeServices?.automationController.isRunning() ||
-        runtimeServices?.trafficBoostEngine.isRunning(),
-    )
 }
 
 function createWindow(): void {
@@ -164,20 +157,9 @@ function createWindow(): void {
         logBootstrap('Main window is unresponsive')
     })
 
-    mainWindow.on('blur', () => {
-        lastMainWindowBlurAt = Date.now()
-    })
-
     mainWindow.on('focus', () => {
-        const hiddenDurationMs = lastMainWindowBlurAt > 0 ? Date.now() - lastMainWindowBlurAt : 0
-        const reloadedRecently = Date.now() - lastForegroundReloadAt < 10_000
-
-        if (!hasActiveAutomationWindowWork() || hiddenDurationMs < 1_500 || reloadedRecently) {
-            return
-        }
-
-        lastForegroundReloadAt = Date.now()
-        reloadRenderer(`focus_after_background_${hiddenDurationMs}ms`)
+        // Do not reloadIgnoringCache() on focus. That wiped React state and
+        // leaked memory whenever automation was running in the background.
     })
 
     // Load the app
@@ -277,6 +259,8 @@ app.whenReady().then(async () => {
                 },
             })
             schedulerService.start()
+            const { warmupSchedulerService } = await import('./services/WarmupSchedulerService')
+            warmupSchedulerService.start()
             logBootstrap('Scheduler service started (automation runner wired)')
         } catch (schedulerError) {
             logBootstrap('Scheduler service failed to start (non-fatal)', schedulerError)
@@ -316,7 +300,7 @@ process.on('uncaughtException', (error) => {
     )
 })
 
-app.on('window-all-closed', () => {
+app.on('window-all-closed', async () => {
     try {
         runtimeServices?.soakTestService.stop('app_shutdown')
     } catch (error) {
@@ -325,8 +309,36 @@ app.on('window-all-closed', () => {
 
     try {
         runtimeServices?.schedulerService.stop()
+        const { warmupSchedulerService } = require('./services/WarmupSchedulerService')
+        warmupSchedulerService.stop()
     } catch (error) {
         logBootstrap('Failed to stop scheduler during shutdown', error)
+    }
+
+    // Stop browsers before closing the database so Chrome is not orphaned.
+    try {
+        await runtimeServices?.automationController.stop()
+    } catch (error) {
+        logBootstrap('Failed to stop automation during shutdown', error)
+    }
+
+    try {
+        await runtimeServices?.trafficBoostEngine.stopCampaign()
+    } catch (error) {
+        logBootstrap('Failed to stop traffic campaigns during shutdown', error)
+    }
+
+    try {
+        await layaSidecarManager.stop()
+    } catch (error) {
+        logBootstrap('Failed to stop Laya sidecar during shutdown', error)
+    }
+
+    try {
+        const { proxyBridgeService } = await import('./services/ProxyBridgeService')
+        await proxyBridgeService.closeAll()
+    } catch (error) {
+        logBootstrap('Failed to close proxy bridges during shutdown', error)
     }
 
     // Close database on app quit

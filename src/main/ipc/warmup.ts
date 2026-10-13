@@ -24,6 +24,8 @@ const warmupActivityTypeSchema = z.enum([
     'search',
     'maps',
     'youtube',
+    'gmail',
+    'photos_browse',
 ])
 
 const warmupStartOptionsSchema = z
@@ -73,6 +75,32 @@ export function registerWarmupHandlers(): void {
             return accountWarmupEngine.cancel(accountId)
         }),
     )
+
+    ipcMain.handle('warmup:scheduler:start', () => {
+        const { warmupSchedulerService } = require('../services/WarmupSchedulerService')
+        warmupSchedulerService.start()
+    })
+
+    ipcMain.handle('warmup:scheduler:stop', () => {
+        const { warmupSchedulerService } = require('../services/WarmupSchedulerService')
+        warmupSchedulerService.stop()
+    })
+
+    ipcMain.handle('warmup:scheduler:status', () => {
+        const { warmupSchedulerService } = require('../services/WarmupSchedulerService')
+        return warmupSchedulerService.isRunning()
+    })
+
+    ipcMain.handle('warmup:toggleAutoWarmup', async (_event, id: unknown, enabled: unknown) => {
+        const accountId = id as number
+        const isEnabled = enabled as boolean
+        const { getDatabase, schema } = require('../database')
+        const { eq } = require('drizzle-orm')
+        getDatabase().update(schema.accounts)
+            .set({ autoWarmupEnabled: isEnabled })
+            .where(eq(schema.accounts.id, accountId))
+            .run()
+    })
 
     console.log('Warmup handlers registered')
 }

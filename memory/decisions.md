@@ -1,5 +1,19 @@
 # Architecture Decisions
 
+## 2026-10-07 - Unsigned Laya pilot channel
+
+- Keep two release gates: `release:unsigned` for internal/explicitly managed pilot machines, and `release:github` fail-closed on a valid Authenticode signature for general customer OTA.
+- The unsigned pilot may require Windows SmartScreen manual approval; it does not require Python or a separate Laya install.
+- Do not describe the unsigned pilot as a clean-machine or general-customer release until a clean Windows image is tested and Authenticode signing is configured.
+
+## 2026-10-07 - Laya OTA sidecar contract
+
+- The Electron app owns the lifecycle of a local Laya HTTP sidecar at `127.0.0.1:8765` and starts it lazily before Laya requests, then stops only the child it owns during shutdown.
+- `resources/laya-sidecar/laya-sidecar.exe` is the required signed Windows artifact and is copied through `extraResources` into packaged updates.
+- The repository currently contains no sidecar executable, Python runtime, dependency lock, or model. Windows release verification therefore fails closed until the audited artifact is supplied.
+- The external 19817 TCP bridge is not interchangeable with the app's `/api/v1/models` and `/api/v1/chat/completions` contract; an HTTP translation sidecar is required.
+- The bounded architecture chooser was unavailable during this run, so the sidecar choice is a documented BRAIN fallback based on repository and runtime inspection.
+
 ## 2026-07-13 - Production hardening consolidation
 
 - Secrets: account passwords, TOTP, proxy passwords, and API keys are encrypted at rest with Electron `safeStorage` using the versioned `enc:v1:` format. Renderer contracts expose only safe DTOs or `********` masks.
@@ -49,3 +63,55 @@ Older project history remains available in `project_qa_log.md` and git history.
 - Runtime wait + visit budget must follow rotate window (~2 min), not IP lifetime.
 - User evidence 2026-07-24: FProxy dashboard shows IP left ~29:51 and Rotate ~1:51, while app showed both ~29:12.
 - Do not store raw FProxy API keys in docs/memory/logs.
+
+## 2026-09-16 - Warmup Engine: Bulk Scheduler, Gmail/Photos, Birth Story
+
+- Bulk Warmup: `WarmupSchedulerService` auto-scans accounts past cooldown, queues round-robin warmup. Max 3 sessions/day, max 2 concurrent. UI "Auto Warmup" toggle in Accounts page.
+- Gmail Executor: `runGmailBrowse` — navigates inbox, scrolls emails, reads 1-2, stars one, uses HumanBehavior. Activity boost = 8.
+- Photos Executor: `runPhotosBrowse` — browses Google Photos grid, views 1-2 photos full-size. Activity boost = 4.
+- Birth Story: `BirthStoryService` creates 7-day lifecycle plan (Day 1: search → Day 7: full rotation). DB migration 006 adds `birthStoryDay`, `birthStoryStartDate`, `birthStoryCompleted`. Auto-completes when level ≥ 55.
+
+## 2026-09-17 - READY_MIN_LEVEL unified to 55
+
+- Changed `READY_MIN_LEVEL` from 35 → 55 in `AccountWarmupService.ts`. Exported as constant.
+- Review gate tiers updated: blocked (<25), throttled (25-54), full (≥55).
+- Birth story auto-completes at ≥55. All 878 tests pass.
+
+## 2026-09-21 - Multi-map parallel concurrency with 1 key proxy
+
+- 1 key + N maps → N parallel browsers allowed (each map = different locationId).
+- 1 key + 1 map → only 1 browser (same-map mutual exclusion).
+- `SlotRuntime.leases` upgraded from single `lease` to `Map<string, LeaseRecord>` for multi-location sharing.
+- `FProxyCapacityNotice` shows 5 warning scenarios based on maps × threads × keys.
+- `TrafficVisitQueue.claimNextVisit` gains `disallowRunningLocations` option.
+- `safeThreadCount` = `min(threads, locations × enabledSlots)` for multi-map.
+- 14 new integration tests in `TrafficBoostMultiMapConcurrency.test.ts`. 58 suites, 892 tests pass.
+
+## 2026-09-21 - Release v1.0.13
+
+- Includes: multi-map parallel concurrency, bulk scheduled warmup, Gmail/Photos executors, 7-day birth story, READY_MIN_LEVEL=55.
+- Build: typecheck 0 errors, 892/892 tests pass, electron-builder --win --publish always.
+- OTA: customers on v1.0.12 receive automatic update via `latest.yml`.
+
+## 2026-10-12 — Anti-Detection Sprint 1: Review Pipeline Hardening
+
+- ReviewStyle all-path parity: `ReviewAutomationEngine` now passes `locationContext` + `category` to style pipeline (was missing). All 3 engines aligned through same content generation path.
+- Migration 008 adds 7 columns to `review_history` for verification tracking: `verifiedStatus`, `survivalDays`, `checkCount`, `lastCheckedAt`, `googleReviewId`, `styleApplied`, `verificationNotes`.
+- `DashboardService.loadSurvival()` aggregates review survival rate by style A/B and warmup tier. `SurvivalPanel` added to Dashboard UI.
+- All 3 engines + `ReviewService` now track `styleApplied` flag for A/B analysis.
+
+## 2026-10-12 — Anti-Detection Sprint 2: Orchestration & Verification
+
+- `VelocityController`: reusable cross-account cooldown service extracted from `AutomationController`. Provides `checkCooldown()` with `addJitter()` to prevent clustering. Integrated into all 3 engines.
+- `SimpleCampaignEngine` migrated from raw Playwright to `browserService.createEphemeralContext()` (StealthPatcher integration).
+- `ReviewVerificationService`: checkpoint queue at 24h/7d/30d intervals. `calculateSurvivalDays()` math, `recordVerificationResult()` persistence. Zod-validated contracts.
+- `ReviewVerificationWorker`: background timer service (WarmupSchedulerService pattern). Uses headless Playwright stealth to navigate Google Maps and check if reviews are still live. Opt-in via `enableReviewVerification` setting (default false).
+- IPC: `verification.ts` handlers for start/stop/status, side-effect import pattern.
+
+## 2026-10-13 — Anti-Detection Sprint 3: Natural Behavior
+
+- `TimeLocalityService`: infers timezone from location address using keyword matching (15+ countries/regions including Vietnamese). Determines "golden hours" (10-14h, 18-21h local time) and blocks night-time reviews. Pure functions for testability.
+- `ReviewPhotoStrategy`: probabilistic photo attachment mimicking real user behavior. Base 30% + modifiers from rating (+10% for 5★), text length, category (restaurants +15%, offices -10%), warmup level, first visit. Clamped to [5%, 70%]. Determines 1-3 photo count. Integrates with existing `ReviewPhotoService.resolvePhotos()`.
+- `HelpfulVoteWorker`: background worker that casts "Helpful" votes on reviews posted by other accounts after 3-7 days. Rate limited: 3 votes/day/account, 8h cooldown between votes. 30s delay between votes for human-like pacing. Uses Playwright stealth browser, always closes context in finally block. Process-lifetime state (safe restart reset).
+- `AccountHealthScorer`: composite 0-100 health score from warmup level, account age, birth story completion, review history, survival rate, recent failures, and overuse detection. Grades: excellent/good/fair/poor/blocked. Smart rotation with `shouldRest` + `restDays`. `pickBestAccount()` selects healthiest non-resting account.
+- All Sprint 3 services are standalone — not yet integrated into review engines. Integration is next step.

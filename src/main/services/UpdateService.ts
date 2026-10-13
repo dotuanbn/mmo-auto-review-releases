@@ -6,6 +6,11 @@ import { automationController } from '../automation/AutomationController'
 import { trafficBoostEngine } from '../automation/TrafficBoostEngine'
 import { loadSettings } from '../ipc/settings'
 
+/** Poll while a downloaded update is waiting on a running campaign. */
+const PENDING_INSTALL_WATCH_MS = 3_000
+/** 1200 × 3s = 1 hour, then the watcher stops itself. */
+const MAX_PENDING_INSTALL_WATCH_TICKS = 1_200
+
 export type UpdaterStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error' | 'disabled'
 
 interface UpdateState {
@@ -119,6 +124,7 @@ class UpdateService {
                 error: undefined,
                 checkedAt: new Date().toISOString(),
             }
+            this.stopPendingInstallWatcher()
             this.broadcast()
         })
 
@@ -151,6 +157,8 @@ class UpdateService {
             }
             this.refreshInstallBlockState()
             this.broadcast()
+            // Restart the 1h window from the moment an update is actually pending.
+            this.startPendingInstallWatcher()
         })
 
         autoUpdater.on('error', (error) => {
@@ -287,8 +295,18 @@ class UpdateService {
             return { ...this.state }
         }
 
+        this.stopPendingInstallWatcher()
         autoUpdater.quitAndInstall(false, true)
         return { ...this.state }
+    }
+
+    /** Stop update timers. Safe to call more than once. */
+    dispose(): void {
+        this.stopPendingInstallWatcher()
+        if (this.startupAutoCheckTimer) {
+            clearTimeout(this.startupAutoCheckTimer)
+            this.startupAutoCheckTimer = null
+        }
     }
 
     private resolveEnablement(): { enabled: boolean; reason?: string } {
@@ -407,19 +425,29 @@ class UpdateService {
         }, 7000)
     }
 
-    private startPendingInstallWatcher(): void {
-        if (this.pendingInstallWatcher) {
-            clearInterval(this.pendingInstallWatcher)
-        }
+    private stopPendingInstallWatcher(): void {
+        if (!this.pendingInstallWatcher) return
+        clearInterval(this.pendingInstallWatcher)
+        this.pendingInstallWatcher = null
+    }
 
+    private startPendingInstallWatcher(): void {
+        this.stopPendingInstallWatcher()
+
+        let watchCount = 0
         this.pendingInstallWatcher = setInterval(() => {
+            watchCount += 1
+            if (watchCount > MAX_PENDING_INSTALL_WATCH_TICKS) {
+                this.stopPendingInstallWatcher()
+                return
+            }
             if (!this.state.enabled || !this.state.downloaded) {
                 return
             }
             if (this.refreshInstallBlockState()) {
                 this.broadcast()
             }
-        }, 3000)
+        }, PENDING_INSTALL_WATCH_MS)
     }
 
     private broadcast(): void {

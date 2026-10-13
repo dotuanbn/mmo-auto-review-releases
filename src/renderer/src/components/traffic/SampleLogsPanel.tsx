@@ -32,7 +32,7 @@ export function SampleLogsPanel({
             title={t('traffic.audit.sampleLogs', 'Sample visit logs')}
             tone="violet"
         >
-            <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-[#6f697c]">
+            <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-[#6f697c] dark:text-[#c8c0d8]">
                 <span>
                     {t('traffic.audit.sampleLogsHint', 'Showing a bounded sample (failed-first), not full history')}
                 </span>
@@ -55,7 +55,7 @@ export function SampleLogsPanel({
                         return (
                             <div
                                 key={log.id}
-                                className="rounded-[14px] border border-[#e9e4f2] bg-white p-3 text-sm"
+                                className="rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3 text-sm"
                             >
                                 <div className="flex items-start gap-2">
                                     {isSuccess ? (
@@ -65,7 +65,7 @@ export function SampleLogsPanel({
                                     )}
                                     <div className="min-w-0 flex-1">
                                         <div className="flex flex-wrap items-center gap-2">
-                                            <span className="text-xs text-[#908a9e]">{formatLogTime(log.createdAt)}</span>
+                                            <span className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{formatLogTime(log.createdAt)}</span>
                                             <StatusPill tone={isSuccess ? 'emerald' : 'rose'}>
                                                 {isSuccess
                                                     ? t('traffic.audit.statusSuccess', 'success')
@@ -79,15 +79,23 @@ export function SampleLogsPanel({
                                                 {t('traffic.audit.duration', 'Duration')} {log.duration}s
                                             </Badge>
                                         </div>
-                                        <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-xs text-[#5f5a6d]">
-                                            <span className="truncate font-medium text-[#17171f]">
+                                        <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-xs text-[#5f5a6d] dark:text-[#c8c0d8]">
+                                            <span
+                                                className="truncate font-medium text-[#17171f] dark:text-[#f0ecff]"
+                                                title={log.locationName || `Location #${log.locationId}`}
+                                            >
                                                 {log.locationName || `Location #${log.locationId}`}
                                             </span>
-                                            <span className="text-[#e9e4f2]">·</span>
-                                            <span className="truncate">{log.accountEmail || 'Anonymous'}</span>
+                                            <span className="text-[#e9e4f2] dark:text-[#3d3558]">·</span>
+                                            <span
+                                                className="truncate"
+                                                title={log.accountEmail || 'Anonymous'}
+                                            >
+                                                {log.accountEmail || 'Anonymous'}
+                                            </span>
                                         </div>
                                         {log.errorMessage && (
-                                            <div className="mt-1 break-words text-xs text-rose-600">
+                                            <div className="mt-1 break-words text-xs text-rose-600 dark:text-rose-400">
                                                 {log.errorMessage}
                                             </div>
                                         )}

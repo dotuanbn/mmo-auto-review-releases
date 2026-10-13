@@ -96,12 +96,12 @@ export function RecoveryBanner({
                         {pendingLabel}:{' '}
                         <strong className="tabular-nums">{report.totalPendingJobs}</strong>
                     </span>
-                    <span className="text-[#5f5a6d]">
+                    <span className="text-[#5f5a6d] dark:text-[#c8c0d8]">
                         {candidatesLabel}:{' '}
                         <strong className="tabular-nums">{candidateIds.length}</strong>
                     </span>
                     {report.requeuedRunningJobs && report.requeuedRunningCount > 0 && (
-                        <span className="text-[#5f5a6d]">
+                        <span className="text-[#5f5a6d] dark:text-[#c8c0d8]">
                             {requeuedLabel}:{' '}
                             <strong className="tabular-nums">{report.requeuedRunningCount}</strong>
                         </span>
@@ -118,10 +118,10 @@ export function RecoveryBanner({
                         return (
                             <li
                                 key={id}
-                                className="flex flex-col gap-2 rounded-[14px] border border-amber-200/80 bg-white/60 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between dark:border-amber-900/40 dark:bg-black/10"
+                                className="flex flex-col gap-2 rounded-[14px] border border-amber-200/80 bg-white/60 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between dark:border-amber-900/40 dark:bg-[#2a2540]"
                             >
                                 <div className="min-w-0">
-                                    <div className="truncate text-sm font-semibold text-[#17171f] dark:text-inherit">
+                                    <div className="truncate text-sm font-semibold text-[#17171f] dark:text-inherit" title={name}>
                                         {name}
                                     </div>
                                     <div className="text-xs opacity-75">

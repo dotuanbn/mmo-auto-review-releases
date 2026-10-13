@@ -481,31 +481,31 @@ const getDefaultParams = (type: string): Record<string, any> => {
 
 const getActionColor = (type: string) => {
     const colorMap: Record<string, string> = {
-        navigate: 'bg-blue-50 text-blue-600 border-blue-200',
-        google_search: 'bg-rose-50 text-rose-600 border-rose-200',
-        go_back: 'bg-blue-50 text-blue-600 border-blue-200',
-        refresh_page: 'bg-blue-50 text-blue-600 border-blue-200',
-        click: 'bg-emerald-50 text-emerald-600 border-emerald-200',
-        type: 'bg-violet-50 text-violet-600 border-violet-200',
-        human_type: 'bg-violet-50 text-violet-600 border-violet-200',
-        hover: 'bg-emerald-50 text-emerald-600 border-emerald-200',
-        select: 'bg-violet-50 text-violet-600 border-violet-200',
-        keyboard: 'bg-violet-50 text-violet-600 border-violet-200',
-        wait: 'bg-amber-50 text-amber-600 border-amber-200',
-        random_delay: 'bg-amber-50 text-amber-600 border-amber-200',
-        scroll: 'bg-cyan-50 text-cyan-600 border-cyan-200',
-        random_scroll: 'bg-cyan-50 text-cyan-600 border-cyan-200',
-        screenshot: 'bg-orange-50 text-orange-600 border-orange-200',
-        upload: 'bg-orange-50 text-orange-600 border-orange-200',
-        maps_click: 'bg-emerald-50 text-emerald-600 border-emerald-200',
-        set_rating: 'bg-amber-50 text-amber-600 border-amber-200',
-        write_review: 'bg-blue-50 text-blue-600 border-blue-200',
-        extract: 'bg-teal-50 text-teal-600 border-teal-200',
-        variable: 'bg-teal-50 text-teal-600 border-teal-200',
-        loop: 'bg-pink-50 text-pink-600 border-pink-200',
-        condition: 'bg-orange-50 text-orange-600 border-orange-200',
+        navigate: 'bg-blue-50 text-blue-600 border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800/60',
+        google_search: 'bg-rose-50 text-rose-600 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-800/60',
+        go_back: 'bg-blue-50 text-blue-600 border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800/60',
+        refresh_page: 'bg-blue-50 text-blue-600 border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800/60',
+        click: 'bg-emerald-50 text-emerald-600 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800/60',
+        type: 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-800/60',
+        human_type: 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-800/60',
+        hover: 'bg-emerald-50 text-emerald-600 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800/60',
+        select: 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-800/60',
+        keyboard: 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-800/60',
+        wait: 'bg-amber-50 text-amber-600 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800/60',
+        random_delay: 'bg-amber-50 text-amber-600 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800/60',
+        scroll: 'bg-cyan-50 text-cyan-600 border-cyan-200 dark:bg-cyan-950/40 dark:text-cyan-300 dark:border-cyan-800/60',
+        random_scroll: 'bg-cyan-50 text-cyan-600 border-cyan-200 dark:bg-cyan-950/40 dark:text-cyan-300 dark:border-cyan-800/60',
+        screenshot: 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-800/60',
+        upload: 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-800/60',
+        maps_click: 'bg-emerald-50 text-emerald-600 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800/60',
+        set_rating: 'bg-amber-50 text-amber-600 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800/60',
+        write_review: 'bg-blue-50 text-blue-600 border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800/60',
+        extract: 'bg-teal-50 text-teal-600 border-teal-200 dark:bg-teal-950/40 dark:text-teal-300 dark:border-teal-800/60',
+        variable: 'bg-teal-50 text-teal-600 border-teal-200 dark:bg-teal-950/40 dark:text-teal-300 dark:border-teal-800/60',
+        loop: 'bg-pink-50 text-pink-600 border-pink-200 dark:bg-pink-950/40 dark:text-pink-300 dark:border-pink-800/60',
+        condition: 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-800/60',
     }
-    return colorMap[type] || 'bg-[#f7f7f9] text-[#5f5a6d] border-[#e9e4f2]'
+    return colorMap[type] || 'bg-[#f7f7f9] text-[#5f5a6d] border-[#e9e4f2] dark:bg-[#2a2540] dark:text-[#c8c0d8] dark:border-[#3d3558]'
 }
 
 const getActionIcon = (type: string) => {
@@ -900,9 +900,9 @@ export function Scripts() {
         <PageShell>
             {/* Toast Notification */}
             {toast && (
-                <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-[18px] shadow-[0_18px_48px_rgba(40,36,54,0.12)] border flex items-center gap-2 animate-[slideIn_0.3s_ease] ${toast.type === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-700' :
-                    toast.type === 'error' ? 'bg-rose-50 border-rose-200 text-rose-700' :
-                        'bg-blue-50 border-blue-200 text-blue-700'
+                <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-[18px] shadow-[0_18px_48px_rgba(40,36,54,0.12)] border flex items-center gap-2 animate-slide-up ${toast.type === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950/40 dark:border-emerald-800/60 dark:text-emerald-300' :
+                    toast.type === 'error' ? 'bg-rose-50 border-rose-200 text-rose-700 dark:bg-rose-950/40 dark:border-rose-800/60 dark:text-rose-300' :
+                        'bg-blue-50 border-blue-200 text-blue-700 dark:bg-blue-950/40 dark:border-blue-800/60 dark:text-blue-300'
                     }`}>
                     <span className="text-sm font-semibold">{toast.message}</span>
                     <button onClick={() => setToast(null)} className="ml-2 opacity-60 hover:opacity-100">
@@ -925,7 +925,7 @@ export function Scripts() {
                 }
             >
                 <div className="flex items-center gap-3 mb-3">
-                    <div className="p-2 bg-rose-50 rounded-full"><AlertTriangle className="w-5 h-5 text-rose-500" /></div>
+                    <div className="p-2 bg-rose-50 dark:bg-rose-950/40 rounded-full"><AlertTriangle className="w-5 h-5 text-rose-500" /></div>
                     <p className="text-sm text-[#5f5a6d]">Bạn có chắc muốn xóa kịch bản <strong className="text-[#17171f]">{scripts.find(s => s.id === showDeleteConfirm)?.name}</strong>? Hành động này không thể hoàn tác.</p>
                 </div>
             </Modal>
@@ -1003,7 +1003,7 @@ export function Scripts() {
                                             }`}
                                         onClick={() => setCurrentScript(script)}
                                     >
-                                        <span className="flex-1 truncate text-xs font-medium">{script.name}</span>
+                                        <span className="flex-1 truncate text-xs font-medium" title={script.name}>{script.name}</span>
                                         <button
                                             onClick={(e) => { e.stopPropagation(); setShowDeleteConfirm(script.id) }}
                                             className="opacity-0 group-hover:opacity-100 p-0.5 text-[#908a9e] hover:text-rose-500 transition-all"
@@ -1041,7 +1041,7 @@ export function Scripts() {
                                 <div className="flex items-center gap-1">
                                     <IconButton icon={ChevronLeft} label={showScriptList ? 'Ẩn sidebar' : 'Hiện sidebar'} onClick={() => setShowScriptList(!showScriptList)} className={showScriptList ? '' : '[&>svg]:rotate-180'} />
                                     <IconButton icon={Settings} label="Cài đặt Script" onClick={() => setShowSettings(!showSettings)} className={showSettings ? '!bg-[#f4f0ff] !text-[#8d74e8]' : ''} />
-                                    <IconButton icon={Hash} label="Quản lý biến" onClick={() => setShowVarManager(!showVarManager)} className={showVarManager ? '!bg-emerald-50 !text-emerald-600' : ''} />
+                                    <IconButton icon={Hash} label="Quản lý biến" onClick={() => setShowVarManager(!showVarManager)} className={showVarManager ? '!bg-emerald-50 dark:!bg-emerald-950/40 !text-emerald-600 dark:!text-emerald-300' : ''} />
                                 </div>
                             </div>
 
@@ -1257,9 +1257,9 @@ export function Scripts() {
                 <div className="mb-4">
                     <button
                         onClick={runScriptDirect}
-                        className="w-full flex items-center gap-3 p-3 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-[16px] transition-colors"
+                        className="w-full flex items-center gap-3 p-3 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 border border-blue-200 dark:border-blue-800/60 rounded-[16px] transition-colors"
                     >
-                        <Play className="w-5 h-5 text-blue-600" />
+                        <Play className="w-5 h-5 text-blue-600 dark:text-blue-300" />
                         <div className="text-left">
                             <div className="text-[#17171f] font-semibold">Chạy trực tiếp</div>
                             <div className="text-xs text-[#908a9e]">Không dùng tài khoản, chạy trình duyệt mới</div>
@@ -1269,9 +1269,9 @@ export function Scripts() {
 
                 {/* Divider */}
                 <div className="flex items-center gap-3 mb-4">
-                    <div className="flex-1 h-px bg-[#e9e4f2]" />
+                    <div className="flex-1 h-px bg-[#e9e4f2] dark:bg-[#3d3558]" />
                     <span className="text-xs text-[#908a9e]">hoặc chọn tài khoản</span>
-                    <div className="flex-1 h-px bg-[#e9e4f2]" />
+                    <div className="flex-1 h-px bg-[#e9e4f2] dark:bg-[#3d3558]" />
                 </div>
 
                 {/* Option 2: Run with accounts */}
@@ -1298,8 +1298,8 @@ export function Scripts() {
                                 <label
                                     key={account.id}
                                     className={`flex items-center gap-3 p-2.5 rounded-[12px] cursor-pointer transition-colors ${selectedAccountIds.includes(account.id)
-                                        ? 'bg-emerald-50 border border-emerald-200'
-                                        : 'bg-[#f7f7f9] border border-transparent hover:bg-[#f4f1fa]'
+                                        ? 'bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60'
+                                        : 'bg-[#f7f7f9] dark:bg-[#2a2540] border border-transparent hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]'
                                         }`}
                                 >
                                     <input
@@ -1309,7 +1309,7 @@ export function Scripts() {
                                         className="h-4 w-4 rounded accent-[#8d74e8]"
                                     />
                                     <div className="flex-1 min-w-0">
-                                        <div className="text-sm text-[#17171f] font-medium truncate">{account.email}</div>
+                                        <div className="text-sm text-[#17171f] font-medium truncate" title={account.email}>{account.email}</div>
                                         <div className="text-xs text-[#908a9e]">
                                             {account.status === 'active' ? 'Active' : 'Inactive'}
                                             {account.totalReviews > 0 && ` -- ${account.totalReviews} reviews`}
@@ -1345,7 +1345,7 @@ export function Scripts() {
                         </div>
                         <div className="space-y-1 max-h-40 overflow-y-auto">
                             {runResults.map((r: any, i: number) => (
-                                <div key={i} className={`text-xs p-2 rounded-[10px] font-medium ${r.success ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-rose-50 text-rose-700 border border-rose-200'}`}>
+                                <div key={i} className={`text-xs p-2 rounded-[10px] font-medium ${r.success ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800/60' : 'bg-rose-50 text-rose-700 border border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-800/60'}`}>
                                     {r.success ? 'OK' : 'FAIL'} {r.email}
                                 </div>
                             ))}

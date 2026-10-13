@@ -508,6 +508,7 @@ export class ReviewService {
         locationId: number
         rating: number
         reviewText: string
+        styleApplied?: boolean
     }): Promise<ReviewHistory> {
         const db = getDatabase()
         return db.insert(schema.reviewHistory).values({
@@ -518,6 +519,7 @@ export class ReviewService {
             reviewText: input.reviewText,
             status: asHistoryStatus('submitting'),
             errorMessage: null,
+            styleApplied: input.styleApplied ?? false,
             createdAt: new Date(),
         }).returning().get()
     }

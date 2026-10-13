@@ -102,7 +102,7 @@ function PoolSummary({
             <Badge tone="blue">
                 {replaceTokens(t('settings.fproxyPool.summaryInUse'), { count: inUse })}
             </Badge>
-            <span className="text-xs font-medium text-[#6f697c]">
+            <span className="text-xs font-medium text-[#6f697c] dark:text-[#c8c0d8]">
                 {replaceTokens(t('settings.fproxyPool.availableCapacity'), { count: capacity })}
             </span>
         </div>
@@ -142,7 +142,7 @@ function SecretInputRow({
                 onPaste={onPaste}
                 autoComplete="new-password"
                 spellCheck={false}
-                className="h-11 min-w-0 flex-1 rounded-[16px] border border-[#e9e4f2] bg-white px-4 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/20"
+                className="h-11 min-w-0 flex-1 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/20"
                 placeholder={replaceTokens(t('settings.fproxyPool.apiKeyPlaceholder'), {
                     number: index + 1,
                 })}
@@ -151,7 +151,7 @@ function SecretInputRow({
                 <button
                     type="button"
                     onClick={onRemove}
-                    className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[#eceaf2] bg-white text-[#6f697c] transition-colors hover:bg-rose-50 hover:text-rose-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#8d74e8]/50"
+                    className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[#eceaf2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-[#6f697c] dark:text-[#c8c0d8] transition-colors hover:bg-rose-50 dark:hover:bg-rose-950/40 hover:text-rose-700 dark:hover:text-rose-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#8d74e8]/50"
                     aria-label={replaceTokens(t('settings.fproxyPool.removeDraftKey'), {
                         number: index + 1,
                     })}
@@ -208,21 +208,21 @@ function FProxySlotRow({
     }
 
     return (
-        <li className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
+        <li className="rounded-[18px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                 <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
-                        <span className="truncate text-sm font-semibold text-[#24222c]">
+                        <span className="truncate text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]">
                             {slot.label}
                         </span>
                         <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ${
-                            presentation.tone === 'emerald' ? 'bg-emerald-50 text-emerald-700'
-                                : presentation.tone === 'amber' ? 'bg-amber-50 text-amber-700'
-                                    : presentation.tone === 'rose' ? 'bg-rose-50 text-rose-700'
-                                        : presentation.tone === 'blue' ? 'bg-blue-50 text-blue-700'
-                                            : presentation.tone === 'cyan' ? 'bg-cyan-50 text-cyan-700'
-                                                : presentation.tone === 'violet' ? 'bg-[#f4f0ff] text-[#735bd6]'
-                                                    : 'bg-[#f4f1fa] text-[#5f5a6d]'
+                            presentation.tone === 'emerald' ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
+                                : presentation.tone === 'amber' ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
+                                    : presentation.tone === 'rose' ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300'
+                                        : presentation.tone === 'blue' ? 'bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
+                                            : presentation.tone === 'cyan' ? 'bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300'
+                                                : presentation.tone === 'violet' ? 'bg-[#f4f0ff] dark:bg-[#2a2540] text-[#735bd6]'
+                                                    : 'bg-[#f4f1fa] dark:bg-[#2a2540] text-[#5f5a6d] dark:text-[#c8c0d8]'
                         }`}>
                             <StatusIcon className={`h-3.5 w-3.5 ${
                                 slot.status === 'testing' || slot.status === 'rotating'
@@ -234,16 +234,16 @@ function FProxySlotRow({
                         {ipLeft > 0 && ` ? IP ${formatFProxyCountdown(ipLeft)}`}
                         </span>
                         {slot.hasSecret && (
-                            <span className="inline-flex items-center gap-1 text-xs text-[#6f697c]">
+                            <span className="inline-flex items-center gap-1 text-xs text-[#6f697c] dark:text-[#c8c0d8]">
                                 <KeyRound className="h-3.5 w-3.5" />
                                 {t('settings.fproxyPool.secretStored')}
                             </span>
                         )}
                     </div>
-                    <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-xs text-[#6f697c]">
+                    <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-xs text-[#6f697c] dark:text-[#c8c0d8]">
                         {slot.currentEgress && (
                             <span>
-                                IP <span className="font-mono text-[#24222c]">{slot.currentEgress.ip}</span>
+                                IP <span className="font-mono text-[#24222c] dark:text-[#f0ecff]">{slot.currentEgress.ip}</span>
                                 {slot.currentEgress.location ? ` · ${slot.currentEgress.location}` : ''}
                             </span>
                         )}
@@ -262,12 +262,12 @@ function FProxySlotRow({
                         )}
                     </div>
                     {slot.error && (
-                        <p className="mt-1.5 text-xs font-medium text-rose-700" role="status">
+                        <p className="mt-1.5 text-xs font-medium text-rose-700 dark:text-rose-300" role="status">
                             {slot.error}
                         </p>
                     )}
                     {removeBlocked && (
-                        <p className="mt-1.5 text-xs text-amber-700">
+                        <p className="mt-1.5 text-xs text-amber-700 dark:text-amber-300">
                             {t('settings.fproxyPool.removeBlocked')}
                         </p>
                     )}
@@ -278,7 +278,7 @@ function FProxySlotRow({
                         type="button"
                         onClick={() => void testSlot(slot.id)}
                         disabled={busy || !slot.enabled || slot.status === 'leased'}
-                        className={`${actionButtonClass} border border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]`}
+                        className={`${actionButtonClass} border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]`}
                     >
                         <span className="inline-flex items-center gap-1.5">
                             {action === 'testing'
@@ -294,8 +294,8 @@ function FProxySlotRow({
                         aria-pressed={slot.enabled}
                         className={`${actionButtonClass} border ${
                             slot.enabled
-                                ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
-                                : 'border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]'
+                                ? 'border-emerald-200 dark:border-emerald-800/60 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50'
+                                : 'border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]'
                         }`}
                     >
                         <span className="inline-flex items-center gap-1.5">
@@ -311,7 +311,7 @@ function FProxySlotRow({
                         type="button"
                         onClick={() => void handleRemove()}
                         disabled={busy || removeBlocked}
-                        className={`${actionButtonClass} border border-rose-100 bg-white text-rose-700 hover:bg-rose-50`}
+                        className={`${actionButtonClass} border border-rose-100 dark:border-rose-900/50 bg-white dark:bg-[#1e1b2e] text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40`}
                     >
                         <span className="inline-flex items-center gap-1.5">
                             {action === 'removing'
@@ -429,7 +429,7 @@ export function FProxyPoolSettings() {
 
     return (
         <section
-            className="rounded-[20px] border border-[#e6e0fb] bg-[#faf8ff] p-4"
+            className="rounded-[20px] border border-[#e6e0fb] dark:border-[#3d3558] bg-[#faf8ff] dark:bg-[#2a2540] p-4"
             aria-labelledby="fproxy-pool-title"
             aria-busy={loading || adding || testingAll || policySaving}
         >
@@ -437,11 +437,11 @@ export function FProxyPoolSettings() {
                 <div>
                     <div className="flex items-center gap-2">
                         <ShieldCheck className="h-5 w-5 text-[#735bd6]" aria-hidden="true" />
-                        <h3 id="fproxy-pool-title" className="text-sm font-semibold text-[#24222c]">
+                        <h3 id="fproxy-pool-title" className="text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]">
                             {t('settings.fproxyPool.title')}
                         </h3>
                     </div>
-                    <p className="mt-1 max-w-2xl text-xs leading-relaxed text-[#6f697c]">
+                    <p className="mt-1 max-w-2xl text-xs leading-relaxed text-[#6f697c] dark:text-[#c8c0d8]">
                         {t('settings.fproxyPool.description')}
                     </p>
                 </div>
@@ -486,10 +486,10 @@ export function FProxyPoolSettings() {
                 </AlertBanner>
             )}
 
-            <form onSubmit={handleAdd} className="mt-4 border-t border-[#e9e4f2] pt-4">
+            <form onSubmit={handleAdd} className="mt-4 border-t border-[#e9e4f2] dark:border-[#3d3558] pt-4">
                 <div className="grid gap-3 lg:grid-cols-[minmax(0,0.65fr)_minmax(0,1.35fr)]">
                     <div>
-                        <label htmlFor="fproxy-slot-label" className="mb-1.5 block text-xs font-semibold text-[#5f5a6d]">
+                        <label htmlFor="fproxy-slot-label" className="mb-1.5 block text-xs font-semibold text-[#5f5a6d] dark:text-[#c8c0d8]">
                             {t('settings.fproxyPool.label')}
                         </label>
                         <input
@@ -498,22 +498,22 @@ export function FProxyPoolSettings() {
                             value={label}
                             onChange={event => setLabel(event.target.value)}
                             maxLength={100}
-                            className="h-11 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/20"
+                            className="h-11 w-full rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/20"
                             placeholder={t('settings.fproxyPool.labelPlaceholder')}
                         />
-                        <p className="mt-1 text-xs leading-relaxed text-[#8e899b]">
+                        <p className="mt-1 text-xs leading-relaxed text-[#8e899b] dark:text-[#9a8fba]">
                             {t('settings.fproxyPool.labelHint')}
                         </p>
                     </div>
                     <div>
                         <div className="mb-1.5 flex items-center justify-between gap-2">
-                            <span className="text-xs font-semibold text-[#5f5a6d]">
+                            <span className="text-xs font-semibold text-[#5f5a6d] dark:text-[#c8c0d8]">
                                 {t('settings.fproxyPool.apiKeys')}
                             </span>
                             <button
                                 type="button"
                                 onClick={addSecretRow}
-                                className="inline-flex min-h-11 items-center gap-1 rounded-full px-3 text-xs font-semibold text-[#735bd6] hover:bg-[#f0ecfb] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#8d74e8]/50"
+                                className="inline-flex min-h-11 items-center gap-1 rounded-full px-3 text-xs font-semibold text-[#735bd6] hover:bg-[#f0ecfb] dark:hover:bg-[#352f4a] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#8d74e8]/50"
                             >
                                 <Plus className="h-4 w-4" />
                                 {t('settings.fproxyPool.addAnother')}
@@ -533,13 +533,13 @@ export function FProxyPoolSettings() {
                                 />
                             ))}
                         </div>
-                        <p id="fproxy-secret-hint" className="mt-1.5 text-xs leading-relaxed text-[#8e899b]">
+                        <p id="fproxy-secret-hint" className="mt-1.5 text-xs leading-relaxed text-[#8e899b] dark:text-[#9a8fba]">
                             {t('settings.fproxyPool.secretHint')}
                         </p>
                     </div>
                 </div>
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-                    <span className="text-xs text-[#8e899b]" aria-live="polite">
+                    <span className="text-xs text-[#8e899b] dark:text-[#9a8fba]" aria-live="polite">
                         {resultMessage}
                     </span>
                     <PrimaryButton
@@ -555,22 +555,22 @@ export function FProxyPoolSettings() {
                 </div>
             </form>
 
-            <fieldset className="mt-4 border-t border-[#e9e4f2] pt-4" disabled={!snapshot || policySaving}>
-                <legend className="text-xs font-semibold uppercase tracking-wide text-[#6f697c]">
+            <fieldset className="mt-4 border-t border-[#e9e4f2] dark:border-[#3d3558] pt-4" disabled={!snapshot || policySaving}>
+                <legend className="text-xs font-semibold uppercase tracking-wide text-[#6f697c] dark:text-[#c8c0d8]">
                     {t('settings.fproxyPool.policyTitle')}
                 </legend>
-                <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-[16px] border border-[#ece7f5] bg-white p-3.5">
+                <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-[16px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5">
                     <input
                         type="checkbox"
                         checked={snapshot?.policy.strictUnique || false}
                         onChange={event => handlePolicy({ strictUnique: event.target.checked })}
-                        className="mt-0.5 h-5 w-5 rounded border-[#d8d1e8] text-[#8d74e8] focus:ring-[#8d74e8]"
+                        className="mt-0.5 h-5 w-5 rounded border-[#d8d1e8] dark:border-[#3d3558] text-[#8d74e8] focus:ring-[#8d74e8]"
                     />
                     <span>
-                        <span className="block text-sm font-semibold text-[#24222c]">
+                        <span className="block text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]">
                             {t('settings.fproxyPool.strictUnique')}
                         </span>
-                        <span className="mt-0.5 block text-xs leading-relaxed text-[#6f697c]">
+                        <span className="mt-0.5 block text-xs leading-relaxed text-[#6f697c] dark:text-[#c8c0d8]">
                             {t('settings.fproxyPool.strictUniqueDesc')}
                         </span>
                     </span>
@@ -581,8 +581,8 @@ export function FProxyPoolSettings() {
                             key={policy}
                             className={`flex cursor-pointer items-start gap-3 rounded-[16px] border p-3.5 transition-colors ${
                                 snapshot?.policy.rotationPolicy === policy
-                                    ? 'border-[#cbbff3] bg-[#f4f0ff]'
-                                    : 'border-[#ece7f5] bg-white hover:bg-[#faf8ff]'
+                                    ? 'border-[#cbbff3] dark:border-[#735bd6] bg-[#f4f0ff] dark:bg-[#2a2540]'
+                                    : 'border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] hover:bg-[#faf8ff] dark:hover:bg-[#2a2540]'
                             }`}
                         >
                             <input
@@ -591,13 +591,13 @@ export function FProxyPoolSettings() {
                                 value={policy}
                                 checked={snapshot?.policy.rotationPolicy === policy}
                                 onChange={() => handlePolicy({ rotationPolicy: policy })}
-                                className="mt-0.5 h-5 w-5 border-[#d8d1e8] text-[#8d74e8] focus:ring-[#8d74e8]"
+                                className="mt-0.5 h-5 w-5 border-[#d8d1e8] dark:border-[#3d3558] text-[#8d74e8] focus:ring-[#8d74e8]"
                             />
                             <span>
-                                <span className="block text-sm font-semibold text-[#24222c]">
+                                <span className="block text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]">
                                     {t(`settings.fproxyPool.policy.${policy}`)}
                                 </span>
-                                <span className="mt-0.5 block text-xs leading-relaxed text-[#6f697c]">
+                                <span className="mt-0.5 block text-xs leading-relaxed text-[#6f697c] dark:text-[#c8c0d8]">
                                     {t(`settings.fproxyPool.policy.${policy}Desc`)}
                                 </span>
                             </span>
@@ -606,11 +606,11 @@ export function FProxyPoolSettings() {
                 </div>
             </fieldset>
 
-            <div className="mt-4 border-t border-[#e9e4f2] pt-4">
+            <div className="mt-4 border-t border-[#e9e4f2] dark:border-[#3d3558] pt-4">
                 {loading && !snapshot ? (
                     <div className="space-y-2" role="status" aria-label={t('settings.fproxyPool.loading')}>
                         {[0, 1].map(index => (
-                            <div key={index} className="h-20 animate-pulse rounded-[18px] bg-[#eeebf5] motion-reduce:animate-none" />
+                            <div key={index} className="h-20 animate-pulse rounded-[18px] bg-[#eeebf5] dark:bg-[#2a2540] motion-reduce:animate-none" />
                         ))}
                     </div>
                 ) : snapshot && snapshot.slots.length > 0 ? (
@@ -620,12 +620,12 @@ export function FProxyPoolSettings() {
                         ))}
                     </ul>
                 ) : (
-                    <div className="rounded-[18px] border border-dashed border-[#dcd5eb] bg-white px-4 py-7 text-center">
+                    <div className="rounded-[18px] border border-dashed border-[#dcd5eb] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 py-7 text-center">
                         <KeyRound className="mx-auto h-6 w-6 text-[#8d74e8]" />
-                        <p className="mt-2 text-sm font-semibold text-[#24222c]">
+                        <p className="mt-2 text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]">
                             {t('settings.fproxyPool.empty')}
                         </p>
-                        <p className="mt-1 text-xs text-[#6f697c]">
+                        <p className="mt-1 text-xs text-[#6f697c] dark:text-[#c8c0d8]">
                             {t('settings.fproxyPool.emptyHint')}
                         </p>
                     </div>

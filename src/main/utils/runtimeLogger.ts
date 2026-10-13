@@ -1,7 +1,8 @@
 import { app } from 'electron'
-import { appendFileSync, existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import type { RuntimeLogLevel } from '../runtime/v2/types'
+import { getRotatingLogger } from './RotatingLogger'
 
 export interface RuntimeLogger {
     level: RuntimeLogLevel
@@ -83,7 +84,7 @@ function writeLine(level: RuntimeLogLevel, bindings: Record<string, unknown>, ar
 
     const line = `${safeSerialize(payload)}\n`
     try {
-        appendFileSync(getLogFilePath(), line)
+        getRotatingLogger('runtime', getLogFilePath()).write(line)
     } catch {
         // Keep runtime resilient when filesystem is unavailable.
     }

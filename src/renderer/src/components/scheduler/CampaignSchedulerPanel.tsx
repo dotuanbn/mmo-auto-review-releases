@@ -210,7 +210,7 @@ export function CampaignSchedulerPanel({ campaignId, campaignName }: CampaignSch
     }
 
     const selectClass =
-        'w-full rounded-[12px] border border-[#e9e4f2] bg-white px-3 py-2 text-sm text-[#17171f] outline-none focus:border-[#8d74e8] focus:ring-2 focus:ring-[#8d74e8]/20'
+        'w-full rounded-[12px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-3 py-2 text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] outline-none focus:border-[#8d74e8] focus:ring-2 focus:ring-[#8d74e8]/20'
     const inputClass = selectClass
 
     return (
@@ -247,19 +247,19 @@ export function CampaignSchedulerPanel({ campaignId, campaignName }: CampaignSch
                 <div className="space-y-3">
                     {schedule && (
                         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                            <div className="rounded-[12px] border border-[#e9e4f2] bg-white px-3 py-2">
-                                <div className="text-[10px] font-bold uppercase tracking-wider text-[#908a9e]">
+                            <div className="rounded-[12px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-3 py-2">
+                                <div className="text-[10px] font-bold uppercase tracking-wider text-[#908a9e] dark:text-[#9a8fba]">
                                     {t('scheduler.nextRun', 'Next run')}
                                 </div>
-                                <div className="mt-0.5 text-sm font-medium text-[#17171f]">
+                                <div className="mt-0.5 text-sm font-medium text-[#17171f] dark:text-[#f0ecff]">
                                     {formatScheduleTimestamp(schedule.nextRunAt)}
                                 </div>
                             </div>
-                            <div className="rounded-[12px] border border-[#e9e4f2] bg-white px-3 py-2">
-                                <div className="text-[10px] font-bold uppercase tracking-wider text-[#908a9e]">
+                            <div className="rounded-[12px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-3 py-2">
+                                <div className="text-[10px] font-bold uppercase tracking-wider text-[#908a9e] dark:text-[#9a8fba]">
                                     {t('scheduler.lastRun', 'Last run')}
                                 </div>
-                                <div className="mt-0.5 text-sm font-medium text-[#17171f]">
+                                <div className="mt-0.5 text-sm font-medium text-[#17171f] dark:text-[#f0ecff]">
                                     {formatScheduleTimestamp(schedule.lastRunAt)}
                                 </div>
                             </div>
@@ -349,7 +349,7 @@ export function CampaignSchedulerPanel({ campaignId, campaignName }: CampaignSch
                                                 'rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors',
                                                 selected
                                                     ? 'border-[#8d74e8] bg-[#8d74e8] text-white'
-                                                    : 'border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f0ff]',
+                                                    : 'border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f0ff] dark:hover:bg-[#352f4a]',
                                             ].join(' ')}
                                         >
                                             {t(day.key, day.fallback)}

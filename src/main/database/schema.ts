@@ -40,9 +40,16 @@ export const accounts = sqliteTable('accounts', {
     // Phase 2 extended - per-account review style + warmup schedule
     reviewStyleProfile: text('review_style_profile'), // JSON style profile for content variation
     reviewStyleSeed: text('review_style_seed'), // stable seed for style generation
+    behaviorProfile: text('behavior_profile'), // JSON behavior profile (nullable)
     lastWarmupAt: integer('last_warmup_at', { mode: 'timestamp' }),
     nextWarmupAt: integer('next_warmup_at', { mode: 'timestamp' }),
     warmupSessions: integer('warmup_sessions').default(0).notNull(),
+
+    // Birth-story scheduler + auto-warmup
+    birthStoryDay: integer('birth_story_day').default(0).notNull(),
+    birthStoryStartDate: integer('birth_story_start_date', { mode: 'timestamp' }),
+    birthStoryCompleted: integer('birth_story_completed', { mode: 'boolean' }).default(false).notNull(),
+    autoWarmupEnabled: integer('auto_warmup_enabled', { mode: 'boolean' }).default(false).notNull(),
 })
 
 // Proxies table - Proxy servers for rotation
@@ -141,6 +148,14 @@ export const reviewHistory = sqliteTable('review_history', {
     errorMessage: text('error_message'),
     screenshot: text('screenshot'), // file path
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+    // Review survival tracking (migration 008)
+    verifiedStatus: text('verified_status', { enum: ['pending', 'live', 'removed', 'unknown'] }).default('pending'),
+    verifiedAt: integer('verified_at', { mode: 'timestamp' }),
+    lastCheckAt: integer('last_check_at', { mode: 'timestamp' }),
+    checkCount: integer('check_count').default(0),
+    survivalDays: integer('survival_days'),
+    googleReviewId: text('google_review_id'),
+    styleApplied: integer('style_applied', { mode: 'boolean' }).default(false),
 })
 
 // Settings table - App configuration

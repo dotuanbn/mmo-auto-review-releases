@@ -69,6 +69,67 @@ function assertWebSeoLocationsSafe(db: TrafficDb, locationIds: number[]): void {
     }
 }
 
+function uniqueNumericIds(values: ReadonlyArray<number | null>): number[] {
+    const ids = new Set<number>()
+    for (const value of values) {
+        if (typeof value === 'number' && Number.isInteger(value) && value > 0) ids.add(value)
+    }
+    return Array.from(ids)
+}
+
+function parseLogActions(raw: string): unknown {
+    try {
+        const parsed: unknown = JSON.parse(raw || '[]')
+        return parsed
+    } catch {
+        return []
+    }
+}
+
+/** One query for every distinct account referenced by the log page. */
+function loadAccountEmailMap(db: TrafficDb, accountIds: number[]): Map<number, string> {
+    const emails = new Map<number, string>()
+    if (accountIds.length === 0) return emails
+    const rows = db.select({ id: accounts.id, email: accounts.email })
+        .from(accounts)
+        .where(inArray(accounts.id, accountIds))
+        .all()
+    for (const row of rows) emails.set(row.id, row.email)
+    return emails
+}
+
+/** One query for every distinct location referenced by the log page. */
+function loadLocationNameMap(db: TrafficDb, locationIds: number[]): Map<number, string> {
+    const names = new Map<number, string>()
+    if (locationIds.length === 0) return names
+    const rows = db.select({ id: locations.id, name: locations.name })
+        .from(locations)
+        .where(inArray(locations.id, locationIds))
+        .all()
+    for (const row of rows) names.set(row.id, row.name)
+    return names
+}
+
+/**
+ * Campaign logs plus display names.
+ * Three queries total (logs, accounts, locations) instead of two lookups per row.
+ */
+function loadTrafficBoostLogs(campaignId: number) {
+    const db = getDatabase()
+    const logs = db.select().from(trafficLogs)
+        .where(eq(trafficLogs.campaignId, campaignId))
+        .all()
+    const accountEmails = loadAccountEmailMap(db, uniqueNumericIds(logs.map((log) => log.accountId)))
+    const locationNames = loadLocationNameMap(db, uniqueNumericIds(logs.map((log) => log.locationId)))
+
+    return logs.map((log) => ({
+        ...log,
+        accountEmail: (log.accountId != null ? accountEmails.get(log.accountId) : undefined) || 'Anonymous',
+        locationName: locationNames.get(log.locationId) || 'Unknown',
+        actions: parseLogActions(log.actions),
+    }))
+}
+
 function resolveDwellWindow(
     minInput: number | undefined,
     maxInput: number | undefined,
@@ -525,24 +586,7 @@ export function registerTrafficHandlers() {
     ipcMain.handle('trafficBoost:getLogs', withIpcValidation('trafficBoost:getLogs', async (_event, campaignId: unknown) => {
         const parsedId = parseIpcPayload('trafficBoost:getLogs', idSchema, campaignId)
         try {
-            const db = getDatabase()
-            const logs = db.select().from(trafficLogs)
-                .where(eq(trafficLogs.campaignId, parsedId))
-                .all()
-
-            return logs.map(log => {
-                const account = log.accountId
-                    ? db.select().from(accounts).where(eq(accounts.id, log.accountId)).get()
-                    : null
-                const location = db.select().from(locations).where(eq(locations.id, log.locationId)).get()
-
-                return {
-                    ...log,
-                    accountEmail: account?.email || 'Anonymous',
-                    locationName: location?.name || 'Unknown',
-                    actions: (() => { try { return JSON.parse(log.actions || '[]') } catch { return [] } })(),
-                }
-            })
+            return loadTrafficBoostLogs(parsedId)
         } catch (error) {
             console.error('Failed to get logs:', error)
             return []

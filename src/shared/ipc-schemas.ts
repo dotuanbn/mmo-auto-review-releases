@@ -3,6 +3,7 @@
  * Strict by default: unknown keys/types are rejected at the boundary.
  */
 import { z } from 'zod'
+import { WARMUP_ACTIVITY_INPUTS } from './warmup-contracts'
 import {
     WEB_SEO_KEYWORD_MAX_COUNT,
     WEB_SEO_KEYWORD_MAX_LEN,
@@ -136,6 +137,11 @@ export const SETTINGS_KEYS = [
     'autoGenerateReview',
     'enforceAccountWarmup',
     'enablePerAccountReviewStyle',
+    'stealthLevel',
+    'crossAccountCooldownMinutes',
+    'restHoursEnabled',
+    'restHoursStart',
+    'restHoursEnd',
     'enableAgenticReview',
     'manualReviewSubmit',
     'allowAutoSubmitOnTrustedHosts',
@@ -214,6 +220,11 @@ export const settingsPatchSchema = z
         autoGenerateReview: z.boolean().optional(),
         enforceAccountWarmup: z.boolean().optional(),
         enablePerAccountReviewStyle: z.boolean().optional(),
+        stealthLevel: z.enum(['off', 'low', 'medium', 'high', 'paranoid']).optional(),
+        crossAccountCooldownMinutes: z.number().int().min(0).max(1440).optional(),
+        restHoursEnabled: z.boolean().optional(),
+        restHoursStart: z.number().int().min(0).max(23).optional(),
+        restHoursEnd: z.number().int().min(0).max(23).optional(),
         enableAgenticReview: z.boolean().optional(),
         manualReviewSubmit: z.boolean().optional(),
         allowAutoSubmitOnTrustedHosts: z.boolean().optional(),
@@ -741,3 +752,42 @@ export const scriptsRunWithAccountsSchema = z.tuple([
 ])
 
 export const scriptIdSchema = boundedString(128)
+
+// ---------------------------------------------------------------------------
+// Warmup + birth-story auto-scheduler
+// ---------------------------------------------------------------------------
+
+/** Activity types accepted by warmup:start and the birth-story scheduler. */
+export const warmupActivityInputSchema = z.enum(WARMUP_ACTIVITY_INPUTS)
+
+export const warmupStartOptionsSchema = z
+    .object({
+        activityType: warmupActivityInputSchema.optional(),
+        durationSeconds: z.number().int().min(30).max(600).optional(),
+    })
+    .strict()
+
+/** warmup:start(id, options?) — options default to {}. */
+export const warmupStartArgsSchema = z.tuple([
+    idSchema,
+    warmupStartOptionsSchema.optional().default({}),
+])
+
+/** warmup:getStatus(id) / warmup:cancel(id) */
+export const warmupAccountIdSchema = idSchema
+
+/**
+ * Birth-story day 0–7 (0 = not started).
+ * Matches accounts.birth_story_day.
+ */
+export const birthStoryDaySchema = z.number().int().min(0).max(7)
+
+/** Toggle auto-warmup scheduler for one account: (accountId, enabled). */
+export const autoWarmupSetEnabledArgsSchema = z.tuple([idSchema, z.boolean()])
+
+export const autoWarmupSetEnabledSchema = z
+    .object({
+        accountId: idSchema,
+        enabled: z.boolean(),
+    })
+    .strict()

@@ -58,12 +58,70 @@ import type {
     ComplianceAuditQuery,
 } from '../shared/compliance-audit-contracts'
 import type {
+    ReviewVerificationQueueItem,
+    ReviewVerificationRecordInput,
+    ReviewVerificationResult,
+} from '../shared/review-history-contracts'
+import type {
     TrafficVisitQueueStatsDto,
     TrafficVisitRecoverResult,
 } from '../shared/traffic-visit-contracts'
+import type {
+    LayaHealthStatus,
+    LayaRiskContext,
+    LayaRiskResult,
+    LayaDecisionResult,
+    CampaignMetricsSnapshot,
+    CampaignOptimizationResult,
+    AccountHealthContext,
+    AccountHealthResult,
+} from '../shared/laya-types'
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
+
+// on() wraps the renderer callback. off() must remove that wrapper, not the original function.
+type RendererIpcCallback = (...args: unknown[]) => void
+type RendererIpcWrapper = (event: Electron.IpcRendererEvent, ...args: unknown[]) => void
+const listenerMap = new Map<RendererIpcCallback, RendererIpcWrapper>()
+
+/** Mirrors DashboardOverview in src/main/services/DashboardService.ts. Preload must not import main. */
+interface DashboardOverview {
+    traffic: {
+        totalVisits: number
+        successVisits: number
+        failedVisits: number
+        avgQualityScore: number
+        avgDurationSeconds: number
+        organicPercent: number
+        sparkline30d: number[]
+    }
+    reviews: {
+        totalReviews: number
+        successReviews: number
+        failedReviews: number
+        successRate: number
+        reviewsToday: number
+        reviewsThisWeek: number
+        reviewsThisMonth: number
+        avgRating: number
+        sparkline30d: number[]
+    }
+    accounts: {
+        total: number
+        active: number
+        banned: number
+        suspended: number
+        tiers: { blocked: number; throttled: number; ready: number }
+        avgWarmupLevel: number
+        birthStoryCompletePercent: number
+        autoWarmupEnabled: number
+    }
+    campaigns: { total: number; running: number; paused: number; done: number }
+    captcha: { totalAttempts: number; successRate: number; avgSolveTimeMs: number }
+    recentFailures: Array<{ error: string; count: number }>
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
     // App
     getVersion: () => ipcRenderer.invoke('app:getVersion'),
@@ -109,6 +167,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
             ipcRenderer.invoke('warmup:start', id, options),
         cancel: (id: number): Promise<WarmupActionResultDto> =>
             ipcRenderer.invoke('warmup:cancel', id),
+        schedulerStart: (): Promise<void> =>
+            ipcRenderer.invoke('warmup:scheduler:start'),
+        schedulerStop: (): Promise<void> =>
+            ipcRenderer.invoke('warmup:scheduler:stop'),
+        schedulerStatus: (): Promise<boolean> =>
+            ipcRenderer.invoke('warmup:scheduler:status'),
+        toggleAutoWarmup: (id: number, enabled: boolean): Promise<void> =>
+            ipcRenderer.invoke('warmup:toggleAutoWarmup', id, enabled),
     },
 
     // Proxies
@@ -208,6 +274,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getToday: () => ipcRenderer.invoke('reviews:getToday'),
         getStats: () => ipcRenderer.invoke('reviews:getStats'),
         getHistory: (filters?: any) => ipcRenderer.invoke('reviews:getHistory', filters),
+        getVerificationQueue: (limit?: number): Promise<ReviewVerificationQueueItem[]> =>
+            ipcRenderer.invoke('reviews:getVerificationQueue', limit),
+        recordVerification: (payload: ReviewVerificationRecordInput): Promise<ReviewVerificationResult> =>
+            ipcRenderer.invoke('reviews:recordVerification', payload),
+    },
+
+    dashboard: {
+        getOverview: (): Promise<DashboardOverview> => ipcRenderer.invoke('dashboard:getOverview'),
     },
 
     // Settings (key-value; whitelist + schema enforced in main).
@@ -341,6 +415,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
             ipcRenderer.on('trafficBoost:status', handler)
             return () => ipcRenderer.removeListener('trafficBoost:status', handler)
         },
+    },
+
+    // Laya AI Integration
+    laya: {
+        healthCheck: () => ipcRenderer.invoke('laya:healthCheck'),
+        riskScore: (ctx: LayaRiskContext) => ipcRenderer.invoke('laya:riskScore', ctx),
+        decide: (type: string, payload: Record<string, unknown>) => ipcRenderer.invoke('laya:decide', { type, payload }),
+        optimizeCampaign: (metrics: CampaignMetricsSnapshot) => ipcRenderer.invoke('laya:optimizeCampaign', metrics),
+        shouldPauseCampaign: (metrics: CampaignMetricsSnapshot) => ipcRenderer.invoke('laya:shouldPauseCampaign', metrics),
+        evaluateAccountHealth: (ctx: AccountHealthContext) => ipcRenderer.invoke('laya:evaluateAccountHealth', ctx),
+        rankAccounts: (accounts: AccountHealthContext[]) => ipcRenderer.invoke('laya:rankAccounts', accounts),
     },
 
     // Runtime V2
@@ -632,7 +717,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
 
     // Event listeners — returns unsubscribe function to prevent leaks
-    on: (channel: string, callback: (...args: any[]) => void) => {
+    on: (channel: string, callback: RendererIpcCallback) => {
         const validChannels = [
             'campaign:update',
             'review:progress',
@@ -643,17 +728,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
             'compliance:reviewSubmissionQueue',
         ]
         if (validChannels.includes(channel)) {
-            const handler = (_event: any, ...args: any[]) => callback(...args)
+            const handler: RendererIpcWrapper = (_event, ...args) => {
+                callback(...args)
+            }
+            listenerMap.set(callback, handler)
             ipcRenderer.on(channel, handler)
-            // Return unsubscribe function
-            return () => { ipcRenderer.removeListener(channel, handler) }
+            return () => {
+                ipcRenderer.removeListener(channel, handler)
+                if (listenerMap.get(callback) === handler) {
+                    listenerMap.delete(callback)
+                }
+            }
         }
         return () => {}
     },
 
-    off: (channel: string, handler?: (...args: any[]) => void) => {
+    off: (channel: string, handler?: RendererIpcCallback) => {
         if (handler) {
-            ipcRenderer.removeListener(channel, handler)
+            const wrapper = listenerMap.get(handler)
+            if (wrapper) {
+                ipcRenderer.removeListener(channel, wrapper)
+                listenerMap.delete(handler)
+            } else {
+                ipcRenderer.removeListener(channel, handler as unknown as RendererIpcWrapper)
+            }
         } else {
             ipcRenderer.removeAllListeners(channel)
         }
@@ -695,6 +793,10 @@ declare global {
                 getAllStatuses: () => Promise<AccountWarmupStatusDto[]>
                 start: (id: number, options?: WarmupStartOptions) => Promise<WarmupActionResultDto>
                 cancel: (id: number) => Promise<WarmupActionResultDto>
+                schedulerStart: () => Promise<void>
+                schedulerStop: () => Promise<void>
+                schedulerStatus: () => Promise<boolean>
+                toggleAutoWarmup: (id: number, enabled: boolean) => Promise<void>
             }
             proxies: {
                 getAll: () => Promise<PublicProxy[]>
@@ -739,6 +841,11 @@ declare global {
                 getToday: () => Promise<any[]>
                 getStats: () => Promise<any>
                 getHistory: (filters?: any) => Promise<any[]>
+                getVerificationQueue: (limit?: number) => Promise<ReviewVerificationQueueItem[]>
+                recordVerification: (payload: ReviewVerificationRecordInput) => Promise<ReviewVerificationResult>
+            }
+            dashboard: {
+                getOverview: () => Promise<DashboardOverview>
             }
             settings: {
                 /** Secret keys return '********' when set, never plaintext. */
@@ -799,6 +906,15 @@ declare global {
                 getVisitQueueStats: (campaignId: number) => Promise<TrafficVisitQueueStatsDto>
                 recoverVisitLeases: (campaignId: number) => Promise<TrafficVisitRecoverResult>
                 onStatusUpdate: (callback: (status: any) => void) => () => void
+            }
+            laya: {
+                healthCheck: () => Promise<LayaHealthStatus>
+                riskScore: (ctx: LayaRiskContext) => Promise<LayaRiskResult>
+                decide: (type: string, payload: Record<string, unknown>) => Promise<LayaDecisionResult>
+                optimizeCampaign: (metrics: CampaignMetricsSnapshot) => Promise<CampaignOptimizationResult>
+                shouldPauseCampaign: (metrics: CampaignMetricsSnapshot) => Promise<boolean>
+                evaluateAccountHealth: (ctx: AccountHealthContext) => Promise<AccountHealthResult>
+                rankAccounts: (accounts: AccountHealthContext[]) => Promise<Array<AccountHealthContext & { health: AccountHealthResult }>>
             }
             runtime: {
                 getStatusV2: () => Promise<any>
@@ -978,8 +1094,8 @@ declare global {
                 run: (toolName: string, args?: string[]) => Promise<any>
                 stop: () => Promise<{ stopped: boolean }>
             }
-            on: (channel: string, callback: (...args: any[]) => void) => void
-            off: (channel: string) => void
+            on: (channel: string, callback: (...args: unknown[]) => void) => () => void
+            off: (channel: string, handler?: (...args: unknown[]) => void) => void
         }
     }
 }

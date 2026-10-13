@@ -432,8 +432,8 @@ function IncludeOptionRow({
                 locked ? 'cursor-default' : 'cursor-pointer'
             } ${
                 checked
-                    ? 'border-[#d4c8f8] bg-[#f7f4ff]'
-                    : 'border-[#ece7f5] bg-white hover:bg-[#faf8ff]'
+                    ? 'border-[#d4c8f8] dark:border-[#735bd6] bg-[#f7f4ff] dark:bg-[#2a2540]'
+                    : 'border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] hover:bg-[#faf8ff] dark:hover:bg-[#352f4a]'
             } ${disabled && !locked ? 'pointer-events-none opacity-50' : ''} ${
                 locked ? 'opacity-90' : ''
             }`}
@@ -454,15 +454,15 @@ function IncludeOptionRow({
             />
             <Icon className="mt-0.5 h-4 w-4 shrink-0 text-[#735bd6]" />
             <div className="min-w-0">
-                <div className="text-sm font-semibold text-[#24222c]">
+                <div className="text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]">
                     {label}
                     {locked ? (
-                        <span className="ml-1 text-[10px] font-medium uppercase text-[#8e899b]">
+                        <span className="ml-1 text-[10px] font-medium uppercase text-[#8e899b] dark:text-[#9a8fba]">
                             required
                         </span>
                     ) : null}
                 </div>
-                <div className="text-xs text-[#8e899b]">{description}</div>
+                <div className="text-xs text-[#8e899b] dark:text-[#9a8fba]">{description}</div>
             </div>
         </label>
     )
@@ -505,7 +505,7 @@ function CreateSection({
 
     return (
         <Panel tone="slate" className="!p-3">
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#6f697c]">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#6f697c] dark:text-[#c8c0d8]">
                 {t('settings.backupCreate', 'Create backup')}
             </div>
             <div className="grid gap-2 sm:grid-cols-3">
@@ -563,7 +563,7 @@ function BackupListSection({
 }) {
     if (state === 'loading' || (busy && !items)) {
         return (
-            <Panel tone="slate" className="flex items-center justify-center gap-2 !p-8 text-sm text-[#6f697c]">
+            <Panel tone="slate" className="flex items-center justify-center gap-2 !p-8 text-sm text-[#6f697c] dark:text-[#c8c0d8]">
                 <Loader2 className="h-5 w-5 animate-spin text-[#8d74e8]" />
                 {t('settings.backupLoading', 'Loading backups…')}
             </Panel>
@@ -602,7 +602,7 @@ function BackupListSection({
     return (
         <Panel tone="slate" className="!p-3">
             <div className="mb-2 flex items-center justify-between gap-2">
-                <div className="text-xs font-semibold uppercase tracking-wide text-[#6f697c]">
+                <div className="text-xs font-semibold uppercase tracking-wide text-[#6f697c] dark:text-[#c8c0d8]">
                     {t('settings.backupList', 'Available backups')}
                 </div>
                 <IconButton
@@ -622,15 +622,15 @@ function BackupListSection({
                             onClick={() => onSelect(item.backupId)}
                             className={`flex w-full flex-col gap-1 rounded-[14px] border px-3 py-2.5 text-left transition-colors sm:flex-row sm:items-center sm:justify-between ${
                                 selectedId === item.backupId
-                                    ? 'border-[#8d74e8] bg-[#f4f0ff]'
-                                    : 'border-[#e9e4f2] bg-white/70 hover:bg-[#faf8ff]'
+                                    ? 'border-[#8d74e8] dark:border-[#735bd6] bg-[#f4f0ff] dark:bg-[#2a2540]'
+                                    : 'border-[#e9e4f2] dark:border-[#3d3558] bg-white/70 dark:bg-[#1e1b2e] hover:bg-[#faf8ff] dark:hover:bg-[#352f4a]'
                             } disabled:opacity-50`}
                         >
                             <div className="min-w-0">
-                                <div className="truncate text-sm font-semibold text-[#24222c]">
+                                <div className="truncate text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]" title={item.backupId}>
                                     {item.backupId}
                                 </div>
-                                <div className="text-[11px] text-[#908a9e]">
+                                <div className="text-[11px] text-[#908a9e] dark:text-[#9a8fba]">
                                     {formatBackupDate(item.createdAt)}
                                     {item.label ? ` · ${item.label}` : ''}
                                 </div>
@@ -641,7 +641,7 @@ function BackupListSection({
                                         {inc}
                                     </Badge>
                                 ))}
-                                <span className="text-[11px] font-medium text-[#5f5a6d]">
+                                <span className="text-[11px] font-medium text-[#5f5a6d] dark:text-[#c8c0d8]">
                                     {formatBackupBytes(item.totalSizeBytes)}
                                 </span>
                             </div>
@@ -679,7 +679,7 @@ function InspectRestoreSection({
     if (!inspect) {
         if (!selectedId || !busy) return null
         return (
-            <Panel tone="slate" className="flex items-center gap-2 !p-4 text-sm text-[#6f697c]">
+            <Panel tone="slate" className="flex items-center gap-2 !p-4 text-sm text-[#6f697c] dark:text-[#c8c0d8]">
                 <Loader2 className="h-4 w-4 animate-spin text-[#8d74e8]" />
                 {t('settings.backupInspecting', 'Inspecting backup…')}
             </Panel>
@@ -689,7 +689,7 @@ function InspectRestoreSection({
     return (
         <Panel tone="slate" className="!p-3 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="text-xs font-semibold uppercase tracking-wide text-[#6f697c]">
+                <div className="text-xs font-semibold uppercase tracking-wide text-[#6f697c] dark:text-[#c8c0d8]">
                     {t('settings.backupInspect', 'Backup details')}
                 </div>
                 <Badge tone={inspect.valid ? 'emerald' : 'rose'}>
@@ -700,26 +700,26 @@ function InspectRestoreSection({
             </div>
             <div className="grid gap-2 text-xs sm:grid-cols-2">
                 <div>
-                    <span className="text-[#908a9e]">{t('settings.backupFileName', 'File')}: </span>
-                    <span className="font-medium text-[#24222c] break-all">{inspect.backupId}</span>
+                    <span className="text-[#908a9e] dark:text-[#9a8fba]">{t('settings.backupFileName', 'File')}: </span>
+                    <span className="font-medium text-[#24222c] dark:text-[#f0ecff] break-all">{inspect.backupId}</span>
                 </div>
                 <div>
-                    <span className="text-[#908a9e]">{t('settings.backupSize', 'Size')}: </span>
+                    <span className="text-[#908a9e] dark:text-[#9a8fba]">{t('settings.backupSize', 'Size')}: </span>
                     <span className="font-medium">{formatBackupBytes(inspect.totalSizeBytes)}</span>
                 </div>
                 <div>
-                    <span className="text-[#908a9e]">{t('settings.backupCreatedAt', 'Created')}: </span>
+                    <span className="text-[#908a9e] dark:text-[#9a8fba]">{t('settings.backupCreatedAt', 'Created')}: </span>
                     <span className="font-medium">{formatBackupDate(inspect.createdAt)}</span>
                 </div>
                 {inspect.appVersion && (
                     <div>
-                        <span className="text-[#908a9e]">{t('settings.version', 'Version')}: </span>
+                        <span className="text-[#908a9e] dark:text-[#9a8fba]">{t('settings.version', 'Version')}: </span>
                         <span className="font-medium">{inspect.appVersion}</span>
                     </div>
                 )}
                 {inspect.label && (
                     <div>
-                        <span className="text-[#908a9e]">Label: </span>
+                        <span className="text-[#908a9e] dark:text-[#9a8fba]">Label: </span>
                         <span className="font-medium">{inspect.label}</span>
                     </div>
                 )}
@@ -818,7 +818,7 @@ export function BackupRestorePanel() {
             tone="emerald"
         >
             <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-sm text-[#6f697c]">
+                <p className="text-sm text-[#6f697c] dark:text-[#c8c0d8]">
                     {t(
                         'settings.backupRestoreDesc',
                         'Create local backups of database, settings, and profiles. Restore requires typed confirmation. Secrets are never shown in this UI.',
@@ -913,7 +913,7 @@ export function BackupRestorePanel() {
                     }}
                 />
 
-                <div className="flex items-start gap-2 text-[11px] text-[#908a9e]">
+                <div className="flex items-start gap-2 text-[11px] text-[#908a9e] dark:text-[#9a8fba]">
                     <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     <span>
                         {t(

@@ -10,7 +10,6 @@
  * 7. Save screenshot & close
  */
 
-import { chromium, Browser, BrowserContext, Page } from 'playwright'
 import { BrowserWindow } from 'electron'
 import { campaignService } from '../services/CampaignService'
 import { accountService } from '../services/AccountService'
@@ -19,9 +18,11 @@ import { locationService } from '../services/LocationService'
 import { reviewService } from '../services/ReviewService'
 import { SpintaxParser } from '../utils/SpintaxParser'
 import * as path from 'path'
-import * as fs from 'fs'
 import { loadSettings } from '../ipc/settings'
 import { aiService } from '../services/AIService'
+import { browserService } from './BrowserService'
+import { reviewContentGenerator } from '../services/ReviewContentGenerator'
+import { velocityController } from '../services/VelocityController'
 
 export interface CampaignStatus {
     running: boolean
@@ -33,7 +34,7 @@ export interface CampaignStatus {
 }
 
 class SimpleCampaignEngine {
-    private browser: Browser | null = null
+    private currentContextId: number | null = null
     private running = false
     private shouldStop = false
 
@@ -64,9 +65,9 @@ class SimpleCampaignEngine {
     // Stop campaign
     async stopCampaign(): Promise<void> {
         this.shouldStop = true
-        if (this.browser) {
-            await this.browser.close().catch(() => { })
-            this.browser = null
+        if (this.currentContextId != null) {
+            await browserService.closeContext(this.currentContextId).catch(() => { })
+            this.currentContextId = null
         }
         this.running = false
         this.sendStatus({ running: false, progress: 0, message: 'Campaign stopped' })
@@ -124,39 +125,9 @@ class SimpleCampaignEngine {
             // 4. Update campaign status
             await campaignService.start(campaignId)
 
-            // 5. Launch browser (VISIBLE for debugging)
-            this.log('Launching browser...')
+            // 5. Browser contexts are created per review via BrowserService (stealth applied there)
+            this.log('Starting reviews via BrowserService...')
             this.sendStatus({ running: true, campaignId, progress: 5, message: 'Launching browser...' })
-
-            const globalSettings = loadSettings()
-            this.browser = await chromium.launch({
-                headless: globalSettings.headless ?? false,
-                channel: 'chrome', // Use installed Chrome instead of Chromium
-                args: [
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--no-first-run',
-                    '--no-default-browser-check',
-                    '--disable-infobars',
-                    '--window-size=1366,768',
-                    '--start-maximized',
-                    '--disable-extensions',
-                    '--disable-component-extensions-with-background-pages',
-                    '--disable-default-apps',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--flag-switches-begin',
-                    '--flag-switches-end',
-                    '--disable-sync',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--metrics-recording-only',
-                    '--disable-hang-monitor',
-                    '--disable-prompt-on-repost',
-                    '--disable-domain-reliability',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-background-timer-throttling',
-                ]
-            })
 
             // 6. Process each account-location pair
             let completed = 0
@@ -205,14 +176,42 @@ class SimpleCampaignEngine {
                                 const reviewTemplate = reviewTemplates[Math.floor(Math.random() * reviewTemplates.length)]
                                 reviewText = SpintaxParser.spin(reviewTemplate)
                             }
-                        } catch (aiErr: any) {
-                            this.log(`AI failed, using spintax template: ${aiErr.message}`)
+                        } catch (aiErr: unknown) {
+                            const aiMsg = aiErr instanceof Error ? aiErr.message : String(aiErr)
+                            this.log(`AI failed, using spintax template: ${aiMsg}`)
                             const reviewTemplate = reviewTemplates[Math.floor(Math.random() * reviewTemplates.length)]
                             reviewText = SpintaxParser.spin(reviewTemplate)
                         }
                     } else {
                         const reviewTemplate = reviewTemplates[Math.floor(Math.random() * reviewTemplates.length)]
                         reviewText = SpintaxParser.spin(reviewTemplate)
+                    }
+
+                    const reviewSettings = loadSettings()
+                    let wasStyled = false
+                    if (reviewSettings.enablePerAccountReviewStyle === true && reviewText) {
+                        try {
+                            const styled = await reviewContentGenerator.generate({
+                                accountId: account.id,
+                                baseText: reviewText,
+                                rating: campaign.rating,
+                                locationName: location.name,
+                                locationContext: location.address || undefined,
+                                category: location.category || undefined,
+                            })
+                            reviewText = styled.styledText
+                            wasStyled = true
+                            this.log(
+                                `[ReviewStyle] account=${account.id} ` +
+                                `typos=${styled.audit.typoCount} emoji=${styled.audit.emojiCount} ` +
+                                `similarity=${styled.audit.similarityToPrevious.toFixed(2)}`
+                            )
+                        } catch (error) {
+                            this.log(
+                                `[ReviewStyle] fallback account=${account.id}: ` +
+                                `${error instanceof Error ? error.message : String(error)}`
+                            )
+                        }
                     }
 
                     this.sendStatus({
@@ -225,6 +224,13 @@ class SimpleCampaignEngine {
                     })
 
                     // Do review
+                    const cooldown = velocityController.checkCooldown(location.id, account.id)
+                    if (!cooldown.allowed) {
+                        this.log(`[VelocityController] Cooldown: location=${location.id} account=${account.id}, skip`)
+                        completed++
+                        continue
+                    }
+
                     const result = await this.performSingleReview(
                         account.email,
                         account.password,
@@ -243,6 +249,7 @@ class SimpleCampaignEngine {
                         reviewText: reviewText,
                         status: result.success ? 'success' : 'failed',
                         errorMessage: result.error,
+                        styleApplied: wasStyled,
                         createdAt: new Date(),
                     })
 
@@ -269,9 +276,9 @@ class SimpleCampaignEngine {
             await campaignService.update(campaignId, { status: 'error' })
             return { success: false, error: errorMsg }
         } finally {
-            if (this.browser) {
-                await this.browser.close().catch(() => { })
-                this.browser = null
+            if (this.currentContextId != null) {
+                await browserService.closeContext(this.currentContextId).catch(() => { })
+                this.currentContextId = null
             }
             this.running = false
         }
@@ -286,96 +293,23 @@ class SimpleCampaignEngine {
         reviewText: string,
         rating: number
     ): Promise<{ success: boolean; error?: string }> {
-        let context: BrowserContext | null = null
+        let contextId: number | undefined
         let currentStep = 'init'
 
         try {
-            if (!this.browser) throw new Error('Browser not initialized')
-
-            // Create new context
             currentStep = 'create_context'
             this.log(`Creating browser context for ${email}...`)
-            context = await this.browser.newContext({
+            const globalSettings = loadSettings()
+            // Simple campaign has no persistent profile — ephemeral context + BrowserService stealth
+            contextId = await browserService.createEphemeralContext({
+                headless: globalSettings.headless ?? false,
                 viewport: { width: 1366, height: 768 },
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                locale: 'vi-VN',
-                timezoneId: 'Asia/Ho_Chi_Minh',
             })
-
-            // Comprehensive anti-detection stealth scripts
-            await context.addInitScript(() => {
-                // 1. Hide webdriver flag
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
-
-                // 2. Hide automation extensions
-                const originalQuery = window.navigator.permissions.query
-                window.navigator.permissions.query = (parameters: any) =>
-                    parameters.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
-                        : originalQuery(parameters)
-
-                // 3. Add Chrome runtime
-                Object.defineProperty(window, 'chrome', {
-                    get: () => ({
-                        runtime: {
-                            connect: () => { },
-                            sendMessage: () => { },
-                            onMessage: { addListener: () => { } }
-                        },
-                        loadTimes: () => ({}),
-                        csi: () => ({})
-                    })
-                })
-
-                // 4. Override plugins count
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5].map(() => ({
-                        name: 'Chrome PDF Plugin',
-                        description: 'Portable Document Format',
-                        filename: 'internal-pdf-viewer',
-                        length: 1
-                    }))
-                })
-
-                // 5. Override languages
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['vi-VN', 'vi', 'en-US', 'en']
-                })
-
-                // 6. Override hardwareConcurrency
-                Object.defineProperty(navigator, 'hardwareConcurrency', {
-                    get: () => 8
-                })
-
-                // 7. Override deviceMemory
-                Object.defineProperty(navigator, 'deviceMemory', {
-                    get: () => 8
-                })
-
-                // 8. Override platform
-                Object.defineProperty(navigator, 'platform', {
-                    get: () => 'Win32'
-                })
-
-                // 9. Override vendor
-                Object.defineProperty(navigator, 'vendor', {
-                    get: () => 'Google Inc.'
-                })
-
-                // 10. Mock WebGL attributes
-                const getParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function (parameter) {
-                    if (parameter === 37445) {
-                        return 'Intel Inc.'
-                    }
-                    if (parameter === 37446) {
-                        return 'Intel Iris OpenGL Engine'
-                    }
-                    return getParameter.call(this, parameter)
-                }
-            })
-
-            const page = await context.newPage()
+            this.currentContextId = contextId
+            const page = browserService.getPage(contextId)
+            if (!page) {
+                throw new Error('Browser context initialization failed')
+            }
 
             // Step 1: Go to Google
             currentStep = 'google_navigate'
@@ -459,8 +393,11 @@ class SimpleCampaignEngine {
             this.log(`Error at step ${currentStep}: ${errorMsg}`)
             return { success: false, error: `${currentStep}: ${errorMsg}` }
         } finally {
-            if (context) {
-                await context.close().catch(() => { })
+            if (contextId != null) {
+                await browserService.closeContext(contextId).catch(() => { })
+                if (this.currentContextId === contextId) {
+                    this.currentContextId = null
+                }
             }
         }
     }

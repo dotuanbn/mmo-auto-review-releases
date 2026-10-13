@@ -4,7 +4,7 @@
  */
 
 /** Activity types exposed in the Start Warmup UI. */
-export type WarmupActivityType = 'search' | 'maps' | 'youtube'
+export type WarmupActivityType = 'search' | 'maps' | 'youtube' | 'gmail' | 'photos_browse'
 
 /** Runtime state of a warmup job for one account. */
 export type WarmupRunState = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled'
@@ -48,6 +48,7 @@ export interface AccountWarmupStatus {
     activityType: WarmupActivityType | null
     /** Safe, user-facing error message (never secrets). */
     error: string | null
+    birthStoryDay?: number
 }
 
 export interface WarmupActionResult {
@@ -70,9 +71,13 @@ export interface WarmupApi {
     getAllStatuses: () => Promise<unknown>
     start: (id: number, options?: WarmupStartOptions) => Promise<WarmupActionResult>
     cancel: (id: number) => Promise<WarmupActionResult>
+    schedulerStart: () => Promise<void>
+    schedulerStop: () => Promise<void>
+    schedulerStatus: () => Promise<boolean>
+    toggleAutoWarmup: (id: number, enabled: boolean) => Promise<void>
 }
 
-const WARMUP_ACTIVITY_TYPES: readonly WarmupActivityType[] = ['search', 'maps', 'youtube'] as const
+const WARMUP_ACTIVITY_TYPES: readonly WarmupActivityType[] = ['search', 'maps', 'youtube', 'gmail', 'photos_browse'] as const
 const WARMUP_RUN_STATES: readonly WarmupRunState[] = [
     'idle',
     'running',
@@ -147,6 +152,7 @@ export function normalizeWarmupStatus(raw: unknown, fallbackId?: number): Accoun
         state,
         activityType,
         error: state === 'failed' || error ? error : null,
+        birthStoryDay: asFiniteNumber(r.birthStoryDay, 0) || undefined,
     }
 }
 
@@ -200,4 +206,6 @@ export const WARMUP_ACTIVITY_OPTIONS: ReadonlyArray<{
     { type: 'search', labelKey: 'accounts.warmup.activitySearch', fallback: 'Search' },
     { type: 'maps', labelKey: 'accounts.warmup.activityMaps', fallback: 'Maps' },
     { type: 'youtube', labelKey: 'accounts.warmup.activityYoutube', fallback: 'YouTube' },
+    { type: 'gmail', labelKey: 'accounts.warmup.activityGmail', fallback: 'Gmail' },
+    { type: 'photos_browse', labelKey: 'accounts.warmup.activityPhotos', fallback: 'Photos' },
 ]

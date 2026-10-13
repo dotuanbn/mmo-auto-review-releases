@@ -9,6 +9,7 @@
  * Uses the canonical Drizzle schema from src/main/database/schema.
  */
 
+import { eq, inArray, sql } from 'drizzle-orm'
 import { getDatabase } from '../database'
 import {
     trafficVisitQueue as trafficVisitQueueTable,
@@ -23,6 +24,7 @@ import {
     isTrafficVisitActive,
     isTrafficVisitClaimable,
     isTrafficVisitTerminal,
+    parseTrafficVisitPayload,
     serializeTrafficVisitPayload,
     type TrafficVisitCampaignCounters,
     type TrafficVisitPayload,
@@ -45,12 +47,65 @@ const EMPTY_COUNTERS = (): TrafficVisitCampaignCounters => ({
     remaining: 0,
 })
 
+/** Resident rows only. `retry` is claimable work, not history. */
+const ACTIVE_VISIT_STATUSES: Array<'pending' | 'retry' | 'running'> = [
+    'pending',
+    'retry',
+    'running',
+]
+
+const TERMINAL_VISIT_STATUSES: Array<'done' | 'failed' | 'cancelled'> = [
+    'done',
+    'failed',
+    'cancelled',
+]
+
+interface TerminalCountBucket {
+    done: number
+    failed: number
+    cancelled: number
+}
+
+function emptyTerminalBucket(): TerminalCountBucket {
+    return { done: 0, failed: 0, cancelled: 0 }
+}
+
+function coerceSqlCount(value: unknown): number {
+    const n = typeof value === 'number' ? value : Number(value ?? 0)
+    return Number.isFinite(n) ? n : 0
+}
+
 function nowIso(now: Date = new Date()): string {
     return now.toISOString()
 }
 
 function cloneVisit(v: TrafficVisitRow): TrafficVisitRow {
     return { ...v }
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+    return (
+        typeof value === 'object' &&
+        value !== null &&
+        'then' in value &&
+        typeof (value as { then?: unknown }).then === 'function'
+    )
+}
+
+function isVisitQueueRow(row: unknown): row is TrafficVisitQueueRow {
+    if (row == null || typeof row !== 'object' || isThenable(row)) return false
+    const candidate = row as {
+        id?: unknown
+        campaignId?: unknown
+        visitIndex?: unknown
+        status?: unknown
+    }
+    return (
+        typeof candidate.id === 'string' &&
+        typeof candidate.campaignId === 'number' &&
+        typeof candidate.visitIndex === 'number' &&
+        typeof candidate.status === 'string'
+    )
 }
 
 function rowToVisit(row: TrafficVisitQueueRow): TrafficVisitRow {
@@ -75,6 +130,14 @@ function rowToVisit(row: TrafficVisitQueueRow): TrafficVisitRow {
 
 export class TrafficVisitQueue {
     private visits: Map<string, TrafficVisitRow> = new Map()
+    /** Status only — full terminal rows stay in SQLite, not in `visits`. */
+    private terminalStatus: Map<string, TrafficVisitStatus> = new Map()
+    /**
+     * Terminal rows the sync driver could not read back.
+     * Not part of `visits`, so claim/load stay limited to active work.
+     */
+    private evictedVisits: Map<string, TrafficVisitRow> = new Map()
+    private evictedCounts: Map<number, TerminalCountBucket> = new Map()
     private loaded = false
     private loadPromise: Promise<void> | null = null
     private mutationTail: Promise<void> = Promise.resolve()
@@ -100,25 +163,165 @@ export class TrafficVisitQueue {
     }
 
     /**
-     * Load durable rows. Does NOT auto-requeue; call recoverExpiredLeases on boot/resume.
+     * Load claimable/in-flight rows only. Terminal history stays in SQLite.
+     * Does NOT auto-requeue; call recoverExpiredLeases on boot/resume.
      */
     private async loadFromDatabase(): Promise<void> {
         try {
-            const db = getDatabase()
-            const rows = await db.select().from(trafficVisitQueueTable).all()
+            const rows = await this.selectActiveVisitRows()
             this.visits.clear()
+            this.terminalStatus.clear()
+            this.evictedCounts.clear()
+            this.evictedVisits.clear()
             for (const row of rows) {
                 const visit = rowToVisit(row)
+                if (!this.isResidentStatus(visit.status)) continue
                 this.visits.set(visit.id, visit)
             }
+            await this.loadEvictedCounts()
             this.loaded = true
-            console.log(`[TrafficVisitQueue] Loaded ${rows.length} visits from DB`)
+            console.log(`[TrafficVisitQueue] Loaded ${this.visits.size} active visits from DB`)
         } catch (error) {
             console.error('[TrafficVisitQueue] Failed to load from database:', error)
             this.visits.clear()
+            this.terminalStatus.clear()
+            this.evictedCounts.clear()
+            this.evictedVisits.clear()
             this.loaded = false
             throw error
         }
+    }
+
+    private isResidentStatus(status: TrafficVisitStatus): boolean {
+        return status === 'pending' || status === 'retry' || status === 'running'
+    }
+
+    /** SQL filter when the driver supports it; otherwise drop terminal rows in memory. */
+    private async selectActiveVisitRows(): Promise<TrafficVisitQueueRow[]> {
+        const db = getDatabase()
+        const query = db.select().from(trafficVisitQueueTable)
+        const whereFn = (query as {
+            where?: (clause: unknown) => {
+                all: () => Promise<TrafficVisitQueueRow[]> | TrafficVisitQueueRow[]
+            }
+        }).where
+        if (typeof whereFn === 'function') {
+            const filtered = whereFn.call(
+                query,
+                inArray(trafficVisitQueueTable.status, ACTIVE_VISIT_STATUSES),
+            )
+            return await filtered.all()
+        }
+        const rows = await (query as {
+            all: () => Promise<TrafficVisitQueueRow[]> | TrafficVisitQueueRow[]
+        }).all()
+        return rows.filter((row) =>
+            row.status === 'pending' || row.status === 'retry' || row.status === 'running',
+        )
+    }
+
+    /** Count done/failed/cancelled without materializing those rows. */
+    private async loadEvictedCounts(): Promise<void> {
+        const db = getDatabase()
+        const query = db
+            .select({
+                campaignId: trafficVisitQueueTable.campaignId,
+                status: trafficVisitQueueTable.status,
+                count: sql<number>`count(*)`,
+            })
+            .from(trafficVisitQueueTable)
+        const whereFn = (query as {
+            where?: (clause: unknown) => {
+                groupBy: (...cols: unknown[]) => {
+                    all: () => Array<{ campaignId: number; status: string; count: unknown }>
+                        | Promise<Array<{ campaignId: number; status: string; count: unknown }>>
+                }
+            }
+        }).where
+        if (typeof whereFn !== 'function') return
+        let rows: Array<{ campaignId: number; status: string; count: unknown }>
+        try {
+            const grouped = whereFn
+                .call(query, inArray(trafficVisitQueueTable.status, TERMINAL_VISIT_STATUSES))
+                .groupBy(trafficVisitQueueTable.campaignId, trafficVisitQueueTable.status)
+            rows = await grouped.all()
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (/is not a function/i.test(message)) return
+            throw error
+        }
+        for (const row of rows) {
+            this.addEvictedCount(row.campaignId, row.status, coerceSqlCount(row.count))
+        }
+    }
+
+    private addEvictedCount(campaignId: number, status: string, amount: number): void {
+        if (!Number.isFinite(amount) || amount === 0) return
+        const bucket = this.evictedCounts.get(campaignId) ?? emptyTerminalBucket()
+        if (status === 'done') bucket.done += amount
+        else if (status === 'failed') bucket.failed += amount
+        else if (status === 'cancelled') bucket.cancelled += amount
+        else return
+        this.evictedCounts.set(campaignId, bucket)
+    }
+
+    /** Drop a persisted terminal row from the active map and remember status for idempotent replays. */
+    private releaseTerminalVisit(visit: TrafficVisitRow): void {
+        if (!isTrafficVisitTerminal(visit.status)) return
+        this.terminalStatus.set(visit.id, visit.status)
+        this.addEvictedCount(visit.campaignId, visit.status, 1)
+        this.visits.delete(visit.id)
+        if (this.readVisitFromDatabase(visit.id)) {
+            this.evictedVisits.delete(visit.id)
+            return
+        }
+        // Sync read missed (test double or driver error). Do not put the row back in `visits`.
+        this.evictedVisits.set(visit.id, cloneVisit(visit))
+    }
+
+    /** Point read. Never inserts into `visits`. */
+    private readVisitFromDatabase(visitId: string): TrafficVisitRow | undefined {
+        try {
+            const db = getDatabase()
+            const row = db
+                .select()
+                .from(trafficVisitQueueTable)
+                .where(eq(trafficVisitQueueTable.id, visitId))
+                .get()
+            if (!isVisitQueueRow(row)) {
+                if (isThenable(row)) {
+                    void Promise.resolve(row).then(
+                        () => undefined,
+                        () => undefined,
+                    )
+                }
+                return undefined
+            }
+            return rowToVisit(row)
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (/is not a function/i.test(message)) return undefined
+            console.error(`[TrafficVisitQueue] SQLite visit lookup failed for ${visitId}:`, error)
+            return undefined
+        }
+    }
+
+    private rememberedVisitResult(
+        visitId: string,
+        op: 'complete' | 'fail' | 'cancel',
+    ): TrafficVisitTransitionResult | null {
+        const status = this.terminalStatus.get(visitId)
+        if (!status) return null
+        if (op === 'complete' && status === 'done') {
+            return { applied: true, status: 'done', reason: 'already_done' }
+        }
+        if (op === 'fail' && status === 'failed') {
+            return { applied: true, status: 'failed', reason: 'already_failed' }
+        }
+        if (op === 'cancel' && status === 'cancelled') {
+            return { applied: true, status: 'cancelled', reason: 'already_cancelled' }
+        }
+        return { applied: false, status, reason: `blocked_by_${status}` }
     }
 
     private async persistVisit(visit: TrafficVisitRow): Promise<void> {
@@ -209,7 +412,7 @@ export class TrafficVisitQueue {
 
             for (const item of items) {
                 const id = buildTrafficVisitId(campaignId, item.visitIndex)
-                if (this.visits.has(id)) {
+                if (this.visits.has(id) || this.terminalStatus.has(id)) {
                     skippedExisting++
                     continue
                 }
@@ -253,11 +456,39 @@ export class TrafficVisitQueue {
         return new Date(visit.availableAt).getTime() <= now.getTime()
     }
 
-    private findClaimable(campaignId: number, now: Date): TrafficVisitRow | null {
+    /**
+     * Location IDs currently held by running visits in this campaign.
+     * Unparseable payloads are ignored (no location to exclude).
+     */
+    private collectRunningLocationIds(campaignId: number): Set<number> {
+        const ids = new Set<number>()
+        for (const visit of Array.from(this.visits.values())) {
+            if (visit.campaignId !== campaignId) continue
+            if (visit.status !== 'running') continue
+            const payload = parseTrafficVisitPayload(visit.payload)
+            if (payload) ids.add(payload.locationId)
+        }
+        return ids
+    }
+
+    /**
+     * Next claimable visit by visitIndex. Candidates whose payload.locationId
+     * is in disallowedLocationIds are skipped (same-location mutual exclusion).
+     * Returns null when every due candidate is disallowed so the worker can wait.
+     */
+    private findClaimable(
+        campaignId: number,
+        now: Date,
+        disallowedLocationIds?: Set<number>,
+    ): TrafficVisitRow | null {
         const candidates: TrafficVisitRow[] = []
         for (const visit of Array.from(this.visits.values())) {
             if (visit.campaignId !== campaignId) continue
             if (!this.isAvailableNow(visit, now)) continue
+            if (disallowedLocationIds && disallowedLocationIds.size > 0) {
+                const payload = parseTrafficVisitPayload(visit.payload)
+                if (payload && disallowedLocationIds.has(payload.locationId)) continue
+            }
             candidates.push(visit)
         }
         candidates.sort((a, b) => {
@@ -270,16 +501,32 @@ export class TrafficVisitQueue {
     /**
      * Atomic claim: pending|retry → running under mutex.
      * Persist before return; on persist failure roll back memory and rethrow.
+     * When disallowRunningLocations is true, also exclude locations that already
+     * have a running visit in this campaign (merged with disallowedLocationIds).
      */
     async claimNextVisit(
         campaignId: number,
         workerId: string,
         leaseMs: number = DEFAULT_TRAFFIC_VISIT_LEASE_MS,
         now: Date = new Date(),
+        options?: {
+            disallowRunningLocations?: boolean
+            disallowedLocationIds?: Set<number>
+        },
     ): Promise<TrafficVisitRow | null> {
         await this.ensureLoaded()
         return this.runExclusive(async () => {
-            const visit = this.findClaimable(campaignId, now)
+            const disallowedLocationIds = new Set<number>(options?.disallowedLocationIds)
+            if (options?.disallowRunningLocations) {
+                for (const locationId of Array.from(this.collectRunningLocationIds(campaignId))) {
+                    disallowedLocationIds.add(locationId)
+                }
+            }
+            const visit = this.findClaimable(
+                campaignId,
+                now,
+                disallowedLocationIds.size > 0 ? disallowedLocationIds : undefined,
+            )
             if (!visit) return null
             if (!isTrafficVisitClaimable(visit.status)) return null
 
@@ -320,7 +567,10 @@ export class TrafficVisitQueue {
         await this.ensureLoaded()
         return this.runExclusive(async () => {
             const visit = this.visits.get(visitId)
-            if (!visit) return { applied: false, status: null, reason: 'not_found' }
+            if (!visit) {
+                return this.rememberedVisitResult(visitId, 'complete')
+                    ?? { applied: false, status: null, reason: 'not_found' }
+            }
             if (visit.status === 'done') {
                 return { applied: true, status: 'done', reason: 'already_done' }
             }
@@ -346,6 +596,7 @@ export class TrafficVisitQueue {
                 this.visits.set(visitId, snapshot)
                 throw error
             }
+            this.releaseTerminalVisit(visit)
             return { applied: true, status: 'done' }
         })
     }
@@ -367,7 +618,10 @@ export class TrafficVisitQueue {
         await this.ensureLoaded()
         return this.runExclusive(async () => {
             const visit = this.visits.get(visitId)
-            if (!visit) return { applied: false, status: null, reason: 'not_found' }
+            if (!visit) {
+                return this.rememberedVisitResult(visitId, 'fail')
+                    ?? { applied: false, status: null, reason: 'not_found' }
+            }
             if (visit.status === 'failed') {
                 return { applied: true, status: 'failed', reason: 'already_failed' }
             }
@@ -420,6 +674,7 @@ export class TrafficVisitQueue {
             this.visits.set(visit.id, snapshot)
             throw persistError
         }
+        this.releaseTerminalVisit(visit)
         return { applied: true, status: visit.status }
     }
 
@@ -445,7 +700,10 @@ export class TrafficVisitQueue {
         await this.ensureLoaded()
         return this.runExclusive(async () => {
             const visit = this.visits.get(visitId)
-            if (!visit) return { applied: false, status: null, reason: 'not_found' }
+            if (!visit) {
+                return this.rememberedVisitResult(visitId, 'cancel')
+                    ?? { applied: false, status: null, reason: 'not_found' }
+            }
             if (visit.status === 'cancelled') {
                 return { applied: true, status: 'cancelled', reason: 'already_cancelled' }
             }
@@ -471,6 +729,7 @@ export class TrafficVisitQueue {
                 this.visits.set(visitId, snapshot)
                 throw error
             }
+            this.releaseTerminalVisit(visit)
             return { applied: true, status: 'cancelled' }
         })
     }
@@ -605,13 +864,40 @@ export class TrafficVisitQueue {
                     break
             }
         }
+        const evicted = this.evictedCounts.get(campaignId)
+        if (evicted) {
+            counters.done += evicted.done
+            counters.failed += evicted.failed
+            counters.cancelled += evicted.cancelled
+            counters.total += evicted.done + evicted.failed + evicted.cancelled
+        }
         counters.remaining = counters.pending + counters.retry + counters.running
         return counters
     }
 
+    /** Completed (`done`) visits from SQLite, not the in-memory map. */
+    getCompletedCount(): number {
+        try {
+            const db = getDatabase()
+            const row = db
+                .select({ count: sql<number>`count(*)` })
+                .from(trafficVisitQueueTable)
+                .where(eq(trafficVisitQueueTable.status, 'done'))
+                .get()
+            return coerceSqlCount(row?.count)
+        } catch (error) {
+            console.error('[TrafficVisitQueue] getCompletedCount failed:', error)
+            return 0
+        }
+    }
+
     getVisit(visitId: string): TrafficVisitRow | undefined {
-        const v = this.visits.get(visitId)
-        return v ? cloneVisit(v) : undefined
+        const resident = this.visits.get(visitId)
+        if (resident) return cloneVisit(resident)
+        const persisted = this.readVisitFromDatabase(visitId)
+        if (persisted) return persisted
+        const evicted = this.evictedVisits.get(visitId)
+        return evicted ? cloneVisit(evicted) : undefined
     }
 
     getCampaignVisits(campaignId: number): TrafficVisitRow[] {
@@ -642,6 +928,9 @@ export class TrafficVisitQueue {
 
     clearAllForTests(): void {
         this.visits.clear()
+        this.terminalStatus.clear()
+        this.evictedCounts.clear()
+        this.evictedVisits.clear()
         this.loaded = false
         this.loadPromise = null
         this.lastRecoveredCount = 0

@@ -247,7 +247,7 @@ function AuditFilters({
     return (
         <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-end">
             <div className="min-w-0 flex-1">
-                <div className="mb-1 text-[11px] font-medium text-[#908a9e]">
+                <div className="mb-1 text-[11px] font-medium text-[#908a9e] dark:text-[#9a8fba]">
                     {t('settings.auditFilterAction', 'Action filter')}
                 </div>
                 <TextInput
@@ -259,7 +259,7 @@ function AuditFilters({
                 />
             </div>
             <div className="w-full sm:w-44">
-                <div className="mb-1 text-[11px] font-medium text-[#908a9e]">
+                <div className="mb-1 text-[11px] font-medium text-[#908a9e] dark:text-[#9a8fba]">
                     {t('settings.auditFilterOutcome', 'Outcome')}
                 </div>
                 <Select
@@ -289,16 +289,16 @@ function AuditFilters({
 
 function AuditRow({ entry }: { entry: ComplianceAuditEntry }) {
     return (
-        <li className="flex flex-col gap-1.5 rounded-[14px] border border-[#e9e4f2] bg-white/70 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+        <li className="flex flex-col gap-1.5 rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white/70 dark:bg-[#2a2540] px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-1.5">
                     <Badge tone={outcomeTone(entry.outcome)}>{String(entry.outcome)}</Badge>
-                    <span className="text-sm font-semibold text-[#24222c]">{entry.action}</span>
+                    <span className="text-sm font-semibold text-[#24222c] dark:text-[#f0ecff]">{entry.action}</span>
                 </div>
                 {entry.summary && (
-                    <p className="truncate text-xs text-[#6f697c]">{entry.summary}</p>
+                    <p className="truncate text-xs text-[#6f697c] dark:text-[#c8c0d8]" title={entry.summary}>{entry.summary}</p>
                 )}
-                <div className="text-[11px] text-[#908a9e]">
+                <div className="text-[11px] text-[#908a9e] dark:text-[#9a8fba]">
                     {formatBackupDate(entry.createdAt)}
                     {entry.actor ? ` · ${entry.actor}` : ''}
                     {entry.targetType
@@ -306,7 +306,7 @@ function AuditRow({ entry }: { entry: ComplianceAuditEntry }) {
                         : ''}
                 </div>
             </div>
-            <div className="shrink-0 font-mono text-[11px] text-[#908a9e]">#{entry.id}</div>
+            <div className="shrink-0 font-mono text-[11px] text-[#908a9e] dark:text-[#9a8fba]">#{entry.id}</div>
         </li>
     )
 }
@@ -330,7 +330,7 @@ function AuditViews({
 }) {
     if (state === 'loading' || (busy && !pageData)) {
         return (
-            <Panel tone="slate" className="flex items-center justify-center gap-2 !p-8 text-sm text-[#6f697c]">
+            <Panel tone="slate" className="flex items-center justify-center gap-2 !p-8 text-sm text-[#6f697c] dark:text-[#c8c0d8]">
                 <Loader2 className="h-5 w-5 animate-spin text-[#8d74e8]" />
                 {t('settings.auditLoading', 'Loading compliance audit…')}
             </Panel>
@@ -373,9 +373,9 @@ function AuditViews({
 
     return (
         <div className="space-y-3">
-            <div className="text-xs text-[#908a9e]">
+            <div className="text-xs text-[#908a9e] dark:text-[#9a8fba]">
                 {t('settings.auditTotal', 'Total events')}:{' '}
-                <span className="font-semibold text-[#5f5a6d]">{pageData.total}</span>
+                <span className="font-semibold text-[#5f5a6d] dark:text-[#c8c0d8]">{pageData.total}</span>
             </div>
             <ul className="space-y-2">
                 {pageData.items.map((entry) => (
@@ -400,7 +400,7 @@ export function ComplianceAuditPanel() {
             tone="violet"
         >
             <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-sm text-[#6f697c]">
+                <p className="text-sm text-[#6f697c] dark:text-[#c8c0d8]">
                     {t(
                         'settings.complianceAuditDesc',
                         'History of compliance actions. Public metadata only — no secrets.',

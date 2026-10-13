@@ -189,7 +189,7 @@ function MetricsToolbar({
 }) {
     return (
         <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-            <p className="text-sm text-[#6f697c]">
+            <p className="text-sm text-[#6f697c] dark:text-[#c8c0d8]">
                 {t(
                     'settings.captchaMetricsDesc',
                     'Solve attempt rates by type and provider. No secrets are stored or shown.',
@@ -273,16 +273,16 @@ function BucketTable({
     const entries = Object.entries(buckets)
     return (
         <Panel tone="slate" className="!p-3">
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#6f697c]">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#6f697c] dark:text-[#c8c0d8]">
                 {title}
             </div>
             {entries.length === 0 ? (
-                <p className="text-xs text-[#908a9e]">{emptyLabel}</p>
+                <p className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{emptyLabel}</p>
             ) : (
                 <div className="overflow-x-auto">
                     <table className="w-full min-w-[280px] text-left text-xs">
                         <thead>
-                            <tr className="text-[#908a9e]">
+                            <tr className="text-[#908a9e] dark:text-[#9a8fba]">
                                 <th className="pb-1.5 pr-2 font-medium">Key</th>
                                 <th className="pb-1.5 pr-2 font-medium">N</th>
                                 <th className="pb-1.5 pr-2 font-medium">OK</th>
@@ -293,11 +293,11 @@ function BucketTable({
                         </thead>
                         <tbody>
                             {entries.map(([key, b]) => (
-                                <tr key={key} className="border-t border-[#ece7f5] text-[#24222c]">
+                                <tr key={key} className="border-t border-[#ece7f5] dark:border-[#3d3558] text-[#24222c] dark:text-[#f0ecff]">
                                     <td className="py-1.5 pr-2 font-medium">{key}</td>
                                     <td className="py-1.5 pr-2">{b.attempts}</td>
-                                    <td className="py-1.5 pr-2 text-emerald-600">{b.successes}</td>
-                                    <td className="py-1.5 pr-2 text-rose-600">{b.failures}</td>
+                                    <td className="py-1.5 pr-2 text-emerald-600 dark:text-emerald-400">{b.successes}</td>
+                                    <td className="py-1.5 pr-2 text-rose-600 dark:text-rose-400">{b.failures}</td>
                                     <td className="py-1.5 pr-2">{formatPercent(b.successRate)}</td>
                                     <td className="py-1.5">{formatDurationMs(b.averageDurationMs)}</td>
                                 </tr>
@@ -319,31 +319,31 @@ function RecentList({
 }) {
     return (
         <Panel tone="slate" className="!p-3">
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#6f697c]">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#6f697c] dark:text-[#c8c0d8]">
                 {labels.recent}
             </div>
             {attempts.length === 0 ? (
-                <p className="text-xs text-[#908a9e]">{labels.empty}</p>
+                <p className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{labels.empty}</p>
             ) : (
                 <ul className="max-h-64 space-y-2 overflow-y-auto">
                     {attempts.map((a) => (
                         <li
                             key={a.id}
-                            className="flex flex-col gap-1 rounded-[12px] border border-[#e9e4f2] bg-white/70 px-2.5 py-2 sm:flex-row sm:items-center sm:justify-between"
+                            className="flex flex-col gap-1 rounded-[12px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white/70 dark:bg-[#2a2540] px-2.5 py-2 sm:flex-row sm:items-center sm:justify-between"
                         >
                             <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                                 <Badge tone={a.success ? 'emerald' : 'rose'}>
                                     {a.success ? labels.ok : labels.fail}
                                 </Badge>
-                                <span className="text-xs font-medium text-[#24222c]">{a.captchaType}</span>
-                                <span className="text-xs text-[#908a9e]">· {a.provider}</span>
+                                <span className="text-xs font-medium text-[#24222c] dark:text-[#f0ecff]">{a.captchaType}</span>
+                                <span className="text-xs text-[#908a9e] dark:text-[#9a8fba]">· {a.provider}</span>
                                 {a.errorCode && (
-                                    <span className="truncate text-[11px] text-rose-600/80">
+                                    <span className="truncate text-[11px] text-rose-600/80 dark:text-rose-400/80" title={a.errorCode}>
                                         {a.errorCode}
                                     </span>
                                 )}
                             </div>
-                            <div className="shrink-0 text-[11px] text-[#908a9e]">
+                            <div className="shrink-0 text-[11px] text-[#908a9e] dark:text-[#9a8fba]">
                                 {formatDurationMs(a.durationMs)}
                                 {a.retryCount > 0 && ` · ${labels.retries} ${a.retryCount}`}
                                 {' · '}
@@ -436,7 +436,7 @@ function MetricsViews({
 }) {
     if (state === 'loading' || (busy && !snap)) {
         return (
-            <Panel tone="slate" className="flex items-center justify-center gap-2 !p-8 text-sm text-[#6f697c]">
+            <Panel tone="slate" className="flex items-center justify-center gap-2 !p-8 text-sm text-[#6f697c] dark:text-[#c8c0d8]">
                 <Loader2 className="h-5 w-5 animate-spin text-[#8d74e8]" />
                 {t('settings.captchaMetricsLoading', 'Loading CAPTCHA metrics…')}
             </Panel>

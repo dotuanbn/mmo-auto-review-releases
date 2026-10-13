@@ -9,6 +9,7 @@
 import { getDatabase, schema } from '../database'
 import { eq, and, lte } from 'drizzle-orm'
 import { BrowserWindow } from 'electron'
+import { loadSettings } from '../ipc/settings'
 
 export type ScheduleRepeatType = 'once' | 'daily' | 'weekly' | 'custom'
 
@@ -73,6 +74,30 @@ function asRepeatType(value: string): ScheduleRepeatType {
         return value
     }
     return 'once'
+}
+
+/** Hour-of-day 0–23. Non-numeric or out-of-range values use the fallback. */
+function readRestHour(value: unknown, fallback: number): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+    const hour = Math.trunc(value)
+    if (hour < 0 || hour > 23) return fallback
+    return hour
+}
+
+function formatRestHour(hour: number): string {
+    return `${String(hour).padStart(2, '0')}:00`
+}
+
+/**
+ * True when `hour` is inside the rest window.
+ * Overnight windows (start > end, e.g. 23 → 6) match hour >= start OR hour < end.
+ * Same-day windows (start < end) match hour >= start AND hour < end.
+ * start === end is not a window (does not skip the whole day).
+ */
+function isHourInRestPeriod(hour: number, start: number, end: number): boolean {
+    if (start === end) return false
+    if (start < end) return hour >= start && hour < end
+    return hour >= start || hour < end
 }
 
 export class SchedulerService {
@@ -265,9 +290,36 @@ export class SchedulerService {
     }
 
     /**
+     * Night/rest window from settings. Missing keys use enabled=false, 23:00–06:00.
+     * Failures allow scheduling so a settings read error cannot stall campaigns.
+     * Does not touch nextRunAt — the schedule stays due and runs after the window.
+     */
+    private isRestPeriodActive(now: Date = new Date()): boolean {
+        try {
+            const settings = loadSettings() as Record<string, unknown>
+            if (settings.restHoursEnabled !== true) return false
+
+            const start = readRestHour(settings.restHoursStart, 23)
+            const end = readRestHour(settings.restHoursEnd, 6)
+            if (!isHourInRestPeriod(now.getHours(), start, end)) return false
+
+            console.log(
+                `[Scheduler] Skipping due schedules — rest period active ` +
+                `(${formatRestHour(start)}-${formatRestHour(end)})`
+            )
+            return true
+        } catch (error: unknown) {
+            console.warn('[Scheduler] Rest period check failed; continuing schedules:', error)
+            return false
+        }
+    }
+
+    /**
      * Check for due campaigns and start them
      */
     async checkAndStartDue(): Promise<void> {
+        if (this.isRestPeriodActive()) return
+
         try {
             const db = getDatabase()
             const now = new Date()

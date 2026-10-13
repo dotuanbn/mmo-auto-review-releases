@@ -55,3 +55,52 @@ export type ReviewHistoryFilters = z.infer<typeof reviewHistoryFiltersSchema>
 
 /** @deprecated Prefer ReviewHistoryFilters — alias for existing call sites. */
 export type ReviewFilters = ReviewHistoryFilters
+
+/** Outcome written by reviews:recordVerification. */
+export const reviewVerificationRecordSchema = z.object({
+    historyId: idSchema,
+    status: z.enum(['live', 'removed', 'unknown']),
+    googleReviewId: z.string().trim().max(256).optional(),
+}).strict()
+
+export type ReviewVerificationRecordInput = z.infer<typeof reviewVerificationRecordSchema>
+
+/** Optional cap for reviews:getVerificationQueue (undefined → service default). */
+export const reviewVerificationQueueLimitSchema = z.number().int().min(1).max(200).optional()
+
+export type ReviewVerificationQueueLimit = z.infer<typeof reviewVerificationQueueLimitSchema>
+
+/** Status stored on review_history.verified_status. */
+export type ReviewVerifiedStatus = 'pending' | 'live' | 'removed' | 'unknown'
+
+/**
+ * One due review for the verifier. Account secrets (password, cookies) are omitted.
+ * Dates stay Date objects across Electron structured clone.
+ */
+export interface ReviewVerificationQueueItem {
+    historyId: number
+    accountId: number
+    accountEmail: string
+    locationId: number
+    locationName: string
+    locationUrl: string
+    rating: number
+    reviewText: string
+    createdAt: Date
+    lastCheckAt: Date | null
+    checkCount: number
+    verifiedStatus: ReviewVerifiedStatus | null
+    googleReviewId: string | null
+    styleApplied: boolean
+}
+
+/** Tracking fields returned after reviews:recordVerification. The row may include more columns. */
+export interface ReviewVerificationResult {
+    id: number
+    verifiedStatus: ReviewVerifiedStatus | null
+    verifiedAt: Date | null
+    lastCheckAt: Date | null
+    checkCount: number | null
+    survivalDays: number | null
+    googleReviewId: string | null
+}

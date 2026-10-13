@@ -6,45 +6,45 @@ type Tone = 'blue' | 'cyan' | 'amber' | 'emerald' | 'violet' | 'slate' | 'rose'
 const toneStyles: Record<Tone, { icon: string; panel: string; button: string; soft: string }> = {
     blue: {
         icon: 'bg-blue-500 text-white',
-        panel: 'border-blue-100 bg-blue-50 text-blue-700',
+        panel: 'border-blue-100 bg-blue-50 text-blue-700 dark:border-blue-900/60 dark:bg-blue-950/40 dark:text-blue-300',
         button: 'bg-blue-600 text-white hover:bg-blue-500',
-        soft: 'text-blue-600',
+        soft: 'text-blue-600 dark:text-blue-400',
     },
     cyan: {
         icon: 'bg-cyan-500 text-white',
-        panel: 'border-cyan-100 bg-cyan-50 text-cyan-700',
+        panel: 'border-cyan-100 bg-cyan-50 text-cyan-700 dark:border-cyan-900/60 dark:bg-cyan-950/40 dark:text-cyan-300',
         button: 'bg-cyan-500 text-white hover:bg-cyan-400',
-        soft: 'text-cyan-600',
+        soft: 'text-cyan-600 dark:text-cyan-400',
     },
     amber: {
         icon: 'bg-amber-400 text-[#1f1b12]',
-        panel: 'border-amber-100 bg-amber-50 text-amber-700',
+        panel: 'border-amber-100 bg-amber-50 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-300',
         button: 'bg-amber-400 text-[#1f1b12] hover:bg-amber-300',
-        soft: 'text-amber-600',
+        soft: 'text-amber-600 dark:text-amber-400',
     },
     emerald: {
         icon: 'bg-emerald-500 text-white',
-        panel: 'border-emerald-100 bg-emerald-50 text-emerald-700',
+        panel: 'border-emerald-100 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300',
         button: 'bg-emerald-500 text-white hover:bg-emerald-400',
-        soft: 'text-emerald-600',
+        soft: 'text-emerald-600 dark:text-emerald-400',
     },
     violet: {
         icon: 'bg-[#8d74e8] text-white',
-        panel: 'border-[#e6e0fb] bg-[#f4f0ff] text-[#735bd6]',
+        panel: 'border-[#e6e0fb] bg-[#f4f0ff] text-[#735bd6] dark:border-violet-900/60 dark:bg-violet-950/40 dark:text-violet-300',
         button: 'bg-[#8d74e8] text-white hover:bg-[#7b60db]',
-        soft: 'text-[#735bd6]',
+        soft: 'text-[#735bd6] dark:text-violet-400',
     },
     slate: {
         icon: 'bg-[#232229] text-white',
-        panel: 'border-[#eceaf2] bg-[#f7f7f9] text-[#565263]',
+        panel: 'border-[#eceaf2] bg-[#f7f7f9] text-[#565263] dark:border-[#3d3558] dark:bg-[#1e1b2e] dark:text-[#c8c0d8]',
         button: 'bg-[#232229] text-white hover:bg-[#34323b]',
-        soft: 'text-[#706c7d]',
+        soft: 'text-[#706c7d] dark:text-[#9a8fba]',
     },
     rose: {
         icon: 'bg-rose-500 text-white',
-        panel: 'border-rose-100 bg-rose-50 text-rose-700',
+        panel: 'border-rose-100 bg-rose-50 text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300',
         button: 'bg-rose-500 text-white hover:bg-rose-400',
-        soft: 'text-rose-600',
+        soft: 'text-rose-600 dark:text-rose-400',
     },
 }
 
@@ -265,7 +265,7 @@ export function PrimaryButton({
             className={classes(
                 'inline-flex items-center justify-center gap-2 rounded-full px-4 py-2.5 text-sm font-semibold transition-all duration-200',
                 'disabled:cursor-not-allowed disabled:opacity-50',
-                'focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 focus:ring-offset-2 focus:ring-offset-white',
+                'focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-[#111019]',
                 color,
                 className,
             )}
@@ -301,7 +301,7 @@ export function IconButton({
             aria-label={label}
             className={classes(
                 'inline-flex h-10 w-10 items-center justify-center rounded-full transition-all duration-200',
-                'focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 focus:ring-offset-2 focus:ring-offset-white',
+                'focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/40 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-[#111019]',
                 color,
                 className,
             )}
@@ -577,13 +577,13 @@ export function Toggle({
             className={classes(
                 'relative inline-flex shrink-0 cursor-pointer items-center rounded-full transition-colors duration-200',
                 w, h,
-                checked ? 'bg-[#8d74e8]' : 'bg-[#dcd6ee]',
+                checked ? 'bg-[#8d74e8]' : 'bg-[#dcd6ee] dark:bg-[#352f4a]',
                 disabled && 'cursor-not-allowed opacity-50',
             )}
         >
             <span
                 className={classes(
-                    'inline-block rounded-full bg-white shadow-sm transition-transform duration-200',
+                    'inline-block rounded-full bg-white dark:bg-[#f0ecff] shadow-sm transition-transform duration-200',
                     dot,
                     checked ? translate : 'translate-x-0.5',
                 )}
@@ -632,11 +632,11 @@ export function Modal({
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={onClose}>
             {/* Backdrop */}
-            <div className="absolute inset-0 bg-[#22202a]/60" />
+            <div className="absolute inset-0 bg-[#22202a]/60 dark:bg-black/70" />
             {/* Dialog */}
             <div
                 className={classes(
-                    'relative w-full rounded-[24px] border border-[#e9e4f2] bg-white shadow-[0_32px_70px_rgba(27,24,38,0.22)]',
+                    'relative w-full animate-scale-in rounded-[24px] border border-[#e9e4f2] bg-white dark:bg-[#1e1b2e] shadow-[0_32px_70px_rgba(27,24,38,0.22)]',
                     sizeClass,
                 )}
                 onClick={(e) => e.stopPropagation()}

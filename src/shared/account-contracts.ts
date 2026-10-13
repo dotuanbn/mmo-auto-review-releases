@@ -42,6 +42,10 @@ export interface PublicAccount {
     warmupSessions?: number
     lastWarmupAt?: Date | string | null
     nextWarmupAt?: Date | string | null
+    birthStoryDay?: number
+    birthStoryStartDate?: Date | string | null
+    birthStoryCompleted?: boolean
+    autoWarmupEnabled?: boolean
 }
 
 /** Payload for accounts:add — password required at create time. */

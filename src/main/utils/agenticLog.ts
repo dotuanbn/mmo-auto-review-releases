@@ -1,6 +1,6 @@
-import { appendFileSync } from 'fs'
 import { join } from 'path'
 import { app } from 'electron'
+import { getRotatingLogger } from './RotatingLogger'
 
 function getLogPath(): string {
     return join(app.getPath('userData'), 'agentic-debug.log')
@@ -11,7 +11,7 @@ export function writeAgenticLog(scope: string, message: string): void {
     const line = `[${timestamp}] [${scope}] ${message}\n`
 
     try {
-        appendFileSync(getLogPath(), line)
+        getRotatingLogger('agentic', getLogPath()).write(line)
     } catch {
         // Avoid crashing automation because file logging failed.
     }

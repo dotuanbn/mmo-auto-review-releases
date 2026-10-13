@@ -25,7 +25,8 @@ import {
     TestTube2,
     Info,
     Cpu,
-    Moon
+    Moon,
+    Clock
 } from 'lucide-react'
 import { useTranslation } from '../i18n'
 import {
@@ -73,6 +74,11 @@ interface AppSettings {
     autoGenerateReview: boolean
     enforceAccountWarmup: boolean
     enablePerAccountReviewStyle: boolean
+    stealthLevel: 'off' | 'low' | 'medium' | 'high' | 'paranoid'
+    crossAccountCooldownMinutes: number
+    restHoursEnabled: boolean
+    restHoursStart: number
+    restHoursEnd: number
     /** Opt-in only; never auto-on just because Ollama is online */
     enableAgenticReview: boolean
     manualReviewSubmit: boolean
@@ -159,7 +165,12 @@ const DEFAULTS: AppSettings = {
     includePhotos: false,
     autoGenerateReview: true,
     enforceAccountWarmup: false,
-    enablePerAccountReviewStyle: false,
+    enablePerAccountReviewStyle: true,
+    stealthLevel: 'high',
+    crossAccountCooldownMinutes: 120,
+    restHoursEnabled: true,
+    restHoursStart: 23,
+    restHoursEnd: 6,
     enableAgenticReview: false,
     manualReviewSubmit: true,
     allowAutoSubmitOnTrustedHosts: true,
@@ -512,13 +523,13 @@ export function Settings() {
                     const v = parseInt(e.target.value) || min
                     onChange(Math.max(min, Math.min(max, v)))
                 }}
-                className="w-20 rounded-[16px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                className="w-20 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-2.5 py-1.5 text-center text-sm text-[#17171f] dark:text-[#f0ecff] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                 min={min}
                 max={max}
                 step={step}
                 title={`Value between ${min} and ${max}`}
             />
-            {suffix && <span className="text-xs text-[#908a9e]">{suffix}</span>}
+            {suffix && <span className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{suffix}</span>}
         </div>
     )
 
@@ -526,7 +537,7 @@ export function Settings() {
         return (
             <PageShell>
                 <div className="flex h-full items-center justify-center p-6">
-                    <div className="flex items-center gap-3 text-[#5f5a6d]">
+                    <div className="flex items-center gap-3 text-[#5f5a6d] dark:text-[#c8c0d8]">
                         <RefreshCw className="h-5 w-5 animate-spin text-[#8d74e8]" />
                         <span>{t('settings.loadingSettings')}</span>
                     </div>
@@ -578,14 +589,14 @@ export function Settings() {
                     <div className="flex items-center gap-1.5">
                         <button
                             onClick={() => setLanguage('en')}
-                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'en' ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]' : 'border border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]'}`}
+                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'en' ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]' : 'border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]'}`}
                             title="English"
                         >
                             EN
                         </button>
                         <button
                             onClick={() => setLanguage('vi')}
-                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'vi' ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]' : 'border border-[#e9e4f2] bg-white text-[#5f5a6d] hover:bg-[#f4f1fa]'}`}
+                            className={`rounded-full px-3 py-1.5 text-sm font-medium transition-all ${language === 'vi' ? 'bg-[#8d74e8] text-white shadow-[0_14px_24px_rgba(141,116,232,0.24)]' : 'border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-[#5f5a6d] dark:text-[#c8c0d8] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]'}`}
                             title="Tiếng Việt"
                         >
                             VI
@@ -604,7 +615,7 @@ export function Settings() {
             {/* 2. TỰ ĐỘNG HÓA / AUTOMATION (real engine settings only) */}
             <SectionPanel icon={Zap} title={t('settings.automation')} tone="blue">
                 {/* Browser */}
-                <div className="mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.browser')}</div>
+                <div className="mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.browser')}</div>
                 <FormRow icon={<Eye className="h-4 w-4 text-blue-500" />} label={t('settings.headlessMode')} description={t('settings.headlessModeDesc')}>
                     <DSToggle checked={settings.headless} onChange={() => update('headless', !settings.headless)} />
                 </FormRow>
@@ -622,7 +633,7 @@ export function Settings() {
                 </FormRow>
 
                 {/* Concurrency / CAPTCHA / Log */}
-                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.concurrency')}</div>
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.concurrency')}</div>
                 <FormRow icon={<Cpu className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.queueConcurrency')} description={t('settings.maxConcurrentBrowsersDesc')}>
                     <NumberInput value={settings.queueConcurrency} onChange={(v) => update('queueConcurrency', v)} min={1} max={12} />
                 </FormRow>
@@ -656,31 +667,31 @@ export function Settings() {
                 </FormRow>
 
                 {/* Timing */}
-                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.timing')}</div>
-                <div className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.timing')}</div>
+                <div className="rounded-[18px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5">
                     <div className="grid grid-cols-3 gap-4">
                         <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.minDelay')}</label>
-                            <input type="number" value={settings.delayMin} onChange={(e) => update('delayMin', Math.max(5, parseInt(e.target.value) || 30))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min="5" />
+                            <label className="mb-1.5 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.minDelay')}</label>
+                            <input type="number" value={settings.delayMin} onChange={(e) => update('delayMin', Math.max(5, parseInt(e.target.value) || 30))} className="w-full rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-2.5 py-1.5 text-center text-sm text-[#17171f] dark:text-[#f0ecff] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min="5" />
                         </div>
                         <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.maxDelay')}</label>
-                            <input type="number" value={settings.delayMax} onChange={(e) => update('delayMax', Math.max(settings.delayMin + 1, parseInt(e.target.value) || 60))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min={settings.delayMin + 1} />
+                            <label className="mb-1.5 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.maxDelay')}</label>
+                            <input type="number" value={settings.delayMax} onChange={(e) => update('delayMax', Math.max(settings.delayMin + 1, parseInt(e.target.value) || 60))} className="w-full rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-2.5 py-1.5 text-center text-sm text-[#17171f] dark:text-[#f0ecff] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min={settings.delayMin + 1} />
                         </div>
                         <div>
-                            <label className="mb-1.5 block text-xs text-[#6f697c]">{t('settings.maxRetries')}</label>
-                            <input type="number" value={settings.maxRetries} onChange={(e) => update('maxRetries', Math.max(1, Math.min(10, parseInt(e.target.value) || 3)))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1.5 text-center text-sm text-[#17171f] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min="1" max="10" />
+                            <label className="mb-1.5 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.maxRetries')}</label>
+                            <input type="number" value={settings.maxRetries} onChange={(e) => update('maxRetries', Math.max(1, Math.min(10, parseInt(e.target.value) || 3)))} className="w-full rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-2.5 py-1.5 text-center text-sm text-[#17171f] dark:text-[#f0ecff] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15" min="1" max="10" />
                         </div>
                     </div>
-                    <p className="mt-2 text-xs text-[#908a9e]">{t('settings.generalTimingInfo').replace('{min}', String(settings.delayMin)).replace('{max}', String(settings.delayMax)).replace('{retries}', String(settings.maxRetries))}</p>
+                    <p className="mt-2 text-xs text-[#908a9e] dark:text-[#9a8fba]">{t('settings.generalTimingInfo').replace('{min}', String(settings.delayMin)).replace('{max}', String(settings.delayMax)).replace('{retries}', String(settings.maxRetries))}</p>
                 </div>
 
                 {/* Captcha Solver */}
-                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.captchaSolver')}</div>
-                <div className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5 space-y-3">
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.captchaSolver')}</div>
+                <div className="rounded-[18px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5 space-y-3">
                     <div className="grid grid-cols-2 gap-3">
                         <div>
-                            <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.provider')}</label>
+                            <label className="mb-1 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.provider')}</label>
                             <Select
                                 value={settings.captchaSolverProvider || 'none'}
                                 onChange={(v) => update('captchaSolverProvider', v as AppSettings['captchaSolverProvider'])}
@@ -693,12 +704,12 @@ export function Settings() {
                             />
                         </div>
                         <div>
-                            <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.apiKey')}</label>
+                            <label className="mb-1 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.apiKey')}</label>
                             <input
                                 type="password"
                                 value={settings.captchaSolverApiKey || ''}
                                 onChange={(e) => update('captchaSolverApiKey', e.target.value)}
-                                className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
+                                className="w-full rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-3 py-1.5 text-sm text-[#17171f] dark:text-[#f0ecff]"
                                 placeholder={settings.captchaSolverApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'API key...'}
                                 disabled={settings.captchaSolverProvider === 'none'}
                                 autoComplete="off"
@@ -706,19 +717,19 @@ export function Settings() {
                         </div>
                     </div>
                     {settings.captchaSolverProvider !== 'none' && (
-                        <p className="text-xs text-amber-600">{t('settings.solverWarning').replace('{provider}', settings.captchaSolverProvider)}</p>
+                        <p className="text-xs text-amber-600 dark:text-amber-400">{t('settings.solverWarning').replace('{provider}', settings.captchaSolverProvider)}</p>
                     )}
                 </div>
 
                 {/* Fallback CAPTCHA Solver — only when primary is enabled */}
                 {settings.captchaSolverProvider !== 'none' && (
                     <>
-                        <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.captchaFallbackProvider')}</div>
-                        <div className="rounded-[18px] border border-[#ece7f5] bg-white p-3.5 space-y-3">
-                            <p className="text-xs text-[#908a9e]">{t('settings.captchaFallbackProviderDesc')}</p>
+                        <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.captchaFallbackProvider')}</div>
+                        <div className="rounded-[18px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5 space-y-3">
+                            <p className="text-xs text-[#908a9e] dark:text-[#9a8fba]">{t('settings.captchaFallbackProviderDesc')}</p>
                             <div className="grid grid-cols-2 gap-3">
                                 <div>
-                                    <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.captchaFallbackProvider')}</label>
+                                    <label className="mb-1 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.captchaFallbackProvider')}</label>
                                     <Select
                                         value={settings.captchaSolverFallbackProvider || 'none'}
                                         onChange={(v) => update('captchaSolverFallbackProvider', v as AppSettings['captchaSolverFallbackProvider'])}
@@ -731,12 +742,12 @@ export function Settings() {
                                     />
                                 </div>
                                 <div>
-                                    <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.captchaFallbackApiKey')}</label>
+                                    <label className="mb-1 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.captchaFallbackApiKey')}</label>
                                     <input
                                         type="password"
                                         value={settings.captchaSolverFallbackApiKey || ''}
                                         onChange={(e) => update('captchaSolverFallbackApiKey', e.target.value)}
-                                        className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
+                                        className="w-full rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-3 py-1.5 text-sm text-[#17171f] dark:text-[#f0ecff]"
                                         placeholder={settings.captchaSolverFallbackApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'API key...'}
                                         disabled={settings.captchaSolverFallbackProvider === 'none'}
                                         autoComplete="off"
@@ -748,7 +759,7 @@ export function Settings() {
                 )}
 
                 {/* Proxy */}
-                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.proxy')}</div>
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.proxy')}</div>
                 <FormRow icon={<Globe className="h-4 w-4 text-cyan-500" />} label={t('settings.useProxy')} description={t('settings.useProxyDesc')}>
                     <DSToggle checked={settings.useProxy} onChange={() => update('useProxy', !settings.useProxy)} />
                 </FormRow>
@@ -760,20 +771,56 @@ export function Settings() {
                 )}
             </SectionPanel>
 
+            {/* Anti-detection: stealth level, cross-account cooldown, night rest */}
+            <SectionPanel icon={Shield} title={t('settings.antiDetection')} description={t('settings.antiDetectionDesc')} tone="blue">
+                <FormRow icon={<Shield className="h-4 w-4 text-emerald-500" />} label={t('settings.stealthLevel')} description={t('settings.stealthLevelDesc')}>
+                    <Select
+                        value={settings.stealthLevel}
+                        onChange={(v) => update('stealthLevel', v as AppSettings['stealthLevel'])}
+                        options={[
+                            { value: 'off', label: t('settings.stealthOff') },
+                            { value: 'low', label: t('settings.stealthLow') },
+                            { value: 'medium', label: t('settings.stealthMedium') },
+                            { value: 'high', label: t('settings.stealthHigh') },
+                            { value: 'paranoid', label: t('settings.stealthParanoid') },
+                        ]}
+                        className="w-48"
+                    />
+                </FormRow>
+                <FormRow icon={<Clock className="h-4 w-4 text-amber-500" />} label={t('settings.crossAccountCooldownMinutes')} description={t('settings.crossAccountCooldownMinutesDesc')}>
+                    <NumberInput
+                        value={settings.crossAccountCooldownMinutes}
+                        onChange={(v) => update('crossAccountCooldownMinutes', v)}
+                        min={0}
+                        max={1440}
+                        suffix={t('settings.minutesSuffix')}
+                    />
+                </FormRow>
+                <FormRow icon={<Moon className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.restHoursEnabled')} description={t('settings.restHoursEnabledDesc')}>
+                    <DSToggle checked={settings.restHoursEnabled} onChange={() => update('restHoursEnabled', !settings.restHoursEnabled)} />
+                </FormRow>
+                <FormRow label={t('settings.restHoursStart')} description={t('settings.restHoursStartDesc')}>
+                    <NumberInput value={settings.restHoursStart} onChange={(v) => update('restHoursStart', v)} min={0} max={23} />
+                </FormRow>
+                <FormRow label={t('settings.restHoursEnd')} description={t('settings.restHoursEndDesc')}>
+                    <NumberInput value={settings.restHoursEnd} onChange={(v) => update('restHoursEnd', v)} min={0} max={23} />
+                </FormRow>
+            </SectionPanel>
+
             {/* CAPTCHA Metrics Dashboard (public DTO only) */}
             <CaptchaMetricsPanel />
 
             {/* 3. AI & REVIEW */}
             <SectionPanel icon={Bot} title={t('settings.ai')} tone="violet">
                 {/* Groq */}
-                <div className="space-y-2 rounded-[18px] border border-[#ece7f5] bg-[#f9f7fe] p-3.5">
+                <div className="space-y-2 rounded-[18px] border border-[#ece7f5] dark:border-[#3d3558] bg-[#f9f7fe] dark:bg-[#2a2540] p-3.5">
                     <div className="flex items-center gap-2 text-sm font-medium"><Key className="h-4 w-4 text-[#735bd6]" />{t('settings.groq')}</div>
                     <div className="flex gap-2">
                         <input
                             type="password"
                             value={settings.groqApiKey}
                             onChange={(e) => update('groqApiKey', e.target.value)}
-                            className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm"
+                            className="flex-1 rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-3 py-1.5 text-sm text-[#17171f] dark:text-[#f0ecff]"
                             placeholder={settings.groqApiKey === SETTINGS_SECRET_MASK ? '•••••••• (set)' : 'gsk_...'}
                             autoComplete="off"
                         />
@@ -791,7 +838,7 @@ export function Settings() {
                         </AlertBanner>
                     )}
                     <div>
-                        <label className="mb-1 block text-xs text-[#6f697c]">{t('settings.groqModel')}</label>
+                        <label className="mb-1 block text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.groqModel')}</label>
                         <Select value={settings.groqModel} onChange={(v) => update('groqModel', v)} options={[
                             { value: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B' },
                             { value: 'llama-3.1-8b-instant', label: 'Llama 3.1 8B Instant' },
@@ -802,16 +849,16 @@ export function Settings() {
                 </div>
 
                 {/* Ollama */}
-                <div className="mt-3 space-y-2 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
+                <div className="mt-3 space-y-2 rounded-[18px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5">
                     <div className="flex items-center gap-2 text-sm font-medium"><Database className="h-4 w-4" />{t('settings.ollama')}</div>
                     <div className="flex gap-2">
-                        <input type="text" value={settings.ollamaUrl} onChange={(e) => update('ollamaUrl', e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] bg-white px-3 py-1.5 text-sm" placeholder="http://localhost:11434" />
+                        <input type="text" value={settings.ollamaUrl} onChange={(e) => update('ollamaUrl', e.target.value)} className="flex-1 rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-3 py-1.5 text-sm text-[#17171f] dark:text-[#f0ecff]" placeholder="http://localhost:11434" />
                         <PrimaryButton variant="quiet" icon={ollamaTesting ? RefreshCw : TestTube2} onClick={handleTestOllama} disabled={!settings.ollamaUrl || ollamaTesting} className={ollamaTesting ? '[&_svg]:animate-spin' : ''} />
                     </div>
                     {ollamaStatus !== 'idle' && <AlertBanner type={ollamaStatus === 'valid' ? 'success' : 'error'}>{ollamaStatus === 'valid' ? t('settings.testSuccess') : t('settings.testFailed')}</AlertBanner>}
                     {ollamaModels.length > 0 && (
                         <div>
-                            <label className="text-xs text-[#6f697c]">{t('settings.ollamaModel')}</label>
+                            <label className="text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.ollamaModel')}</label>
                             <Select value={settings.ollamaModel} onChange={(v) => update('ollamaModel', v)} options={ollamaModels.map(m => ({ value: m, label: m }))} />
                         </div>
                     )}
@@ -819,12 +866,12 @@ export function Settings() {
 
                 {/* Review defaults */}
                 <div className="mt-3">
-                    <div className="mb-2 text-xs font-semibold text-[#6f697c] uppercase tracking-wide">{t('settings.reviewDefaults')}</div>
+                    <div className="mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.reviewDefaults')}</div>
                     <FormRow icon={<Star className="h-4 w-4 text-amber-500" />} label={t('settings.defaultRating')} description={t('settings.defaultRatingDesc')}>
                         <div className="flex items-center gap-1">
                             {[1,2,3,4,5].map(s => (
                                 <button key={s} onClick={() => update('defaultRating', s)} className="transition hover:scale-110" title={`${s}`}>
-                                    <Star className={`h-5 w-5 ${s <= settings.defaultRating ? 'fill-amber-400 text-amber-400' : 'text-[#908a9e]'}`} />
+                                    <Star className={`h-5 w-5 ${s <= settings.defaultRating ? 'fill-amber-400 text-amber-400' : 'text-[#908a9e] dark:text-[#9a8fba]'}`} />
                                 </button>
                             ))}
                         </div>
@@ -881,19 +928,19 @@ export function Settings() {
                 <FormRow icon={<Zap className="h-4 w-4 text-amber-500" />} label={t('settings.actionsPerVisit')} description="">
                     <NumberInput value={settings.defaultActionsPerVisit} onChange={(v) => update('defaultActionsPerVisit', v)} min={1} max={50} />
                 </FormRow>
-                <div className="mt-2 rounded-[18px] border border-[#ece7f5] bg-white p-3.5">
+                <div className="mt-2 rounded-[18px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5">
                     <div className="mb-2 text-sm font-medium">{t('settings.visitDelayRange')}</div>
                     <div className="flex gap-3">
                         <div className="flex-1">
-                            <div className="text-xs text-[#6f697c] mb-1">{t('settings.minSeconds')}</div>
-                            <input type="number" value={settings.trafficDelayMin} onChange={(e) => update('trafficDelayMin', Math.max(5, parseInt(e.target.value)||5))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1 text-sm text-center" min="5" />
+                            <div className="text-xs text-[#6f697c] dark:text-[#c8c0d8] mb-1">{t('settings.minSeconds')}</div>
+                            <input type="number" value={settings.trafficDelayMin} onChange={(e) => update('trafficDelayMin', Math.max(5, parseInt(e.target.value)||5))} className="w-full rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-2.5 py-1 text-sm text-center" min="5" />
                         </div>
                         <div className="flex-1">
-                            <div className="text-xs text-[#6f697c] mb-1">{t('settings.maxSeconds')}</div>
-                            <input type="number" value={settings.trafficDelayMax} onChange={(e) => update('trafficDelayMax', Math.max(settings.trafficDelayMin+1, parseInt(e.target.value)||30))} className="w-full rounded-[14px] border border-[#e9e4f2] bg-white px-2.5 py-1 text-sm text-center" min={settings.trafficDelayMin+1} />
+                            <div className="text-xs text-[#6f697c] dark:text-[#c8c0d8] mb-1">{t('settings.maxSeconds')}</div>
+                            <input type="number" value={settings.trafficDelayMax} onChange={(e) => update('trafficDelayMax', Math.max(settings.trafficDelayMin+1, parseInt(e.target.value)||30))} className="w-full rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-2.5 py-1 text-sm text-center" min={settings.trafficDelayMin+1} />
                         </div>
                     </div>
-                    <p className="mt-2 text-xs text-[#908a9e]">{t('settings.randomDelay').replace('{min}', String(settings.trafficDelayMin)).replace('{max}', String(settings.trafficDelayMax))}</p>
+                    <p className="mt-2 text-xs text-[#908a9e] dark:text-[#9a8fba]">{t('settings.randomDelay').replace('{min}', String(settings.trafficDelayMin)).replace('{max}', String(settings.trafficDelayMax))}</p>
                 </div>
             </SectionPanel>
 
@@ -905,7 +952,7 @@ export function Settings() {
                         <PrimaryButton variant="dark" icon={FolderOpen} onClick={selectDataDir}>{t('settings.browseDirectory')}</PrimaryButton>
                     </div>
                 </FormRow>
-                <div className="mt-3 rounded-[16px] border border-[#e9e4f2] bg-white p-3 space-y-2">
+                <div className="mt-3 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3 space-y-2">
                     <div className="flex items-center justify-between">
                         <div className="text-sm font-medium">{t('settings.storageUsage')}</div>
                         <div className="flex gap-2">
@@ -914,18 +961,18 @@ export function Settings() {
                             <PrimaryButton tone="rose" variant="quiet" onClick={async () => { try { setMaintenanceBusy(true); const r = await window.electronAPI.data.clearCaches?.(); showMsg('success', `${t('settings.clearCachesDone')} (${r?.cleared ?? 0})`); await loadStorageInfo() } catch { showMsg('error', t('settings.saveFailed')) } finally { setMaintenanceBusy(false) } }} disabled={maintenanceBusy} className="text-xs" icon={Trash2}>{t('settings.clearCaches')}</PrimaryButton>
                         </div>
                     </div>
-                    <div className="text-xs break-all text-[#6f697c]">{storageInfo?.dataRoot || 'N/A'}</div>
-                    <div className="text-xs"><span className="text-[#908a9e]">{t('settings.totalSize')}:</span> <span className="font-medium">{formatBytes(storageInfo?.totalSize || 0)}</span></div>
+                    <div className="text-xs break-all text-[#6f697c] dark:text-[#c8c0d8]">{storageInfo?.dataRoot || 'N/A'}</div>
+                    <div className="text-xs"><span className="text-[#908a9e] dark:text-[#9a8fba]">{t('settings.totalSize')}:</span> <span className="font-medium">{formatBytes(storageInfo?.totalSize || 0)}</span></div>
                     {storageInfo?.items?.length ? (
                         <div className="space-y-1 text-xs pt-1">
                             {storageInfo.items.map((it: any, i: number) => (
-                                <div key={i} className="flex justify-between rounded border border-[#f0edf7] bg-[#faf8ff] px-2 py-1">
+                                <div key={i} className="flex justify-between rounded border border-[#f0edf7] dark:border-[#3d3558] bg-[#faf8ff] dark:bg-[#2a2540] px-2 py-1">
                                     <span>{it.label} {it.count ? `(${it.count} ${t('settings.items')})` : ''}</span>
-                                    <span className="font-mono text-[#5f5a6d]">{formatBytes(it.size || 0)} {it.path && <button onClick={() => window.electronAPI.data.openPath?.(it.path)} className="ml-1 text-[#8d74e8]">↗</button>}</span>
+                                    <span className="font-mono text-[#5f5a6d] dark:text-[#c8c0d8]">{formatBytes(it.size || 0)} {it.path && <button onClick={() => window.electronAPI.data.openPath?.(it.path)} className="ml-1 text-[#8d74e8]">↗</button>}</span>
                                 </div>
                             ))}
                         </div>
-                    ) : <div className="text-xs text-[#6f697c]">{t('settings.noProfileData')}</div>}
+                    ) : <div className="text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.noProfileData')}</div>}
                 </div>
             </SectionPanel>
 
@@ -936,11 +983,11 @@ export function Settings() {
             {/* 6. GIỚI THIỆU / ABOUT */}
             <SectionPanel icon={Info} title={t('settings.appAbout')} tone="slate">
                 {/* Update mode + controls (end-to-end via updates IPC + UpdateService) */}
-                <div className="space-y-2 rounded-[16px] border border-[#ece7f5] bg-white p-3.5">
+                <div className="space-y-2 rounded-[16px] border border-[#ece7f5] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] p-3.5">
                     <div className="flex items-center justify-between gap-3">
                         <div>
                             <div className="text-sm font-medium">{t('settings.updateMode')}</div>
-                            <div className="text-xs text-[#6f697c]">{t('settings.updateModeDesc')}</div>
+                            <div className="text-xs text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.updateModeDesc')}</div>
                         </div>
                         <Select
                             value={settings.updateMode || 'manual'}
@@ -962,19 +1009,19 @@ export function Settings() {
                             </PrimaryButton>
                         )}
                         {updateState?.status === 'downloading' && updateState?.progress != null && (
-                            <span className="text-xs text-[#6f697c]"> {Math.round(updateState.progress)}% </span>
+                            <span className="text-xs text-[#6f697c] dark:text-[#c8c0d8]"> {Math.round(updateState.progress)}% </span>
                         )}
                         {updateState?.status === 'downloaded' && (
-                            <span className="text-xs text-emerald-600">Sẵn sàng cài đặt</span>
+                            <span className="text-xs text-emerald-600 dark:text-emerald-400">Sẵn sàng cài đặt</span>
                         )}
                     </div>
-                    <div className="text-xs text-[#908a9e] pt-1">
+                    <div className="text-xs text-[#908a9e] dark:text-[#9a8fba] pt-1">
                         {t('settings.version')}: {appVersion}
                         {updateState?.latestVersion && updateState.latestVersion !== appVersion ? ` → ${updateState.latestVersion}` : ''}
                         {updateState?.error && <span className="ml-2 text-rose-500">{updateState.error}</span>}
                     </div>
                     {updateState?.available && !updateState.downloaded && !updateState.error && (
-                        <div className="text-xs text-amber-600">Có bản mới — bấm "Cập nhật ngay" để tải & cài (manual) hoặc chờ auto.</div>
+                        <div className="text-xs text-amber-600 dark:text-amber-400">Có bản mới — bấm "Cập nhật ngay" để tải & cài (manual) hoặc chờ auto.</div>
                     )}
                 </div>
 
@@ -990,7 +1037,7 @@ export function Settings() {
                         </div>
                     </AlertBanner>
                 )}
-                <div className="pt-3 text-xs text-[#908a9e]">{t('settings.version')}: {appVersion}</div>
+                <div className="pt-3 text-xs text-[#908a9e] dark:text-[#9a8fba]">{t('settings.version')}: {appVersion}</div>
             </SectionPanel>
         </PageShell>
     )

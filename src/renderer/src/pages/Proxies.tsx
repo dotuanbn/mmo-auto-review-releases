@@ -318,7 +318,7 @@ export function Proxies() {
                     <textarea
                         value={importText}
                         onChange={(e) => setImportText(e.target.value)}
-                        className="h-48 w-full rounded-[16px] border border-[#e9e4f2] bg-white px-4 py-3 font-mono text-sm text-[#17171f] placeholder:text-[#908a9e] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
+                        className="h-48 w-full rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] px-4 py-3 font-mono text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:border-[#cbbff3] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15"
                         placeholder={"192.168.1.1:8080\n192.168.1.2:8080:user:pass\ndataimpulse.gw:823:user-session-abc123:pass"}
                     />
                 </div>

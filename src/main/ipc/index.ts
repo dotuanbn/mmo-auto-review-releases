@@ -32,6 +32,9 @@ import { registerDatasetHandlers } from './datasets'
 import { registerToolHandlers } from './tools'
 import { registerWarmupHandlers } from './warmup'
 import { registerCaptchaHandlers } from './captcha'
+import { registerLayaIpcHandlers } from './laya'
+import './dashboard'
+import './verification'
 
 // Register all IPC handlers
 export function registerAllHandlers() {
@@ -69,6 +72,7 @@ export function registerAllHandlers() {
     registerToolHandlers()
     registerWarmupHandlers()
     registerCaptchaHandlers()
+    registerLayaIpcHandlers()
 
     console.log('All IPC handlers registered')
 }

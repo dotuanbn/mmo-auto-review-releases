@@ -22,10 +22,11 @@ export type WarmupActivityType =
     | 'google_search'
     | 'maps_browse'
     | 'photos'
+    | 'photos_browse'
     | 'other'
 
 /** Bounded engine session types (Worker 2). */
-export type WarmupSessionType = 'google_search' | 'maps_browse' | 'youtube_browse'
+export type WarmupSessionType = 'google_search' | 'maps_browse' | 'youtube_browse' | 'gmail' | 'photos_browse'
 
 export interface WarmupActivity {
     type: WarmupActivityType
@@ -43,6 +44,8 @@ export interface WarmupData {
     firstReviewDate?: Date
     lastReviewDate?: Date
     history: WarmupActivity[]
+    birthStoryDay?: number
+    birthStoryCompleted?: boolean
 }
 
 /** IPC/status shape required by Worker 2 contract. */
@@ -55,6 +58,8 @@ export interface AccountWarmupStatus {
     lastWarmupAt: string | null
     nextWarmupAt: string | null
     isReady: boolean
+    birthStoryDay?: number
+    birthStoryCompleted?: boolean
 }
 
 export type WarmupGateTier = 'blocked' | 'throttled' | 'full'
@@ -90,7 +95,7 @@ export interface CompleteSessionOptions {
     shouldCommit?: WarmupShouldCommitGuard
 }
 
-const READY_MIN_LEVEL = 35
+export const READY_MIN_LEVEL = 55
 const HISTORY_LIMIT = 50
 const DEFAULT_NEXT_WARMUP_HOURS = 8
 
@@ -102,6 +107,8 @@ const SESSION_ACTIVITY_TYPES: ReadonlySet<string> = new Set<WarmupSessionType>([
     'google_search',
     'maps_browse',
     'youtube_browse',
+    'gmail',
+    'photos_browse',
 ])
 
 function toIso(value: Date | null | undefined): string | null {
@@ -484,6 +491,7 @@ export class AccountWarmupService {
             case 'maps_browse':
                 return 7
             case 'photos':
+            case 'photos_browse':
                 return 4
             default:
                 return 3
@@ -517,6 +525,8 @@ export class AccountWarmupService {
             firstReviewDate: acc.firstReviewDate ? new Date(acc.firstReviewDate) : undefined,
             lastReviewDate: acc.lastReviewDate ? new Date(acc.lastReviewDate) : undefined,
             history: parseHistory(acc.warmupHistory),
+            birthStoryDay: acc.birthStoryDay ?? 0,
+            birthStoryCompleted: acc.birthStoryCompleted ?? false,
         }
     }
 
@@ -530,6 +540,8 @@ export class AccountWarmupService {
             lastWarmupAt: toIso(data.lastWarmupAt),
             nextWarmupAt: toIso(data.nextWarmupAt),
             isReady: data.warmupLevel >= READY_MIN_LEVEL,
+            birthStoryDay: data.birthStoryDay,
+            birthStoryCompleted: data.birthStoryCompleted,
         }
     }
 }

@@ -606,6 +606,8 @@ export function Traffic() {
     const autoMonitorRestoredRef = useRef(false)
     const lastHeavyRuntimeFetchAtRef = useRef(0)
     const activeTabRef = useRef<'campaigns' | 'monitor' | 'reports'>('campaigns')
+    const actionLogBufferRef = useRef<MonitorActionLog[]>([])
+    const actionLogRafRef = useRef<number>(0)
 
     const api = (window as any).electronAPI
 
@@ -739,7 +741,8 @@ export function Traffic() {
     useEffect(() => {
         if (activeTab === 'monitor') {
             fetchStatus()
-            statusInterval.current = setInterval(fetchStatus, 1500)
+            // Live updates come from onStatusV2. This poll is only a fallback.
+            statusInterval.current = setInterval(fetchStatus, 10000)
         }
         return () => {
             if (statusInterval.current) clearInterval(statusInterval.current)
@@ -782,12 +785,27 @@ export function Traffic() {
                     if (!log) {
                         return
                     }
-                    setMonitorActionLogs(previous => [log, ...previous].slice(0, 400))
+                    // Keep newest-first order inside the frame (same as the old prepend).
+                    actionLogBufferRef.current.unshift(log)
+                    if (!actionLogRafRef.current) {
+                        actionLogRafRef.current = requestAnimationFrame(() => {
+                            const batch = actionLogBufferRef.current
+                            actionLogBufferRef.current = []
+                            actionLogRafRef.current = 0
+                            if (batch.length === 0 || activeTabRef.current !== 'monitor') return
+                            setMonitorActionLogs(prev => [...batch, ...prev].slice(0, 400))
+                        })
+                    }
                 })
             )
         }
 
         return () => {
+            if (actionLogRafRef.current) {
+                cancelAnimationFrame(actionLogRafRef.current)
+                actionLogRafRef.current = 0
+            }
+            actionLogBufferRef.current = []
             for (const unsubscribe of unsubscribers) {
                 try {
                     unsubscribe()
@@ -831,6 +849,11 @@ export function Traffic() {
     const handleStartCampaign = async (id: number) => {
         try {
             lastThreadStateRef.current = {}
+            actionLogBufferRef.current = []
+            if (actionLogRafRef.current) {
+                cancelAnimationFrame(actionLogRafRef.current)
+                actionLogRafRef.current = 0
+            }
             setMonitorActionLogs([])
             await api.trafficBoost.start(id)
             setActiveTab('monitor')
@@ -971,6 +994,7 @@ export function Traffic() {
                     runtimeDiagnostics={runtimeDiagnostics}
                     ragStats={ragStats}
                     mcpHealth={mcpHealth}
+                    active={activeTab === 'monitor'}
                     auditEnabled={activeTab === 'monitor'}
                     onStop={handleStopCampaign}
                     onPause={handlePauseCampaign}
@@ -1243,14 +1267,14 @@ function ThreadCursorPreview({ thread, clickVersion }: {
     const delaySeconds = ((thread.id % 9) * 0.43).toFixed(2)
 
     return (
-        <div className="relative mt-3 h-28 rounded-[16px] border border-[#e6e0fb] bg-gradient-to-br from-[#f4f0ff] via-[#f7f7f9] to-white overflow-hidden">
+        <div className="relative mt-3 h-28 rounded-[16px] border border-[#e6e0fb] dark:border-[#3d3558] bg-gradient-to-br from-[#f4f0ff] via-[#f7f7f9] to-white dark:from-[#2a2540] dark:via-[#1e1b2e] dark:to-[#111019] overflow-hidden">
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,rgba(141,116,232,0.12),transparent_45%),radial-gradient(circle_at_80%_70%,rgba(141,116,232,0.08),transparent_45%)]" />
             <div
                 className={`live-cursor-bot ${thread.status === 'visiting' ? 'is-active' : ''} ${isClicking ? 'is-clicking' : ''}`}
                 style={{ animationDelay: `-${delaySeconds}s` }}
             >
                 <div className="live-cursor-icon-shell">
-                    <MousePointer2 className="w-6 h-6 text-[#8d74e8] fill-[#e6e0fb] drop-shadow-[0_6px_12px_rgba(141,116,232,0.35)]" />
+                    <MousePointer2 className="w-6 h-6 text-[#8d74e8] fill-[#e6e0fb] dark:fill-[#3d3558] drop-shadow-[0_6px_12px_rgba(141,116,232,0.35)]" />
                 </div>
                 <div className="live-cursor-name">{actorName || `Thread ${thread.id}`}</div>
                 <div className="live-cursor-action">{actionName}</div>
@@ -1263,13 +1287,14 @@ function ThreadCursorPreview({ thread, clickVersion }: {
 // Live Monitor Tab
 // ============================================================
 
-function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, auditEnabled = true, onStop, onPause, onResume, onRefresh }: {
+function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, ragStats, mcpHealth, active = true, auditEnabled = true, onStop, onPause, onResume, onRefresh }: {
     status: LiveStatus | null
     actionLogs: MonitorActionLog[]
     runtimePolicy: RuntimePolicy | null
     runtimeDiagnostics: RuntimeDiagnostics | null
     ragStats: RagStats | null
     mcpHealth: McpHealth | null
+    active?: boolean
     auditEnabled?: boolean
     onStop: () => void
     onPause: () => void
@@ -1277,11 +1302,14 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
     onRefresh: () => void
 }) {
     const { t } = useI18n()
+    const monitorClockEnabled = Boolean(active && status && (status.isRunning || status.isPaused))
     const [nowMs, setNowMs] = useState(() => Date.now())
     useEffect(() => {
+        // Countdown text is only rendered while the monitor tab is visible and a campaign is live.
+        if (!monitorClockEnabled) return
         const timer = setInterval(() => setNowMs(Date.now()), 1000)
         return () => clearInterval(timer)
-    }, [])
+    }, [monitorClockEnabled])
     const lastThreadActionRef = useRef<Record<number, string>>({})
     const [cursorClickVersion, setCursorClickVersion] = useState<Record<number, number>>({})
     const effectiveMode = status?.effectiveNetworkMode || status?.networkState?.mode || 'direct'
@@ -1382,7 +1410,7 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
             ) : (
                 <Panel tone={effectiveMode === 'static_proxy' ? 'cyan' : 'slate'} className="flex items-center gap-3 p-3">
                     <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${
-                        effectiveMode === 'static_proxy' ? 'bg-cyan-100' : 'bg-[#f4f1fa]'
+                        effectiveMode === 'static_proxy' ? 'bg-cyan-100 dark:bg-cyan-900/40' : 'bg-[#f4f1fa]'
                     }`}>
                         <Globe className={`h-4 w-4 ${
                             effectiveMode === 'static_proxy' ? 'text-cyan-600' : 'text-[#908a9e]'
@@ -1434,7 +1462,7 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                                     if (!note) return null
                                     const waiting = thread.status === 'waiting'
                                     return (
-                                        <div className={`flex items-center gap-2 text-xs mt-1 font-mono tabular-nums ${waiting ? 'text-amber-700' : 'text-[#735bd6]'}`}>
+                                        <div className={`flex items-center gap-2 text-xs mt-1 font-mono tabular-nums ${waiting ? 'text-amber-700 dark:text-amber-400' : 'text-[#735bd6]'}`}>
                                             <Clock className="w-3 h-3 shrink-0" />
                                             <span>{note}</span>
                                         </div>
@@ -1508,7 +1536,7 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                         Chua co hanh dong nao duoc ghi nhan.
                     </div>
                 ) : (
-                    <div className="max-h-72 overflow-y-auto divide-y divide-[#e9e4f2]">
+                    <div className="max-h-72 overflow-y-auto divide-y divide-[#e9e4f2] dark:divide-[#3d3558]">
                         {actionLogs.map(log => (
                             <div key={log.id} className="p-3 text-sm">
                                 <div className="flex items-center gap-2 flex-wrap">
@@ -1563,14 +1591,14 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
                                     {log.retryCategory && (
                                         <>
                                             <span className="text-[#908a9e]">-</span>
-                                            <span className="text-amber-700 text-xs">{log.retryCategory}</span>
+                                            <span className="text-amber-700 dark:text-amber-400 text-xs">{log.retryCategory}</span>
                                         </>
                                     )}
                                     <span className="text-[#5f5a6d]">{log.accountEmail}</span>
                                     <span className="text-[#908a9e]">-</span>
                                     <span className="text-[#5f5a6d]">{log.locationName}</span>
                                 </div>
-                                <div className="mt-1 text-amber-700 font-medium break-words">{log.action}</div>
+                                <div className="mt-1 text-amber-700 dark:text-amber-400 font-medium break-words">{log.action}</div>
                                 {log.thought && (
                                     <div className="mt-1 text-xs text-amber-600 break-words">AI: {log.thought}</div>
                                 )}
@@ -1688,7 +1716,7 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                         <SectionPanel icon={MapPin} title={t('traffic.visitsByLocation')} tone="violet">
                             <div className="space-y-2">
                                 {report.visitsByLocation.map(loc => (
-                                    <div key={loc.locationId} className="flex items-center justify-between p-3 bg-white rounded-[14px] border border-[#e9e4f2]">
+                                    <div key={loc.locationId} className="flex items-center justify-between p-3 bg-white dark:bg-[#1e1b2e] rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558]">
                                         <div>
                                             <span className="text-[#17171f] text-sm font-semibold">{loc.locationName}</span>
                                             <div className="text-xs text-[#908a9e]">{t('traffic.avgDuration')} {loc.avgDuration}s</div>
@@ -1705,7 +1733,7 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                         <SectionPanel icon={Users} title={t('traffic.visitsByAccount')} tone="emerald">
                             <div className="space-y-2">
                                 {report.visitsByAccount.map(acc => (
-                                    <div key={acc.accountId} className="flex items-center justify-between p-3 bg-white rounded-[14px] border border-[#e9e4f2]">
+                                    <div key={acc.accountId} className="flex items-center justify-between p-3 bg-white dark:bg-[#1e1b2e] rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558]">
                                         <span className="text-[#17171f] text-sm font-semibold">{acc.accountEmail}</span>
                                         <Badge tone="emerald">{acc.visits} {t('traffic.visits')}</Badge>
                                     </div>
@@ -1722,13 +1750,13 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                                     const maxCount = Math.max(...report.actionStats.map(a => a.count))
                                     const percentage = maxCount > 0 ? (item.count / maxCount) * 100 : 0
                                     return (
-                                        <div key={item.action} className="relative bg-white rounded-[14px] border border-[#e9e4f2] p-3 overflow-hidden">
+                                        <div key={item.action} className="relative bg-white dark:bg-[#1e1b2e] rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] p-3 overflow-hidden">
                                             <div className="relative z-10">
-                                                <div className="text-[#17171f] text-sm font-semibold">{formatActionLabel(item.action)}</div>
+                                                <div className="text-[#17171f] dark:text-[#f0ecff] text-sm font-semibold">{formatActionLabel(item.action)}</div>
                                                 <div className="text-[#735bd6] text-lg font-bold">{item.count}</div>
                                             </div>
                                             <div
-                                                className="absolute inset-0 bg-[#f4f0ff] rounded-[14px] transition-all"
+                                                className="absolute inset-0 bg-[#f4f0ff] dark:bg-[#2a2540] rounded-[14px] transition-all"
                                                 style={{ width: `${percentage}%` }}
                                             />
                                         </div>
@@ -1748,7 +1776,7 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                                     const actionList = Array.isArray(log.actions) ? log.actions : []
 
                                     return (
-                                        <div key={logId} className="p-3 text-sm bg-white rounded-[14px] border border-[#e9e4f2]">
+                                        <div key={logId} className="p-3 text-sm bg-white dark:bg-[#1e1b2e] rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558]">
                                             <div className="flex items-start gap-3">
                                                 {log.status === 'success' ? (
                                                     <CheckCircle className="w-4 h-4 text-emerald-500 flex-shrink-0 mt-0.5" />
@@ -1793,8 +1821,8 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                                             </div>
 
                                             {isExpanded && actionList.length > 0 && (
-                                                <div className="mt-3 ml-7 rounded-[14px] border border-[#e9e4f2] bg-[#f7f7f9] overflow-hidden">
-                                                    <div className="max-h-56 overflow-y-auto divide-y divide-[#e9e4f2]">
+                                                <div className="mt-3 ml-7 rounded-[14px] border border-[#e9e4f2] dark:border-[#3d3558] bg-[#f7f7f9] dark:bg-[#1e1b2e] overflow-hidden">
+                                                    <div className="max-h-56 overflow-y-auto divide-y divide-[#e9e4f2] dark:divide-[#3d3558]">
                                                         {actionList.map((action, index) => (
                                                             <div key={`${logId}-${index}`} className="p-2.5 text-xs space-y-1.5">
                                                                 <div className="flex flex-wrap items-center gap-2">
@@ -1803,7 +1831,7 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                                                                     ) : (
                                                                         <XCircle className="w-3.5 h-3.5 text-rose-500" />
                                                                     )}
-                                                                    <span className="text-[#17171f] font-semibold">
+                                                                    <span className="text-[#17171f] dark:text-[#f0ecff] font-semibold">
                                                                         {formatActionLabel(action.action)}
                                                                     </span>
                                                                     {action.source && (
@@ -1824,20 +1852,20 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                                                                         <Badge tone="amber">{action.retryCategory}</Badge>
                                                                     )}
                                                                     {action.timestamp && (
-                                                                        <span className="text-[#908a9e]">
+                                                                        <span className="text-[#908a9e] dark:text-[#9a8fba]">
                                                                             {formatDateTime(action.timestamp)}
                                                                         </span>
                                                                     )}
                                                                 </div>
 
                                                                 {action.detail && (
-                                                                    <div className="text-[#5f5a6d] break-words">{action.detail}</div>
+                                                                    <div className="text-[#5f5a6d] dark:text-[#c8c0d8] break-words">{action.detail}</div>
                                                                 )}
                                                                 {action.thought && (
-                                                                    <div className="text-amber-700 break-words">AI: {action.thought}</div>
+                                                                    <div className="text-amber-700 dark:text-amber-300 break-words">AI: {action.thought}</div>
                                                                 )}
                                                                 {action.error && (
-                                                                    <div className="text-rose-600 break-words">Error: {action.error}</div>
+                                                                    <div className="text-rose-600 dark:text-rose-400 break-words">Error: {action.error}</div>
                                                                 )}
                                                                 {(action.ragUsed || action.ragHitCount !== undefined || action.decisionLatencyMs !== undefined) && (
                                                                     <div className="text-[#735bd6] break-words">
@@ -1848,7 +1876,7 @@ function ReportsTab({ campaigns, report, reportCampaignId, auditEnabled = true, 
                                                                     </div>
                                                                 )}
                                                                 {(action.queueDepth !== undefined || action.latencyMs !== undefined || action.recoverPath) && (
-                                                                    <div className="text-[#908a9e] break-words">
+                                                                    <div className="text-[#908a9e] dark:text-[#9a8fba] break-words">
                                                                         {action.queueDepth !== undefined ? `queue: ${action.queueDepth}` : ''}
                                                                         {action.latencyMs !== undefined ? `${action.queueDepth !== undefined ? ' - ' : ''}latency: ${action.latencyMs}ms` : ''}
                                                                         {action.recoverPath ? `${(action.queueDepth !== undefined || action.latencyMs !== undefined) ? ' - ' : ''}recover: ${action.recoverPath}` : ''}
@@ -2131,7 +2159,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             onChange={e => setName(e.target.value)}
                             placeholder="e.g., Daily SEO Boost - Restaurant"
                             autoFocus
-                            className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                            className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                         />
                     </div>
 
@@ -2204,7 +2232,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                         <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
                             {t('traffic.selectAccounts')} ({selectedAccounts.length} {t('traffic.selected')})
                         </label>
-                        <div className="max-h-32 overflow-y-auto bg-[#f7f7f9] rounded-[16px] border border-[#e9e4f2] p-2 space-y-1">
+                        <div className="max-h-32 overflow-y-auto bg-[#f7f7f9] dark:bg-[#1e1b2e] rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] p-2 space-y-1">
                             {accounts.length === 0 && (
                                 <p className="text-[#908a9e] text-sm p-2">{t('traffic.noAccountsAvailable')}</p>
                             )}
@@ -2214,7 +2242,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             {accounts.map(acc => (
                                 <label
                                     key={acc.id}
-                                    className="flex items-center gap-2 p-2 rounded-[12px] hover:bg-[#f4f1fa] cursor-pointer"
+                                    className="flex items-center gap-2 p-2 rounded-[12px] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a] cursor-pointer"
                                 >
                                     <input
                                         type="checkbox"
@@ -2222,7 +2250,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                         onChange={() => toggleAccount(acc.id)}
                                         className="h-4 w-4 rounded accent-[#8d74e8]"
                                     />
-                                    <span className="text-[#17171f] text-sm">{acc.email}</span>
+                                    <span className="text-[#17171f] dark:text-[#f0ecff] text-sm">{acc.email}</span>
                                 </label>
                             ))}
                         </div>
@@ -2283,8 +2311,8 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     value={websiteUrl}
                                     onChange={e => setWebsiteUrl(e.target.value)}
                                     placeholder={t('traffic.websiteUrlPlaceholder')}
-                                    className={`w-full h-10 px-4 rounded-[16px] border bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
-                                        webSeoFieldErrors.websiteUrl ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                    className={`w-full h-10 px-4 rounded-[16px] border bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
+                                        webSeoFieldErrors.websiteUrl ? 'border-rose-400' : 'border-[#e9e4f2] dark:border-[#3d3558]'
                                     }`}
                                 />
                                 {webSeoFieldErrors.websiteUrl && (
@@ -2300,8 +2328,8 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     onChange={e => setWebSeoKeyword(e.target.value)}
                                     placeholder={t('traffic.webSeoKeywordPlaceholder')}
                                     rows={3}
-                                    className={`w-full px-4 py-3 rounded-[16px] border bg-white text-sm text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] resize-none ${
-                                        webSeoFieldErrors.keywords ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                    className={`w-full px-4 py-3 rounded-[16px] border bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] resize-none ${
+                                        webSeoFieldErrors.keywords ? 'border-rose-400' : 'border-[#e9e4f2] dark:border-[#3d3558]'
                                     }`}
                                 />
                                 <p className="text-xs text-[#908a9e] mt-1">{t('traffic.webSeoKeywordHint')}</p>
@@ -2323,8 +2351,8 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                         }}
                                         min={WEB_SEO_DWELL_MIN_SECONDS}
                                         max={WEB_SEO_DWELL_MAX_SECONDS}
-                                        className={`w-full h-10 px-4 rounded-[16px] border bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
-                                            webSeoFieldErrors.dwell ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                        className={`w-full h-10 px-4 rounded-[16px] border bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
+                                            webSeoFieldErrors.dwell ? 'border-rose-400' : 'border-[#e9e4f2] dark:border-[#3d3558]'
                                         }`}
                                     />
                                 </div>
@@ -2341,8 +2369,8 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                         }}
                                         min={WEB_SEO_DWELL_MIN_SECONDS}
                                         max={WEB_SEO_DWELL_MAX_SECONDS}
-                                        className={`w-full h-10 px-4 rounded-[16px] border bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
-                                            webSeoFieldErrors.dwell ? 'border-rose-400' : 'border-[#e9e4f2]'
+                                        className={`w-full h-10 px-4 rounded-[16px] border bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3] ${
+                                            webSeoFieldErrors.dwell ? 'border-rose-400' : 'border-[#e9e4f2] dark:border-[#3d3558]'
                                         }`}
                                     />
                                 </div>
@@ -2378,12 +2406,12 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                             <label className="block text-sm font-semibold text-[#24222c] mb-1.5">
                                 {t('traffic.selectLocations')} ({selectedLocations.length} {t('traffic.selected')})
                             </label>
-                            <div className={`${(trafficMode === 'organic' || trafficMode === 'map_search') ? 'max-h-60' : 'max-h-32'} overflow-y-auto rounded-[16px] border border-[#e9e4f2] bg-[#f7f7f9] p-2 space-y-1`}>
+                            <div className={`${(trafficMode === 'organic' || trafficMode === 'map_search') ? 'max-h-60' : 'max-h-32'} overflow-y-auto rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-[#f7f7f9] dark:bg-[#1e1b2e] p-2 space-y-1`}>
                                 {locations.length === 0 && (
                                     <p className="text-[#908a9e] text-sm p-2">{t('traffic.noLocationsAvailable')}</p>
                                 )}
                                 {locations.map(loc => (
-                                    <div key={loc.id} className="rounded-[12px] hover:bg-[#f4f1fa]">
+                                    <div key={loc.id} className="rounded-[12px] hover:bg-[#f4f1fa] dark:hover:bg-[#352f4a]">
                                         <label className="flex items-center gap-2 p-2 cursor-pointer">
                                             <input
                                                 type="checkbox"
@@ -2410,11 +2438,11 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                                         }
                                                     }
                                                 }}
-                                                className="rounded border-[#e9e4f2] text-[#8d74e8] focus:ring-[#8d74e8]"
+                                                className="rounded border-[#e9e4f2] dark:border-[#3d3558] text-[#8d74e8] focus:ring-[#8d74e8]"
                                             />
                                             <div>
-                                                <span className="text-[#17171f] text-sm">{loc.name}</span>
-                                                <div className="text-xs text-[#908a9e] truncate max-w-xs">{loc.url}</div>
+                                                <span className="text-[#17171f] dark:text-[#f0ecff] text-sm">{loc.name}</span>
+                                                <div className="text-xs text-[#908a9e] dark:text-[#9a8fba] truncate max-w-xs">{loc.url}</div>
                                             </div>
                                         </label>
                                         {(trafficMode === 'organic' || trafficMode === 'map_search') && selectedLocations.includes(loc.id) && (
@@ -2424,7 +2452,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                                     value={locationKeywords[loc.id] || ''}
                                                     onChange={e => setLocationKeywords(prev => ({ ...prev, [loc.id]: e.target.value }))}
                                                     placeholder={t('traffic.keywordPlaceholder').replace('{name}', loc.name)}
-                                                    className="w-full px-3 py-1.5 rounded-[12px] border border-[#e9e4f2] bg-white text-xs text-[#17171f] placeholder:text-[#908a9e] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                                                    className="w-full px-3 py-1.5 rounded-[12px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-xs text-[#17171f] dark:text-[#f0ecff] placeholder:text-[#908a9e] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                                                 />
                                                 <p className="text-xs text-[#908a9e] mt-0.5">{t('traffic.keywordHint')}</p>
                                             </div>
@@ -2465,7 +2493,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                 onChange={e => setMaxMapScroll(Math.max(1, Math.min(100, parseInt(e.target.value) || 15)))}
                                 min={1}
                                 max={100}
-                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
                             <p className="text-xs text-[#908a9e] mt-0.5">{t('traffic.maxMapScrollHint')}</p>
                         </div>
@@ -2484,7 +2512,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                 }}
                                 min={1}
                                 max={32}
-                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
                         </div>
                         <div>
@@ -2497,11 +2525,11 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     setVisitsPerLocation(Math.max(1, parseInt(e.target.value) || 1))
                                 }}
                                 min={1}
-                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
                         </div>
                     </div>
-                    <FProxyCapacityNotice threads={threadsCount} />
+                    <FProxyCapacityNotice threads={threadsCount} locationCount={selectedLocations.length} />
 
                     {/* Delay Settings */}
                     <div className="grid grid-cols-2 gap-4">
@@ -2515,7 +2543,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     setDelayMin(Math.max(0, parseInt(e.target.value) || 0))
                                 }}
                                 min={0}
-                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
                         </div>
                         <div>
@@ -2528,7 +2556,7 @@ function CreateCampaignModal({ accounts, locations, onClose, onCreate }: {
                                     setDelayMax(Math.max(0, parseInt(e.target.value) || 0))
                                 }}
                                 min={0}
-                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] bg-white text-sm text-[#17171f] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
+                                className="w-full h-10 px-4 rounded-[16px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e] text-sm text-[#17171f] dark:text-[#f0ecff] dark:placeholder:text-[#9a8fba] focus:outline-none focus:ring-2 focus:ring-[#8d74e8]/15 focus:border-[#cbbff3]"
                             />
                         </div>
                     </div>

@@ -60,6 +60,7 @@ export const fproxyLeaseOwnerSchema = z
     kind: z.enum(['traffic_visit', 'automation_job']),
     id: z.string().trim().min(1).max(FPROXY_OWNER_ID_MAX),
     threadId: z.number().int().nonnegative(),
+    locationId: z.number().int().positive().optional(),
   })
   .strict()
 
@@ -78,6 +79,7 @@ export const fproxySlotPublicSchema = z
     nextRotateAt: nullableEpochMillisecondsSchema,
     currentEgress: fproxyEgressSchema.nullable(),
     leaseOwner: fproxyLeaseOwnerSchema.nullable(),
+    activeLocationIds: z.array(z.number().int().positive()).optional(),
     lastTest: nullableEpochMillisecondsSchema,
     error: sanitizedErrorSchema.nullable(),
   })

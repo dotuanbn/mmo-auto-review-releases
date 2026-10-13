@@ -31,8 +31,8 @@ export function AppShell({ currentPage, onPageChange, children }: AppShellProps)
     )
 
     return (
-        <div className="app-shell h-screen min-h-0 overflow-hidden text-[#1f1f28]">
-            <div className="app-frame flex h-full min-h-0 w-full flex-col overflow-hidden bg-white lg:flex-row">
+        <div className="app-shell h-screen min-h-0 overflow-hidden text-[#1f1f28] dark:text-[#f0ecff]">
+            <div className="app-frame flex h-full min-h-0 w-full flex-col overflow-hidden bg-white dark:bg-[#111019] lg:flex-row">
                 <Sidebar currentPage={currentPage} onPageChange={onPageChange} />
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                     <ComplianceBanner

@@ -1,7 +1,7 @@
 /**
  * AccountWarmupEngine — bounded safe Google activity sessions for account aging.
  *
- * Session types: google_search | maps_browse | youtube_browse
+ * Session types: google_search | maps_browse | youtube_browse | gmail | photos_browse
  * Uses account persistent profile via BrowserService + HumanBehavior.
  * Always closes Playwright context in finally. Supports per-account cancel.
  *
@@ -85,6 +85,18 @@ const SAFE_YOUTUBE_QUERIES = [
     'nature documentary short',
 ]
 
+const SAFE_GMAIL_ACTIONS = [
+    'read_newsletter',
+    'archive_promotions',
+    'star_important',
+]
+
+const SAFE_PHOTOS_ACTIONS = [
+    'scroll_timeline',
+    'view_album',
+    'favorite_photo',
+]
+
 function normalizeSessionType(
     raw: WarmupStartOptions['activityType'] | undefined,
 ): WarmupSessionType {
@@ -98,13 +110,17 @@ function normalizeSessionType(
         case 'search':
         case 'google_search':
             return 'google_search'
+        case 'gmail':
+            return 'gmail'
+        case 'photos_browse':
+            return 'photos_browse'
         default:
             return pickRandomSessionType()
     }
 }
 
 function pickRandomSessionType(): WarmupSessionType {
-    const types: WarmupSessionType[] = ['google_search', 'maps_browse', 'youtube_browse']
+    const types: WarmupSessionType[] = ['google_search', 'maps_browse', 'youtube_browse', 'gmail', 'photos_browse']
     return types[Math.floor(Math.random() * types.length)]
 }
 
@@ -466,6 +482,12 @@ class AccountWarmupEngine {
             case 'youtube_browse':
                 await this.runYoutubeBrowse(page, session, deadline, warmupPlan)
                 break
+            case 'gmail':
+                await this.runGmailBrowse(page, session, deadline, warmupPlan)
+                break
+            case 'photos_browse':
+                await this.runPhotosBrowse(page, session, deadline, warmupPlan)
+                break
             default:
                 await this.runGoogleSearch(page, session, deadline, warmupPlan)
         }
@@ -590,6 +612,23 @@ class AccountWarmupEngine {
         } catch {
             // no consent dialog
         }
+    }
+
+    /** Navigate and swallow load failures so a dead tab does not abort the session. */
+    private async gotoWarmupUrl(page: Page, url: string, timeoutMs = 35_000): Promise<boolean> {
+        try {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs })
+            return true
+        } catch (error: unknown) {
+            const msg = error instanceof Error ? error.message : String(error)
+            console.warn(`[AccountWarmup] page load failed url=${url}: ${msg}`)
+            return false
+        }
+    }
+
+    private rethrowIfCancelled(session: RunningSession, error: unknown): void {
+        if (session.cancelled || !this.registry.isLive(session)) throw error
+        if (error instanceof Error && /cancelled/i.test(error.message)) throw error
     }
 
     private async runGoogleSearch(
@@ -788,6 +827,192 @@ class AccountWarmupEngine {
                 // remain on browse page
             }
         }
+    }
+
+    private async runGmailBrowse(
+        page: Page,
+        session: RunningSession,
+        deadline: number,
+        plan?: SessionWarmupPlan,
+    ): Promise<void> {
+        this.assertNotCancelled(session)
+        const delayFactor = plan?.timeOfDay.delayFactor ?? 1
+        const scrollDepth = plan?.scroll.targetDepth ?? 0.5
+        const action = pickOne(SAFE_GMAIL_ACTIONS)
+
+        try {
+            const loaded = await this.gotoWarmupUrl(page, 'https://mail.google.com')
+            if (!loaded) return
+
+            await HumanBehavior.randomDelay(
+                Math.floor(2000 * delayFactor),
+                Math.floor(4000 * delayFactor),
+            )
+            await this.dismissConsent(page)
+            this.assertNotCancelled(session)
+            await page.waitForSelector('tr.zA, div[role="main"]', { timeout: 12_000 }).catch(() => undefined)
+
+            await HumanBehavior.scrollToDepth(page, scrollDepth, {
+                steps: plan?.scroll.steps ?? 3,
+            }).catch(() => undefined)
+            await HumanBehavior.readingSimulation(page, 1).catch(() => undefined)
+
+            if (Date.now() + 8_000 < deadline) {
+                await this.performGmailAction(page, session, action, scrollDepth)
+            }
+        } catch (error: unknown) {
+            this.rethrowIfCancelled(session, error)
+            const msg = error instanceof Error ? error.message : String(error)
+            console.warn(`[AccountWarmup] gmail browse failed: ${msg}`)
+        }
+    }
+
+    /** Safe inbox-only actions: read, star, or archive a Promotions mail. Never compose/send/delete. */
+    private async performGmailAction(
+        page: Page,
+        session: RunningSession,
+        action: string,
+        scrollDepth: number,
+    ): Promise<void> {
+        try {
+            this.assertNotCancelled(session)
+            if (action === 'archive_promotions') {
+                const loaded = await this.gotoWarmupUrl(
+                    page,
+                    'https://mail.google.com/mail/u/0/#category/promotions',
+                )
+                if (!loaded) return
+                await HumanBehavior.randomDelay(1500, 3000)
+            }
+
+            const row = await page.$('tr.zA, div[role="row"][jsaction]')
+            if (!row) return
+            await row.click({ timeout: 3000 }).catch(() => undefined)
+            await page.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined)
+            await HumanBehavior.randomDelay(2500, 5000)
+            await HumanBehavior.scrollToDepth(page, scrollDepth, { steps: 2 }).catch(() => undefined)
+            this.assertNotCancelled(session)
+
+            if (action === 'star_important') {
+                const star = await page.$(
+                    'span.T-KT, div[aria-label*="Not starred"], div[aria-label*="Star"], ' +
+                    'div[aria-label*="Gắn dấu sao"]',
+                )
+                if (star) await star.click().catch(() => undefined)
+                await HumanBehavior.randomDelay(800, 1600)
+            } else if (action === 'archive_promotions') {
+                const archive = await page.$(
+                    'div[aria-label="Archive"], div[data-tooltip="Archive"], div[aria-label*="Lưu trữ"]',
+                )
+                if (archive) await archive.click().catch(() => undefined)
+                await HumanBehavior.randomDelay(800, 1600)
+            }
+
+            await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined)
+        } catch (error: unknown) {
+            this.rethrowIfCancelled(session, error)
+        }
+    }
+
+    private async runPhotosBrowse(
+        page: Page,
+        session: RunningSession,
+        deadline: number,
+        plan?: SessionWarmupPlan,
+    ): Promise<void> {
+        this.assertNotCancelled(session)
+        const delayFactor = plan?.timeOfDay.delayFactor ?? 1
+        const scrollDepth = plan?.scroll.targetDepth ?? 0.5
+        const action = pickOne(SAFE_PHOTOS_ACTIONS)
+
+        try {
+            const loaded = await this.gotoWarmupUrl(page, 'https://photos.google.com')
+            if (!loaded) return
+
+            await HumanBehavior.randomDelay(
+                Math.floor(2000 * delayFactor),
+                Math.floor(4000 * delayFactor),
+            )
+            await this.dismissConsent(page)
+            this.assertNotCancelled(session)
+            await page.waitForSelector(
+                'div[data-media-key], a[href*="/photo/"], div[role="main"]',
+                { timeout: 12_000 },
+            ).catch(() => undefined)
+
+            await HumanBehavior.scrollToDepth(page, scrollDepth, {
+                steps: plan?.scroll.steps ?? 3,
+            }).catch(() => undefined)
+            await HumanBehavior.readingSimulation(page, 1).catch(() => undefined)
+
+            if (Date.now() + 8_000 < deadline) {
+                await this.performPhotosAction(page, session, action, scrollDepth)
+            }
+        } catch (error: unknown) {
+            this.rethrowIfCancelled(session, error)
+            const msg = error instanceof Error ? error.message : String(error)
+            console.warn(`[AccountWarmup] photos browse failed: ${msg}`)
+        }
+    }
+
+    /** Safe library-only actions: timeline scroll, open album, or favorite. Never upload/share/delete. */
+    private async performPhotosAction(
+        page: Page,
+        session: RunningSession,
+        action: string,
+        scrollDepth: number,
+    ): Promise<void> {
+        try {
+            this.assertNotCancelled(session)
+            if (action === 'scroll_timeline') {
+                await HumanBehavior.scrollToDepth(page, Math.min(0.9, scrollDepth + 0.2), {
+                    steps: 3,
+                }).catch(() => undefined)
+                await page.mouse.wheel(0, HumanBehavior.getRandomDelay(200, 500)).catch(() => undefined)
+                return
+            }
+            if (action === 'view_album') {
+                await this.openPhotosAlbum(page, scrollDepth)
+                return
+            }
+
+            const photo = await page.$('div[data-media-key], a[href*="/photo/"], div[role="img"]')
+            if (!photo) return
+            await photo.click({ timeout: 3000 }).catch(() => undefined)
+            await page.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined)
+            await HumanBehavior.randomDelay(2500, 5000)
+            this.assertNotCancelled(session)
+
+            if (action === 'favorite_photo') {
+                const fav = await page.$(
+                    'button[aria-label*="Favorite"], button[aria-label*="Yêu thích"], ' +
+                    'button[aria-label*="Add to favorites"]',
+                )
+                if (fav) await fav.click().catch(() => undefined)
+                await HumanBehavior.randomDelay(800, 1600)
+            }
+
+            await page.keyboard.press('Escape').catch(() => undefined)
+            await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined)
+        } catch (error: unknown) {
+            this.rethrowIfCancelled(session, error)
+        }
+    }
+
+    private async openPhotosAlbum(page: Page, scrollDepth: number): Promise<void> {
+        const albumsNav = await page.$(
+            'a[href*="/albums"], a[aria-label*="Album"], a:has-text("Albums"), a:has-text("Album")',
+        )
+        if (!albumsNav) return
+        await albumsNav.click({ timeout: 3000 }).catch(() => undefined)
+        await page.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined)
+        await HumanBehavior.randomDelay(2000, 4000)
+        await HumanBehavior.scrollToDepth(page, scrollDepth, { steps: 2 }).catch(() => undefined)
+        const album = await page.$('a[href*="/album/"], div[data-collection-id]')
+        if (!album) return
+        await album.click({ timeout: 3000 }).catch(() => undefined)
+        await HumanBehavior.randomDelay(2500, 5000)
+        await HumanBehavior.scrollToDepth(page, Math.min(0.7, scrollDepth), { steps: 1 }).catch(() => undefined)
     }
 }
 

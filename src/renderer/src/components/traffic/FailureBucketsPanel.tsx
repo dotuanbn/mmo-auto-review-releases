@@ -33,7 +33,7 @@ export function FailureBucketsPanel({ issues }: { issues: TrafficAuditIssues | n
                 />
             ) : (
                 <div className="space-y-3">
-                    <div className="flex flex-wrap items-center gap-2 text-xs text-[#6f697c]">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-[#6f697c] dark:text-[#c8c0d8]">
                         <span>{t('traffic.audit.failureTotal', 'Classified failures')}</span>
                         <Badge tone="rose">{total}</Badge>
                     </div>
@@ -44,14 +44,17 @@ export function FailureBucketsPanel({ issues }: { issues: TrafficAuditIssues | n
                                 <Panel key={bucket.key} tone={bucket.tone} className="!p-3">
                                     <div className="flex items-start justify-between gap-2">
                                         <div className="min-w-0">
-                                            <div className="truncate text-sm font-semibold text-[#17171f]">
+                                            <div
+                                                className="truncate text-sm font-semibold text-[#17171f] dark:text-[#f0ecff]"
+                                                title={t(bucket.i18nKey, BUCKET_FALLBACKS[bucket.i18nKey] || bucket.key)}
+                                            >
                                                 {t(bucket.i18nKey, BUCKET_FALLBACKS[bucket.i18nKey] || bucket.key)}
                                             </div>
-                                            <div className="mt-1 text-[11px] text-[#6f697c]">{pct}%</div>
+                                            <div className="mt-1 text-[11px] text-[#6f697c] dark:text-[#c8c0d8]">{pct}%</div>
                                         </div>
-                                        <div className="text-lg font-bold text-[#17171f]">{bucket.count}</div>
+                                        <div className="text-lg font-bold text-[#17171f] dark:text-[#f0ecff]">{bucket.count}</div>
                                     </div>
-                                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/70">
+                                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/70 dark:bg-[#2a2540]">
                                         <div
                                             className="h-full rounded-full bg-current opacity-60"
                                             style={{ width: `${Math.max(pct, 4)}%` }}

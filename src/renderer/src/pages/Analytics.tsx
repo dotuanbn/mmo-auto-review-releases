@@ -45,7 +45,7 @@ interface LocationConfig {
 // ============================================================
 
 function MiniChart({ data, color = '#8d74e8', height = 40 }: { data: number[], color?: string, height?: number }) {
-    if (!data || data.length < 2) return <div className="h-10 flex items-center justify-center text-[#908a9e] text-xs">No trend data</div>
+    if (!data || data.length < 2) return <div className="h-10 flex items-center justify-center text-[#908a9e] dark:text-[#9a8fba] text-xs">No trend data</div>
     const max = Math.max(...data, 1)
     const min = Math.min(...data, 0)
     const range = max - min || 1
@@ -395,25 +395,25 @@ export function Analytics() {
             {/* Config Panel */}
             {showConfig && (
                 <Panel className="mb-6">
-                    <h3 className="text-sm font-semibold text-[#17171f] mb-4">Cai dat Analytics cho: {selectedLocation?.name}</h3>
+                    <h3 className="text-sm font-semibold text-[#17171f] dark:text-[#f0ecff] mb-4">Cai dat Analytics cho: {selectedLocation?.name}</h3>
 
                     <ModeSelector value={mode} onChange={handleModeChange} />
 
                     {mode === 'api' && (
                         <div className="mt-4 space-y-4">
                             {/* Google Login Area */}
-                            <div className="p-4 rounded-[18px] border border-[#e9e4f2] bg-white">
+                            <div className="p-4 rounded-[18px] border border-[#e9e4f2] dark:border-[#3d3558] bg-white dark:bg-[#1e1b2e]">
                                 <div className="space-y-4">
                                     <div className="flex items-center justify-between">
                                         <div className="flex items-center gap-3">
-                                            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${googleLoginStatus.loggedIn ? 'bg-emerald-50' : 'bg-blue-50'}`}>
+                                            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${googleLoginStatus.loggedIn ? 'bg-emerald-50 dark:bg-emerald-950/40' : 'bg-blue-50 dark:bg-blue-950/40'}`}>
                                                 {googleLoginStatus.loggedIn ? <CheckCircle className="w-5 h-5 text-emerald-500" /> : <LogIn className="w-5 h-5 text-blue-500" />}
                                             </div>
                                             <div>
-                                                <p className="text-sm font-medium text-[#17171f]">
+                                                <p className="text-sm font-medium text-[#17171f] dark:text-[#f0ecff]">
                                                     Ket noi Google Analytics
                                                 </p>
-                                                <p className="text-xs text-[#8e899b]">
+                                                <p className="text-xs text-[#8e899b] dark:text-[#9a8fba]">
                                                     Chon tai khoan de lay du lieu cho MAP nay
                                                 </p>
                                             </div>
@@ -454,7 +454,7 @@ export function Analytics() {
 
                                     <Divider />
                                     <div>
-                                        <p className="text-xs text-[#908a9e] mb-2">Hoac dang nhap tai khoan moi (Goi y username tu tool):</p>
+                                        <p className="text-xs text-[#908a9e] dark:text-[#9a8fba] mb-2">Hoac dang nhap tai khoan moi (Goi y username tu tool):</p>
                                         <div className="flex items-center gap-2">
                                             <Select
                                                 value={selectedLoginEmail}
@@ -499,7 +499,7 @@ export function Analytics() {
                                     {/* Refresh button */}
                                     {!loadingProperties && !apiError && ga4Properties.length === 0 && (
                                         <div className="flex items-center gap-2">
-                                            <p className="text-xs text-[#908a9e]">Khong tim thay GA4 Properties</p>
+                                            <p className="text-xs text-[#908a9e] dark:text-[#9a8fba]">Khong tim thay GA4 Properties</p>
                                             <PrimaryButton
                                                 variant="quiet"
                                                 onClick={() => loadPropertiesAndSites(analyticsGoogleEmail)}
@@ -511,11 +511,11 @@ export function Analytics() {
                                         </div>
                                     )}
                                     <div>
-                                        <label className="text-sm font-medium text-[#17171f] mb-1.5 flex items-center gap-2">
+                                        <label className="text-sm font-medium text-[#17171f] dark:text-[#f0ecff] mb-1.5 flex items-center gap-2">
                                             GA4 Property (Google Analytics 4)
                                             {loadingProperties && <Loader2 className="w-3 h-3 animate-spin text-[#8d74e8]" />}
                                         </label>
-                                        <p className="text-xs text-[#8e899b] mb-2">
+                                        <p className="text-xs text-[#8e899b] dark:text-[#9a8fba] mb-2">
                                             Chon Website/Ung dung tuong ung voi MAP nay de theo doi luong **Truy cap (Traffic)** tu Google do ve.
                                         </p>
                                         {ga4Properties.length > 0 ? (
@@ -540,11 +540,11 @@ export function Analytics() {
                                     </div>
 
                                     <div>
-                                        <label className="text-sm font-medium text-[#17171f] mt-4 mb-1.5 flex items-center gap-2">
+                                        <label className="text-sm font-medium text-[#17171f] dark:text-[#f0ecff] mt-4 mb-1.5 flex items-center gap-2">
                                             Search Console Site
                                             {loadingProperties && <Loader2 className="w-3 h-3 animate-spin text-[#8d74e8]" />}
                                         </label>
-                                        <p className="text-xs text-[#8e899b] mb-2">
+                                        <p className="text-xs text-[#8e899b] dark:text-[#9a8fba] mb-2">
                                             Chon ten mien SEO de theo doi so **Lan hien thi (Impressions), Luot click, va Tu khoa (Keywords)** cua MAP/Website tren Google.
                                         </p>
                                         {gscSites.length > 0 ? (
@@ -572,7 +572,7 @@ export function Analytics() {
 
                             {/* Not logged in hint */}
                             {!googleLoginStatus.loggedIn && (
-                                <p className="text-xs text-[#908a9e] text-center py-2">
+                                <p className="text-xs text-[#908a9e] dark:text-[#9a8fba] text-center py-2">
                                     Dang nhap Google de tu dong tim GA4 Properties va Search Console Sites
                                 </p>
                             )}
@@ -679,7 +679,7 @@ export function Analytics() {
                             {/* Maps Trend Chart */}
                             {mapsTrend.length > 1 && (
                                 <Panel>
-                                    <h3 className="text-xs font-medium text-[#6f697c] mb-2">Xu huong Reviews</h3>
+                                    <h3 className="text-xs font-medium text-[#6f697c] dark:text-[#c8c0d8] mb-2">Xu huong Reviews</h3>
                                     <MiniChart data={mapsTrend} color="#3b82f6" height={60} />
                                 </Panel>
                             )}
@@ -710,7 +710,7 @@ export function Analytics() {
                             </StatRow>
                             {ga4Trend.length > 1 && (
                                 <Panel className="mt-3">
-                                    <h3 className="text-xs font-medium text-[#6f697c] mb-2">Sessions Trend</h3>
+                                    <h3 className="text-xs font-medium text-[#6f697c] dark:text-[#c8c0d8] mb-2">Sessions Trend</h3>
                                     <MiniChart data={ga4Trend} color="#8d74e8" height={60} />
                                 </Panel>
                             )}
@@ -729,7 +729,7 @@ export function Analytics() {
 
                             {gscTrend.length > 1 && (
                                 <Panel className="mt-3">
-                                    <h3 className="text-xs font-medium text-[#6f697c] mb-2">Clicks Trend</h3>
+                                    <h3 className="text-xs font-medium text-[#6f697c] dark:text-[#c8c0d8] mb-2">Clicks Trend</h3>
                                     <MiniChart data={gscTrend} color="#10b981" height={60} />
                                 </Panel>
                             )}
@@ -739,7 +739,7 @@ export function Analytics() {
                                 <div className="mt-3">
                                     <DataTable
                                         columns={[
-                                            { key: 'query', header: 'Query', render: (row: any) => <span className="font-medium text-[#17171f]">{row.query}</span> },
+                                            { key: 'query', header: 'Query', render: (row: any) => <span className="font-medium text-[#17171f] dark:text-[#f0ecff]">{row.query}</span> },
                                             { key: 'impressions', header: 'Impressions', align: 'right' as const, render: (row: any) => row.impressions?.toLocaleString() },
                                             { key: 'clicks', header: 'Clicks', align: 'right' as const, render: (row: any) => row.clicks?.toLocaleString() },
                                             { key: 'ctr', header: 'CTR', align: 'right' as const, render: (row: any) => <span className="text-[#735bd6]">{(row.ctr * 100).toFixed(2)}%</span> },

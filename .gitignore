@@ -5,6 +5,12 @@ node_modules/
 dist/
 dist-electron/
 
+# Generated Windows Laya sidecar payload. README and packaging docs stay tracked.
+resources/laya-sidecar/laya-sidecar.exe
+resources/laya-sidecar/_internal/
+resources/laya-sidecar/model/
+resources/laya-sidecar/artifact-manifest.json
+
 # Release builds (large binaries)
 release/
 release-fix/

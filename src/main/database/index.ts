@@ -21,11 +21,19 @@ const MAX_PRE_MIGRATE_BACKUPS = 3
 
 /** SQLite busy_timeout (ms) for brief lock waits in single-process Electron. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000
+/** Passive WAL checkpoint interval. Keeps the WAL from growing without blocking writers. */
+const WAL_CHECKPOINT_INTERVAL_MS = 3_600_000
+/** Retention sweep interval for traffic_logs and traffic_visit_queue. */
+const DATA_PURGE_INTERVAL_MS = 86_400_000
+const DEFAULT_DATA_RETENTION_DAYS = 30
+const MS_PER_DAY = 86_400_000
 
 let db: AppDatabase | null = null
 let sqlite: Database.Database | null = null
 /** Sync re-entrancy guard: prevents a second open while init is mid-flight. */
 let initInProgress = false
+let walCheckpointTimer: ReturnType<typeof setInterval> | null = null
+let dataPurgeTimer: ReturnType<typeof setInterval> | null = null
 
 // Get the path to the database file
 function getDatabasePath(): string {
@@ -179,9 +187,11 @@ export function initDatabase(): AppDatabase {
     insertDefaultSettings()
 
     db = pendingDb
+    startDatabaseMaintenance()
     return db
   } catch (error) {
     console.error('Database initialization failed (fail-closed):', error)
+    stopDatabaseMaintenance()
     resetDatabaseHandles(opened)
     throw error
   } finally {
@@ -199,7 +209,73 @@ export function getDatabase(): AppDatabase {
 
 // Close database connection
 export function closeDatabase(): void {
+  stopDatabaseMaintenance()
   resetDatabaseHandles(sqlite)
+}
+
+function startDatabaseMaintenance(): void {
+  stopDatabaseMaintenance()
+  walCheckpointTimer = setInterval(() => {
+    try {
+      sqlite?.pragma('wal_checkpoint(PASSIVE)')
+    } catch {
+      // DB may already be closed
+    }
+  }, WAL_CHECKPOINT_INTERVAL_MS)
+
+  dataPurgeTimer = setInterval(() => {
+    try {
+      purgeOldData()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(`Periodic purgeOldData failed: ${message}`)
+    }
+  }, DATA_PURGE_INTERVAL_MS)
+}
+
+function stopDatabaseMaintenance(): void {
+  if (walCheckpointTimer) {
+    clearInterval(walCheckpointTimer)
+    walCheckpointTimer = null
+  }
+  if (dataPurgeTimer) {
+    clearInterval(dataPurgeTimer)
+    dataPurgeTimer = null
+  }
+}
+
+function normalizeRetentionDays(retentionDays: number): number {
+  if (!Number.isFinite(retentionDays) || retentionDays < 1) {
+    throw new Error(`retentionDays must be a finite number >= 1, got ${String(retentionDays)}`)
+  }
+  return Math.floor(retentionDays)
+}
+
+/**
+ * Delete traffic rows older than retentionDays.
+ * traffic_logs.created_at is unix seconds (drizzle timestamp mode).
+ * traffic_visit_queue.created_at is an ISO-8601 text timestamp.
+ * Returns the number of rows removed across both tables.
+ */
+export function purgeOldData(retentionDays: number = DEFAULT_DATA_RETENTION_DAYS): number {
+  const handle = sqlite
+  if (!handle) return 0
+
+  const days = normalizeRetentionDays(retentionDays)
+  const cutoffMs = Date.now() - days * MS_PER_DAY
+  const logCutoffSeconds = Math.floor(cutoffMs / 1000)
+  const queueCutoffIso = new Date(cutoffMs).toISOString()
+
+  const deleteLogs = handle.prepare('DELETE FROM traffic_logs WHERE created_at < ?')
+  const deleteQueue = handle.prepare('DELETE FROM traffic_visit_queue WHERE created_at < ?')
+  const deleted = handle.transaction(() => {
+    return deleteLogs.run(logCutoffSeconds).changes + deleteQueue.run(queueCutoffIso).changes
+  })()
+
+  if (deleted > 0) {
+    console.log(`Purged ${deleted} traffic rows older than ${days} days`)
+  }
+  return deleted
 }
 
 // Create tables manually (since we're not using migrations in dev)
@@ -246,7 +322,12 @@ function createTables() {
       review_style_seed TEXT,
       last_warmup_at INTEGER,
       next_warmup_at INTEGER,
-      warmup_sessions INTEGER NOT NULL DEFAULT 0
+      warmup_sessions INTEGER NOT NULL DEFAULT 0,
+      -- Birth-story scheduler + auto-warmup
+      birth_story_day INTEGER NOT NULL DEFAULT 0,
+      birth_story_start_date INTEGER,
+      birth_story_completed INTEGER NOT NULL DEFAULT 0,
+      auto_warmup_enabled INTEGER NOT NULL DEFAULT 0
     )
   `)
 

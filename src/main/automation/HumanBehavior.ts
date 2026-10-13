@@ -6,6 +6,122 @@ import {
     planScrollDepth,
     type AdaptiveDelayResult,
 } from './CaptchaAvoidancePolicy'
+import type { BehaviorProfile, MoodState, SessionFatigueState } from '../../shared/behavior-contracts'
+
+const MOOD_NORMAL_AFTER_MINUTES = 10
+
+/**
+ * Per-session fatigue. Opt-in: callers that omit the tracker keep legacy timing.
+ *
+ * Fatigue factor is 0 until `fatigueOnsetMinutes`, then ramps linearly and
+ * saturates at `maxFatigueFactor` once elapsed time reaches 2× onset:
+ *   factor = min(maxFatigueFactor, (elapsed - onset) / onset * maxFatigueFactor)
+ * Delay multiplier is 1 + factor (1.0 at the start, 1 + maxFatigueFactor at full fatigue).
+ */
+export class SessionFatigueTracker {
+    private readonly profile: BehaviorProfile
+    private readonly state: SessionFatigueState
+
+    constructor(profile: BehaviorProfile, sessionStartedAt = Date.now()) {
+        this.profile = profile
+        const elapsedMinutes = Math.max(0, (Date.now() - sessionStartedAt) / 60000)
+        this.state = {
+            sessionStartedAt,
+            currentMood: this.resolveMood(elapsedMinutes),
+            actionCount: 0,
+            lastMoodChangeAt: sessionStartedAt,
+        }
+    }
+
+    /** Count one user action and refresh mood if the time threshold moved. */
+    recordAction(): void {
+        this.state.actionCount += 1
+        const mood = this.getCurrentMood()
+        if (mood !== this.state.currentMood) {
+            this.state.currentMood = mood
+            this.state.lastMoodChangeAt = Date.now()
+        }
+    }
+
+    /**
+     * 1.0 before fatigue onset, rising to 1 + maxFatigueFactor at full fatigue.
+     */
+    getDelayMultiplier(): number {
+        return 1 + this.getFatigueFactor()
+    }
+
+    /**
+     * Base mistake rate × profile multiplier × delay multiplier.
+     * The profile applies immediately; fatigue raises it further after onset.
+     */
+    getMistakeRate(baseRate: number): number {
+        const rate = baseRate * this.profile.mistakeMultiplier * this.getDelayMultiplier()
+        if (!Number.isFinite(rate) || rate <= 0) return 0
+        return Math.min(1, rate)
+    }
+
+    /**
+     * focused → normal (after 10 min) → tired (after onset) → distracted (after 2× onset).
+     */
+    getCurrentMood(): MoodState {
+        return this.resolveMood(this.elapsedMinutes())
+    }
+
+    /** Random typing delay scaled by typing speed (faster = shorter) and fatigue. */
+    getTypingDelay(baseMin: number, baseMax: number): number {
+        const scale = this.delayScaleForSpeed(this.profile.typingSpeedMultiplier)
+        return this.randomInScaledRange(baseMin, baseMax, scale)
+    }
+
+    /** Mouse step sleep scaled by mouse speed (faster = shorter) and fatigue. */
+    getMouseStepDelay(baseDelay: number): number {
+        const scale = this.delayScaleForSpeed(this.profile.mouseSpeedMultiplier)
+        return Math.max(1, Math.round(baseDelay * scale))
+    }
+
+    /** Scroll distance scaled by this account's scrollVariance. Direction stays with the caller. */
+    scaleScrollAmount(baseAmount: number): number {
+        const scaled = Math.abs(baseAmount) * this.profile.scrollVariance
+        return Math.max(1, Math.round(scaled))
+    }
+
+    private elapsedMinutes(now = Date.now()): number {
+        return Math.max(0, (now - this.state.sessionStartedAt) / 60000)
+    }
+
+    private getFatigueFactor(): number {
+        const elapsedMinutes = this.elapsedMinutes()
+        const onset = this.profile.fatigueOnsetMinutes
+        const maxFactor = this.profile.maxFatigueFactor
+        if (elapsedMinutes <= onset || maxFactor <= 0) return 0
+        if (onset <= 0) return Math.max(0, maxFactor)
+        const raw = ((elapsedMinutes - onset) / onset) * maxFactor
+        return Math.min(maxFactor, Math.max(0, raw))
+    }
+
+    private resolveMood(elapsedMinutes: number): MoodState {
+        const onset = this.profile.fatigueOnsetMinutes
+        if (onset > 0 && elapsedMinutes >= onset * 2) return 'distracted'
+        if (onset > 0 && elapsedMinutes >= onset) return 'tired'
+        if (elapsedMinutes >= MOOD_NORMAL_AFTER_MINUTES) return 'normal'
+        return 'focused'
+    }
+
+    /** Fatigue slows the action; a higher speed multiplier shortens the delay. */
+    private delayScaleForSpeed(speedMultiplier: number): number {
+        const safeSpeed = speedMultiplier > 0 ? speedMultiplier : 1
+        return this.getDelayMultiplier() / safeSpeed
+    }
+
+    private randomInScaledRange(baseMin: number, baseMax: number, scale: number): number {
+        const min = baseMin * scale
+        const max = baseMax * scale
+        const lo = Math.min(min, max)
+        const hi = Math.max(min, max)
+        if (hi <= lo) return Math.max(1, Math.round(lo))
+        return Math.max(1, Math.round(lo + Math.random() * (hi - lo)))
+    }
+}
 
 /**
  * HumanBehavior - Simulate human-like browser interactions
@@ -19,6 +135,7 @@ export class HumanBehavior {
      * @param selector - Element selector to type into
      * @param text - Text to type
      * @param options - Typing options
+     * @param fatigueTracker - Optional session fatigue. Omitted = unchanged timing.
      */
     static async humanType(
         page: Page,
@@ -28,9 +145,14 @@ export class HumanBehavior {
             minDelay?: number
             maxDelay?: number
             mistakeRate?: number
-        } = {}
+        } = {},
+        fatigueTracker?: SessionFatigueTracker,
     ): Promise<void> {
         const { minDelay = 50, maxDelay = 150, mistakeRate = 0.02 } = options
+        const effectiveMistakeRate = fatigueTracker
+            ? fatigueTracker.getMistakeRate(mistakeRate)
+            : mistakeRate
+        if (fatigueTracker) fatigueTracker.recordAction()
 
         // Click and focus the element first
         await page.click(selector)
@@ -38,7 +160,7 @@ export class HumanBehavior {
 
         for (let i = 0; i < text.length; i++) {
             // Occasionally make a "mistake" and correct it
-            if (Math.random() < mistakeRate && i > 0) {
+            if (Math.random() < effectiveMistakeRate && i > 0) {
                 const wrongChar = String.fromCharCode(97 + Math.floor(Math.random() * 26))
                 await page.keyboard.type(wrongChar)
                 await this.randomDelay(100, 300)
@@ -50,7 +172,9 @@ export class HumanBehavior {
             await page.keyboard.type(text[i])
 
             // Variable delay between characters
-            const delay = this.getRandomDelay(minDelay, maxDelay)
+            const delay = fatigueTracker
+                ? fatigueTracker.getTypingDelay(minDelay, maxDelay)
+                : this.getRandomDelay(minDelay, maxDelay)
 
             // Longer pause after punctuation or spaces
             if (['.', ',', '!', '?', ' '].includes(text[i])) {
@@ -67,12 +191,14 @@ export class HumanBehavior {
      * @param toX - Target X coordinate
      * @param toY - Target Y coordinate
      * @param steps - Number of movement steps
+     * @param fatigueTracker - Optional session fatigue. Omitted = unchanged step delay.
      */
     static async naturalMouseMove(
         page: Page,
         toX: number,
         toY: number,
-        steps: number = 25
+        steps: number = 25,
+        fatigueTracker?: SessionFatigueTracker,
     ): Promise<void> {
         // Get current mouse position (or start from random position)
         const viewportSize = await page.viewportSize()
@@ -86,6 +212,8 @@ export class HumanBehavior {
         const cp1y = fromY + (toY - fromY) * 0.25 + (Math.random() - 0.5) * 100
         const cp2x = fromX + (toX - fromX) * 0.75 + (Math.random() - 0.5) * 100
         const cp2y = fromY + (toY - fromY) * 0.75 + (Math.random() - 0.5) * 100
+
+        if (fatigueTracker) fatigueTracker.recordAction()
 
         // Move along the curve
         for (let i = 0; i <= steps; i++) {
@@ -104,7 +232,10 @@ export class HumanBehavior {
 
             await moveCursor(page, x, y)
             await page.mouse.move(x, y)
-            await this.sleep(this.getRandomDelay(5, 20))
+            const stepDelay = fatigueTracker
+                ? fatigueTracker.getMouseStepDelay(this.getRandomDelay(5, 20))
+                : this.getRandomDelay(5, 20)
+            await this.sleep(stepDelay)
         }
     }
 
@@ -112,15 +243,29 @@ export class HumanBehavior {
      * Random scrolling to simulate reading
      * @param page - Playwright page
      * @param scrollCount - Number of scroll actions
+     * @param fatigueTracker - Optional session fatigue. Omitted = unchanged scroll timing.
      */
-    static async randomScroll(page: Page, scrollCount: number = 3): Promise<void> {
+    static async randomScroll(
+        page: Page,
+        scrollCount: number = 3,
+        fatigueTracker?: SessionFatigueTracker,
+    ): Promise<void> {
+        if (fatigueTracker) fatigueTracker.recordAction()
         for (let i = 0; i < scrollCount; i++) {
             // Random scroll direction and amount
             const direction = Math.random() > 0.3 ? 1 : -1 // 70% down, 30% up
-            const amount = this.getRandomDelay(100, 400) * direction
+            const baseAmount = this.getRandomDelay(100, 400)
+            const amount = fatigueTracker
+                ? fatigueTracker.scaleScrollAmount(baseAmount) * direction
+                : baseAmount * direction
 
             await page.mouse.wheel(0, amount)
-            await this.randomDelay(500, 1500)
+            if (fatigueTracker) {
+                const scale = fatigueTracker.getDelayMultiplier()
+                await this.randomDelay(Math.round(500 * scale), Math.round(1500 * scale))
+            } else {
+                await this.randomDelay(500, 1500)
+            }
         }
     }
 
@@ -238,8 +383,13 @@ export class HumanBehavior {
      * Human-like click with pre-movement, micro-jitter, hesitation, and post-click drift
      * @param page - Playwright page  
      * @param selector - Element to click
+     * @param fatigueTracker - Optional session fatigue. Omitted = 200–600ms hesitation.
      */
-    static async humanClick(page: Page, selector: string): Promise<void> {
+    static async humanClick(
+        page: Page,
+        selector: string,
+        fatigueTracker?: SessionFatigueTracker,
+    ): Promise<void> {
         // Get element bounding box
         const element = await page.$(selector)
         if (!element) throw new Error(`Element not found: ${selector}`)
@@ -252,13 +402,20 @@ export class HumanBehavior {
         const y = box.y + box.height * (0.2 + Math.random() * 0.6)
 
         // Move mouse naturally to the element
-        await this.naturalMouseMove(page, x, y)
+        await this.naturalMouseMove(page, x, y, 25, fatigueTracker)
 
         // Micro-jitter: hover around target briefly (humans wiggle slightly)
         await this.microJitter(page, x, y, this.getRandomDelay(1, 3))
 
-        // Pre-click hesitation: pause 200-600ms (cognitive decision moment)
-        await this.randomDelay(200, 600)
+        // Pre-click hesitation. 200–600ms at rest; a maxFatigueFactor of 0.5
+        // reaches 300–900ms at full fatigue (delay multiplier 1.5).
+        if (fatigueTracker) {
+            fatigueTracker.recordAction()
+            const scale = fatigueTracker.getDelayMultiplier()
+            await this.randomDelay(Math.round(200 * scale), Math.round(600 * scale))
+        } else {
+            await this.randomDelay(200, 600)
+        }
 
         // Click with natural button press duration
         await clickCursor(page, x, y)
