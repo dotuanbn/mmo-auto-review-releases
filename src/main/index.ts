@@ -262,6 +262,24 @@ app.whenReady().then(async () => {
             const { warmupSchedulerService } = await import('./services/WarmupSchedulerService')
             warmupSchedulerService.start()
             logBootstrap('Scheduler service started (automation runner wired)')
+
+            // Sprint 3: start background workers if enabled
+            try {
+                const { loadSettings: loadS3Settings } = await import('./ipc/settings')
+                const s3 = loadS3Settings()
+                if (s3.enableHelpfulVotes) {
+                    const { helpfulVoteWorker } = await import('./services/HelpfulVoteWorker')
+                    helpfulVoteWorker.start()
+                    logBootstrap('HelpfulVoteWorker started')
+                }
+                if (s3.enableReviewVerification) {
+                    const { reviewVerificationWorker } = await import('./services/ReviewVerificationWorker')
+                    reviewVerificationWorker.start()
+                    logBootstrap('ReviewVerificationWorker started')
+                }
+            } catch (workerErr) {
+                logBootstrap('Sprint 3 workers failed to start (non-fatal)', workerErr)
+            }
         } catch (schedulerError) {
             logBootstrap('Scheduler service failed to start (non-fatal)', schedulerError)
         }
@@ -311,6 +329,9 @@ app.on('window-all-closed', async () => {
         runtimeServices?.schedulerService.stop()
         const { warmupSchedulerService } = require('./services/WarmupSchedulerService')
         warmupSchedulerService.stop()
+        // Sprint 3: stop background workers
+        try { require('./services/HelpfulVoteWorker').helpfulVoteWorker.stop() } catch { /* may not be started */ }
+        try { require('./services/ReviewVerificationWorker').reviewVerificationWorker.stop() } catch { /* may not be started */ }
     } catch (error) {
         logBootstrap('Failed to stop scheduler during shutdown', error)
     }

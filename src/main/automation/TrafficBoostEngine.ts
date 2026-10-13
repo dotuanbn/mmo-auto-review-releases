@@ -46,6 +46,7 @@ import {
     buildTrafficVisitSeedItems,
     trafficVisitQueue,
 } from './TrafficVisitQueue'
+import { accountHealthScorer } from '../services/AccountHealthScorer'
 
 import {
     type SEOAction,
@@ -1130,6 +1131,17 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
         if (accountIds.length > 0) {
             const all = db.select().from(schema.accounts).all()
             accounts = all.filter(a => accountIds.includes(a.id) && a.status !== 'banned' && a.status !== 'suspended')
+        }
+        // Sprint 3: filter out accounts that need rest (fail-open for traffic)
+        if (accounts.length > 1) {
+            try {
+                const healthMap = accountHealthScorer.evaluateAll()
+                const healthy = accounts.filter((a: any) => {
+                    const h = healthMap.get(a.id)
+                    return !h || !h.shouldRest
+                })
+                if (healthy.length > 0) accounts = healthy
+            } catch { /* health check failure = use all accounts */ }
         }
         if (accounts.length === 0) accounts = [null] // anonymous / no usable account
 

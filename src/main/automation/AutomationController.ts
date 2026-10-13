@@ -44,6 +44,9 @@ import {
     type ReviewSubmissionStatus,
 } from '../services/ReviewService'
 import { locationService } from '../services/LocationService'
+import { timeLocalityService } from '../services/TimeLocalityService'
+import { accountHealthScorer } from '../services/AccountHealthScorer'
+import { reviewPhotoStrategy, type PhotoDecision } from '../services/ReviewPhotoStrategy'
 
 // Debug file logger
 const LOG_FILE = join(app.getPath('userData'), 'automation-debug.log')
@@ -584,10 +587,44 @@ class AutomationController {
     private async resolveCampaignAccounts(accountIds: number[]): Promise<Array<{ id: number; email: string; status: string }>> {
         const db = getDatabase()
         const all = await db.select().from(schema.accounts).all()
+        let candidates: typeof all
         if (accountIds.length > 0) {
-            return all.filter(a => accountIds.includes(a.id))
+            candidates = all.filter(a => accountIds.includes(a.id))
+        } else {
+            candidates = all.filter(a => a.status !== 'banned' && a.status !== 'suspended')
         }
-        return all.filter(a => a.status !== 'banned' && a.status !== 'suspended')
+
+        // Sprint 3: filter out accounts that should rest (health-based rotation)
+        const settings = loadSettings()
+        if (settings.enableAccountHealth !== false && candidates.length > 1) {
+            try {
+                const healthMap = await accountHealthScorer.evaluateAll()
+                const filtered = candidates.filter(a => {
+                    const h = healthMap.get(a.id)
+                    if (!h) return true // unknown health = allow
+                    if (h.shouldRest) {
+                        logToFile(`[AccountHealth] Resting account ${a.email} (score=${h.score}, grade=${h.grade}, restDays=${h.restDays})`)
+                        return false
+                    }
+                    return true
+                })
+                // Sort by health score descending (healthiest first)
+                filtered.sort((a, b) => {
+                    const ha = healthMap.get(a.id)?.score ?? 50
+                    const hb = healthMap.get(b.id)?.score ?? 50
+                    return hb - ha
+                })
+                if (filtered.length > 0) {
+                    candidates = filtered
+                } else {
+                    logToFile(`[AccountHealth] All accounts need rest — proceeding with original list to avoid deadlock`)
+                }
+            } catch (err) {
+                logToFile(`[AccountHealth] Evaluation failed (proceeding without filter): ${err instanceof Error ? err.message : String(err)}`)
+            }
+        }
+
+        return candidates
     }
 
     /**
@@ -1190,6 +1227,12 @@ class AutomationController {
                     return
                 }
 
+                // Sprint 3: night-time locality block — defer to golden hours
+                if (reviewOutcome.deferredTimeLocality === true) {
+                    await this.releaseDeferredReviewJob(thread, job)
+                    return
+                }
+
                 // Existing submitting/unconfirmed OR new unconfirmed after submitAttempted:
                 // permanent failed (not cancel) — cancelled is re-enqueued on restart churn.
                 // review_history gate still blocks auto re-post.
@@ -1305,11 +1348,17 @@ class AutomationController {
         locationUrl: string,
         rating: number,
         reviewText: string,
+        photoDecision?: PhotoDecision | null,
     ): Promise<SubmitAwareResult> {
         if (thread.contextId == null) {
             return { success: false, submitAttempted: false, error: 'No browser context for linear review' }
         }
         this.assertNotAborted(`Thread ${thread.id}`)
+
+        // Sprint 3: use smart photo decision when available
+        const effectiveMaxPhotos = photoDecision?.shouldAttach
+            ? photoDecision.maxPhotos
+            : (photoDecision === null ? 1 : 0) // null = no decision (legacy) → 1; explicit skip → 0
 
         const result = await googleMapsReviewHandler.postReview(
             thread.contextId,
@@ -1319,7 +1368,7 @@ class AutomationController {
             {
                 accountKey: String(job.accountId),
                 campaignId: job.campaignId != null ? String(job.campaignId) : undefined,
-                maxPhotos: 1,
+                maxPhotos: effectiveMaxPhotos,
                 shouldAbort: () => this.isAbortRequested(),
             },
         )
@@ -1442,6 +1491,7 @@ class AutomationController {
     ): Promise<{
         alreadySucceeded?: boolean
         deferredCrossAccount?: boolean
+        deferredTimeLocality?: boolean
         blockedManualReconcile?: boolean
         blockReason?: string
     }> {
@@ -1461,6 +1511,24 @@ class AutomationController {
 
         if (!location) {
             throw new Error('Location not found')
+        }
+
+        // Sprint 3: Time-of-day locality check — block night-time reviews at location timezone
+        const localitySettings = loadSettings()
+        if (localitySettings.enableTimeLocality !== false) {
+            const timeDecision = timeLocalityService.shouldReviewNow(location.address)
+            if (!timeDecision.allowed) {
+                logToFile(
+                    `[Thread ${thread.id}] TimeLocality DEFER job=${job.id} — ` +
+                    `${timeDecision.reason} (tz=${timeDecision.timezone}, hour=${timeDecision.localHour}, ` +
+                    `waitMs=${timeDecision.waitMs ?? 'N/A'})`
+                )
+                return { deferredTimeLocality: true }
+            }
+            logToFile(
+                `[Thread ${thread.id}] TimeLocality OK — tz=${timeDecision.timezone} hour=${timeDecision.localHour} ` +
+                `${timeDecision.reason}`
+            )
         }
 
         console.log(`[Thread ${thread.id}] Reviewing: ${location.name}`)
@@ -1555,6 +1623,33 @@ class AutomationController {
                 logToFile(
                     `[ReviewStyle] fallback job=${job.id}: ` +
                     `${error instanceof Error ? error.message : String(error)}`
+                )
+            }
+        }
+
+        // Sprint 3: Smart photo attachment — probabilistic decision based on context
+        let photoDecision: PhotoDecision | null = null
+        if (reviewSettings.enableSmartPhotos !== false && reviewSettings.includePhotos) {
+            try {
+                const warmupData = await accountWarmupService.getWarmupData(job.accountId)
+                photoDecision = reviewPhotoStrategy.decide({
+                    accountId: job.accountId,
+                    locationId: job.locationId,
+                    rating,
+                    reviewText: processedReviewText,
+                    category: location.category || null,
+                    accountTotalReviews: todaySuccess,
+                    accountWarmupLevel: warmupData?.warmupLevel ?? 0,
+                    isFirstReviewForLocation: gate.action === 'proceed',
+                })
+                logToFile(
+                    `[PhotoStrategy] job=${job.id} shouldAttach=${photoDecision.shouldAttach} ` +
+                    `maxPhotos=${photoDecision.maxPhotos} probability=${photoDecision.probability.toFixed(2)} ` +
+                    `reason="${photoDecision.reason}"`
+                )
+            } catch (err) {
+                logToFile(
+                    `[PhotoStrategy] fallback job=${job.id}: ${err instanceof Error ? err.message : String(err)}`
                 )
             }
         }
@@ -1667,6 +1762,7 @@ class AutomationController {
                         location.url,
                         rating,
                         processedReviewText,
+                        photoDecision,
                     )
                     const linearAttempted = this.readSubmitAttempted(linear)
                     if (linearAttempted === true) submitAttempted = true
@@ -1717,6 +1813,7 @@ class AutomationController {
                     location.url,
                     rating,
                     processedReviewText,
+                    photoDecision,
                 )
                 submitAttempted = this.readSubmitAttempted(linear)
                 if (linear.success) {

@@ -81,6 +81,12 @@ const DEFAULT_SETTINGS: SettingsRecord = {
     enableReviewVerification: false,
     reviewVerificationIntervalMinutes: 30,
     reviewVerificationMaxPerTick: 10,
+    // Sprint 3 — Natural Behavior integration (safe defaults: on)
+    enableTimeLocality: true,
+    enableSmartPhotos: true,
+    enableAccountHealth: true,
+    // Opt-in only: background cross-account Helpful votes
+    enableHelpfulVotes: false,
     manualReviewSubmit: true,
     allowAutoSubmitOnTrustedHosts: true,
     trustedAutoSubmitHosts: 'localhost,127.0.0.1',

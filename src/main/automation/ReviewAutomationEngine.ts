@@ -11,6 +11,8 @@ import { aiService } from '../services/AIService'
 import { reviewContentGenerator } from '../services/ReviewContentGenerator'
 import { loadSettings } from '../ipc/settings'
 import { velocityController } from '../services/VelocityController'
+import { timeLocalityService } from '../services/TimeLocalityService'
+import { accountHealthScorer } from '../services/AccountHealthScorer'
 import type { Campaign } from '../database/schema'
 
 export interface AutomationStatus {
@@ -74,6 +76,18 @@ export class ReviewAutomationEngine {
             if (accounts.length === 0) {
                 throw new Error('No active accounts available')
             }
+
+            // Sprint 3: filter out accounts that need rest
+            try {
+                const healthMap = await accountHealthScorer.evaluateAll()
+                const healthyAccounts = accounts.filter(a => {
+                    const h = healthMap.get(a.id)
+                    return !h || !h.shouldRest
+                })
+                if (healthyAccounts.length > 0) {
+                    accounts = healthyAccounts
+                }
+            } catch { /* health check failure = proceed with all accounts */ }
 
             // Get proxies
             const proxies = await proxyService.getActive()
@@ -184,6 +198,14 @@ export class ReviewAutomationEngine {
                         message: `Reviewing ${location.name}...`,
                         progress: Math.round((completedReviews / totalReviews) * 100),
                     })
+
+                    // Sprint 3: Time-of-day locality — skip if night at location timezone
+                    const timeDecision = timeLocalityService.shouldReviewNow(location.address)
+                    if (!timeDecision.allowed) {
+                        console.warn(`[ReviewEngine] TimeLocality blocked: ${timeDecision.reason} (tz=${timeDecision.timezone})`)
+                        completedReviews++
+                        continue
+                    }
 
                     const cooldown = velocityController.checkCooldown(location.id, account.id)
                     if (!cooldown.allowed) {
