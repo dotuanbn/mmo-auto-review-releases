@@ -4,10 +4,15 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { ChildProcess } from 'node:child_process'
-import { LayaSidecarManager, type LayaSidecarSpawnOptions } from '../../src/main/services/LayaSidecarManager'
+import { LayaSidecarManager, type LayaSidecarOptions, type LayaSidecarSpawnOptions } from '../../src/main/services/LayaSidecarManager'
 
 const tempRoots: string[] = []
 const managers: LayaSidecarManager[] = []
+
+function createManager(options: LayaSidecarOptions): LayaSidecarManager {
+    // Exercise the Windows sidecar contract independently of the CI host OS.
+    return new LayaSidecarManager({ platform: 'win32', ...options })
+}
 
 afterEach(async () => {
     await Promise.all(managers.splice(0).map((manager) => manager.stop()))
@@ -59,7 +64,7 @@ function track(manager: LayaSidecarManager): LayaSidecarManager {
 describe('Laya low-resource policy', () => {
     it('does not load the local model when the PC has less than 2 GB free', async () => {
         const spawn = vi.fn()
-        const manager = track(new LayaSidecarManager({ freeMemoryMB: () => 1700, spawnProcess: spawn }))
+        const manager = track(createManager({ freeMemoryMB: () => 1700, spawnProcess: spawn }))
         manager.setLowResourceMode(true)
         expect(await manager.ensureRunning()).toMatchObject({ state: 'unavailable', error: expect.stringContaining('2 GB') })
         expect(spawn).not.toHaveBeenCalled()
@@ -69,7 +74,7 @@ describe('Laya low-resource policy', () => {
         vi.useFakeTimers()
         const child = createFakeChild(2222)
         const spawn = vi.fn<(file: string, args: string[], options: LayaSidecarSpawnOptions) => ChildProcess>(() => child)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath: executableFixture(), platform: 'win32', port: 18765,
             freeMemoryMB: () => 4096, spawnProcess: spawn, fetchHealth: async () => ownedHealth(2222),
         }))
@@ -91,7 +96,7 @@ describe('Laya low-resource policy', () => {
     it('passive health checks do not keep an unused model resident', async () => {
         vi.useFakeTimers()
         const child = createFakeChild(2223)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath: executableFixture(), platform: 'win32', port: 18766,
             freeMemoryMB: () => 4096, spawnProcess: () => child, fetchHealth: async () => ownedHealth(2223),
         }))
@@ -110,7 +115,7 @@ describe('Laya low-resource policy', () => {
 
 describe('LayaSidecarManager', () => {
     it('reports an explicit unavailable state when the artifact is absent', async () => {
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath: join(tmpdir(), 'missing-laya-sidecar.exe'),
             fetchHealth: async () => null,
         }))
@@ -124,7 +129,7 @@ describe('LayaSidecarManager', () => {
     it('returns unavailable promptly on non-Windows platforms', async () => {
         const executablePath = executableFixture()
         let spawnCalls = 0
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             platform: 'linux',
             spawnProcess: () => {
@@ -141,7 +146,7 @@ describe('LayaSidecarManager', () => {
     })
 
     it('does not throw when process.resourcesPath is absent outside Electron', async () => {
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             cwd: join(tmpdir(), `laya-no-resources-${Date.now()}`),
             spawnProcess: () => {
                 throw new Error('must not spawn without a packaged executable')
@@ -158,7 +163,7 @@ describe('LayaSidecarManager', () => {
         const executablePath = executableFixture()
         let spawnCalls = 0
         const child = createFakeChild(4242)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34567,
             fetchHealth: async () => ownedHealth(4242),
@@ -181,7 +186,7 @@ describe('LayaSidecarManager', () => {
         const executablePath = executableFixture()
         let spawnCalls = 0
         const child = createFakeChild(99)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34568,
             startupTimeoutMs: 200,
@@ -204,7 +209,7 @@ describe('LayaSidecarManager', () => {
     it('rejects health that does not match the owned child PID', async () => {
         const executablePath = executableFixture()
         const child = createFakeChild(11)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34569,
             startupTimeoutMs: 200,
@@ -221,7 +226,7 @@ describe('LayaSidecarManager', () => {
     it('passes the model directory beside the executable', async () => {
         const executablePath = executableFixture()
         let spawnArgs: string[] = []
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34570,
             fetchHealth: async () => ownedHealth(7),
@@ -242,7 +247,7 @@ describe('LayaSidecarManager', () => {
         const executablePath = executableFixture()
         let spawnArgs: string[] = []
         const allocatedPort = 41234
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             allocateLoopbackPort: async () => allocatedPort,
             fetchHealth: async () => ownedHealth(8),
@@ -267,7 +272,7 @@ describe('LayaSidecarManager', () => {
         const healthGate = new Promise<unknown>((resolve) => {
             releaseHealth = resolve
         })
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34571,
             fetchHealth: async () => healthGate,
@@ -291,7 +296,7 @@ describe('LayaSidecarManager', () => {
 
     it('records spawn errors as failed without throwing', async () => {
         const executablePath = executableFixture()
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34572,
             spawnProcess: () => {
@@ -308,7 +313,7 @@ describe('LayaSidecarManager', () => {
     it('records early child exit as failed and does not mark ready later', async () => {
         const executablePath = executableFixture()
         const child = createFakeChild(33)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34573,
             startupTimeoutMs: 1_000,
@@ -334,7 +339,7 @@ describe('LayaSidecarManager', () => {
     it('retains failed status and the timeout error after killing the owned child', async () => {
         const executablePath = executableFixture()
         const child = createFakeChild(44)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34574,
             startupTimeoutMs: 200,
@@ -359,7 +364,7 @@ describe('LayaSidecarManager', () => {
             releaseHealth = resolve
         })
         const child = createFakeChild(55)
-        const manager = track(new LayaSidecarManager({
+        const manager = track(createManager({
             executablePath,
             port: 34575,
             fetchHealth: async () => healthGate,
