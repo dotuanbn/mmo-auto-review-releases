@@ -23,6 +23,7 @@ assert(github || verifyOnly || releaseDir, 'A local release directory or GitHub 
 
 const fixtureParent = path.join(os.tmpdir(), 'mmo-packaged-smoke')
 fs.mkdirSync(fixtureParent, { recursive: true })
+assert(fs.realpathSync(executable).toLowerCase().startsWith(`${fs.realpathSync(fixtureParent).toLowerCase()}${path.sep}`), 'Executable must be an isolated TEMP fixture')
 const fixture = arg('fixture') ? path.resolve(arg('fixture')) : fs.mkdtempSync(path.join(fixtureParent, 'ota-'))
 assert(fixture.toLowerCase().startsWith(`${path.resolve(fixtureParent).toLowerCase()}${path.sep}`), 'Fixture must be inside the dedicated temp smoke root')
 const userData = path.join(fixture, 'user-data')
@@ -96,9 +97,23 @@ async function startFeed() {
 async function main() {
   let electron
   let feed
+  let originalConfig
+  const configFile = path.join(path.dirname(executable), 'resources', 'app-update.yml')
   persist()
   try {
     if (!github && !verifyOnly) feed = await startFeed()
+    const settingsFile = path.join(userData, 'settings.json')
+    const settings = fs.existsSync(settingsFile) ? JSON.parse(fs.readFileSync(settingsFile, 'utf8')) : {}
+    // Set manual mode before startup so closing the fixture never installs an update.
+    fs.writeFileSync(settingsFile, JSON.stringify({ ...settings, updateMode: 'manual' }, null, 2))
+    const configText = fs.readFileSync(configFile, 'utf8')
+    const config = yaml.load(configText)
+    if (feed) {
+      originalConfig = configText
+      // The app bundles electron-updater: changing an externally required instance
+      // would not affect its real IPC updater. Override only the fixture's feed.
+      fs.writeFileSync(configFile, yaml.dump({ ...config, provider: 'generic', url: feed.url }))
+    }
     const env = { ...process.env, MMO_SMOKE_MODE: '1', SMOKE_USER_DATA_DIR: userData, LOCALAPPDATA: localCache }
     delete env.ELECTRON_RUN_AS_NODE
     electron = await _electron.launch({
@@ -130,14 +145,7 @@ async function main() {
       await window.electronAPI.settings.set('maxConcurrentBrowsers', 7)
     })
     fs.writeFileSync(path.join(userData, 'upgrade-sentinel.txt'), 'ota-upgrade-preserved')
-    const prepared = await electron.evaluate(async (_, feedUrl) => {
-      const updater = process.mainModule.require('electron-updater').autoUpdater
-      updater.autoInstallOnAppQuit = false
-      updater.autoDownload = false
-      if (feedUrl) updater.setFeedURL({ provider: 'generic', url: feedUrl, useMultipleRangeRequest: false })
-      const config = await updater.configOnDisk.value
-      return { publisherName: config.publisherName || null, version: updater.currentVersion.version }
-    }, feed?.url || null)
+    const prepared = { publisherName: config.publisherName || null, version: actualVersion }
     report.client = prepared
     assert.equal(prepared.version, currentVersion)
     report.check = await page.evaluate(() => window.electronAPI.updates.check())
@@ -151,7 +159,10 @@ async function main() {
     assert.equal(report.download.downloaded, true, report.download.error)
     assert.equal(report.download.status, 'downloaded')
     report.gates.realUpdaterDownload = true
-    report.downloadedInstaller = await electron.evaluate(() => process.mainModule.require('electron-updater').autoUpdater.installerPath)
+    const pending = path.join(localCache, config.updaterCacheDirName, 'pending')
+    const installers = fs.readdirSync(pending).filter(name => name.endsWith('.exe'))
+    assert.equal(installers.length, 1, 'Expected exactly one updater-downloaded installer')
+    report.downloadedInstaller = path.join(pending, installers[0])
     assert(report.downloadedInstaller.toLowerCase().startsWith(`${localCache.toLowerCase()}${path.sep}`))
     report.sha256 = await hashFile(report.downloadedInstaller, 'sha256', 'hex')
     if (feed) {
@@ -160,15 +171,13 @@ async function main() {
     }
     report.ok = true
   } finally {
-    if (electron) {
-      try {
-        await electron.evaluate(() => { process.mainModule.require('electron-updater').autoUpdater.autoInstallOnAppQuit = false })
-      } finally {
-        await electron.close()
-      }
+    try {
+      if (electron) await electron.close()
+    } finally {
+      if (originalConfig !== undefined) fs.writeFileSync(configFile, originalConfig)
+      if (feed) await new Promise(resolve => feed.server.close(resolve))
+      persist()
     }
-    if (feed) await new Promise(resolve => feed.server.close(resolve))
-    persist()
   }
 }
 

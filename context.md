@@ -2,7 +2,7 @@ stack: Electron 28 + Vite 5 + React 19 + TypeScript + SQLite/Drizzle + Playwrigh
 structure: main=src/main; preload=src/preload; renderer=src/renderer/src; shared=src/shared; tests=tests
 conventions: strict IPC validation; public DTOs redact secrets; minimal diffs; comments in English; no any
 phase: Preparing v1.0.19 unsigned Windows update for GitHub publication authorized on 2026-10-23; v1.0.18 remains public Latest
-verification: v1.0.19 fresh main/renderer typecheck + lint + Vite build PASS; 72 files / 1069 tests pass + 1 skip; unpacked smoke 25/25; offline sidecar and 63 real-Chrome cycles x 3 parallel contexts PASS; NSIS install/upgrade gate still pending
+verification: v1.0.19 fresh typecheck/lint/Vite PASS; GitHub Linux CI 72 files / 1070 tests PASS; Windows 1069 + 1 skip; final unpacked smoke 25/25 + offline sidecar PASS; NSIS safe-path fresh install 25/25; real v1.0.18 IPC updater downloaded hash-matched final installer; installation/production feed gate pending
 ---
 active_focus:
   current_task: Build and verify v1.0.19, checkpoint reviewed source, validate unsigned NSIS update from v1.0.18, upload draft assets and publish only after gates pass. Codex only; no Grok.
