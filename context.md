@@ -1,14 +1,15 @@
 stack: Electron 28 + Vite 5 + React 19 + TypeScript + SQLite/Drizzle + Playwright
 structure: main=src/main; preload=src/preload; renderer=src/renderer/src; shared=src/shared; tests=tests
 conventions: strict IPC validation; public DTOs redact secrets; minimal diffs; comments in English; no any
-phase: Preparing v1.0.19 unsigned Windows update for GitHub publication authorized on 2026-10-23; v1.0.18 remains public Latest
-verification: v1.0.19 fresh typecheck/lint/Vite PASS; GitHub Linux CI 72 files / 1070 tests PASS; Windows 1069 + 1 skip; final unpacked smoke 25/25 + offline sidecar PASS; NSIS safe-path fresh install 25/25; real v1.0.18 IPC updater downloaded hash-matched final installer; installation/production feed gate pending
+phase: v1.0.19 published as GitHub Latest on 2026-10-23 10:32 +07; unsigned Windows release explicitly authorized by owner
+verification: Release source/tag 05b21d8 / GitHub CI 39895077017 green (1070 tests); Windows 1069 + 1 skip; unpacked/upgraded-installed 25/25 each; v1.0.18 NSIS upgrade preserved fixture settings/data; public GitHub updater check/download PASS without GitHub tokens, final setup SHA256 matched
 ---
 active_focus:
-  current_task: Build and verify v1.0.19, checkpoint reviewed source, validate unsigned NSIS update from v1.0.18, upload draft assets and publish only after gates pass. Codex only; no Grok.
-  blocked_by: Release QA in progress. Existing signed CI path cannot publish without a certificate; use explicitly authorized local unsigned draft route, preserving runtime updater verification. Real i3/8GB all-day performance remains unverified.
+  current_task: Customer rollout feedback; remaining real i3/8GB 8-24h soak and live-account QA. Codex completed publication without Grok.
+  blocked_by: No release blocker. Unsigned trust warnings remain; real i3/8GB all-day performance and live-account behavior remain unverified.
 ---
 recent_decisions:
+- [2026-10-23] Published v1.0.19 Latest, exact source tag 05b21d8c0dbd1034c6fc6ce7e6d75a3adbf08854; setup SHA256 e7dc95a41b2c98e951d0c56836557445bfe271e6a2eb734caff00f3b5855d576. Keep v1.0.18 assets intact.
 - [2026-10-23] User authorizes new GitHub release for customer updates. Bump to v1.0.19; preserve v1.0.18 assets, tag exact release source, verify installer/latest.yml/blockmap before making Latest. Do not weaken updater verification.
 - [2026-10-23] User accepts unsigned Windows installers and defers Authenticode signing; not a blocker for manual distribution. Warn about SmartScreen/Smart App Control limitations; do not disable Windows security or silently change OTA verification.
 - [2026-10-23] Low-resource mode must not add browser/map caps, RAM waits or launch spacing; preserve user concurrency and proxy/IP rules, retain auxiliary UI/model/idle optimisations. New unsigned local package in output/performance-parallel-20261023.
@@ -19,6 +20,7 @@ recent_decisions:
 - [2026-10-12] Velocity Controller & Verification Worker: VelocityController cross-account cooldown with jitter + ReviewVerificationWorker periodic stealth checks + Review Survival Tracking (migration 008)
 ---
 active_tasks:
+- [x] Publish v1.0.19 GitHub Latest, exact-source tag, checksums, installed upgrade and real public-feed download verified (2026-10-23)
 - [x] Throughput-preserving low-resource mode: no additional browser/map cap or RAM wait; parallel lifecycle, Settings and isolated runtime verified locally (2026-10-23)
 - [x] Regression coverage for Windows smoke temp-path aliases and local packaged verification (2026-10-23)
 - [ ] Real i3/8GB 8-24h soak at user-selected concurrency; investigate any repeated Chrome startup exit

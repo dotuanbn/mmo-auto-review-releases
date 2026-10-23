@@ -8,6 +8,8 @@ Luồng lần này: build local bằng `--publish never`, kiểm tra typecheck/l
 
 Đây là ngoại lệ unsigned có chủ đích cho lần phát hành đã được yêu cầu; không sửa gate ký số mặc định của `release:github`/Windows CI hoặc tắt kiểm tra chữ ký trong updater. Không chạy menu tự bump/tag/publish song song với luồng draft thủ công.
 
+Kết quả đã xác minh: v1.0.19 được publish Latest lúc 2026-10-23 10:32 +07, tag trỏ `05b21d8c0dbd1034c6fc6ce7e6d75a3adbf08854`. Client v1.0.18 dùng feed GitHub thật, không có token, đã tải đúng bộ cài mới; nâng cấp NSIS và kiểm tra cài đặt/dữ liệu thử đã đạt. Xem `docs/releases/v1.0.19.md` và `memory/sessions/2026-10-23-v1.0.19-release.md`. Không thay thế asset v1.0.18.
+
 ## 0) Phạm vi ký số — cập nhật 2026-10-23
 
 - Theo yêu cầu của chủ dự án, tạm gác Authenticode signing và chấp nhận bộ cài Windows unsigned để phân phối thủ công. Thiếu chứng thư không chặn việc phát triển hoặc đóng gói unsigned; không đồng nghĩa đã đạt QA trên máy khách.
@@ -15,8 +17,8 @@ Luồng lần này: build local bằng `--publish never`, kiểm tra typecheck/l
 - Khách chỉ nên tiếp tục khi nhận đúng bộ cài từ nguồn của dự án và đã kiểm tra thông tin file. Với cảnh báo SmartScreen về ứng dụng chưa được nhận diện, có thể chọn `More info` → `Run anyway` nếu Windows cho phép.
 - Không hứa mọi máy đều có nút tiếp tục: chính sách doanh nghiệp có thể cấm bỏ qua; Smart App Control trên Windows 11 có thể chặn ứng dụng unsigned và không có ngoại lệ cho từng app.
 - Không hướng dẫn tắt Defender/SmartScreen hoặc bỏ qua cảnh báo phát hiện mã độc. Giữ kiểm thử cài đặt/nâng cấp, đối chiếu checksum và kiểm tra tính toàn vẹn.
-- Quyết định này không sửa cơ chế OTA: `release:github` và Windows CI hiện vẫn yêu cầu chữ ký sidecar; không tắt kiểm tra chữ ký cập nhật. Cài thủ công một bộ cài unsigned không chứng minh OTA đã hoạt động.
-- Chưa commit, push hoặc publish theo quyết định này.
+- Quyết định này không sửa cơ chế OTA: `release:github` và Windows CI mặc định vẫn yêu cầu chữ ký sidecar; không tắt kiểm tra chữ ký cập nhật. Cài thủ công một bộ cài unsigned không tự chứng minh OTA; v1.0.19 có thêm bằng chứng tải qua updater thật và nâng cấp thực tế.
+- Giai đoạn chỉ đóng gói local đã được mở rộng bởi yêu cầu publish v1.0.19 của chủ dự án; không coi ghi chú no-publish trước đó là trạng thái hiện tại.
 
 ## 1) Muc tieu
 - May A build/publish version moi len GitHub Releases.
