@@ -263,20 +263,28 @@ describe('LayaAccountHealthService local gates', () => {
     })
 
     it('never loosens a recent-ban cooldown even when Laya says the account is ready', async () => {
-        vi.spyOn(layaService, 'decide').mockResolvedValue(layaDecision({
-            decision: healthDecisionPayload({ grade: 'A', score: 95, readyForTraffic: true, cooldownMs: 0 }),
-            confidence: 0.99,
-            tier: 'laya-choice',
-            reasoning: healthDecisionPayload({ grade: 'A', score: 95, readyForTraffic: true, cooldownMs: 0 }),
-        }))
-        const service = new LayaAccountHealthService()
+        // Pin the clock to cover a ban recorded in the exact evaluation millisecond.
+        const instant = new Date('2026-10-23T03:00:00.000Z')
+        vi.useFakeTimers()
+        vi.setSystemTime(instant)
+        try {
+            vi.spyOn(layaService, 'decide').mockResolvedValue(layaDecision({
+                decision: healthDecisionPayload({ grade: 'A', score: 95, readyForTraffic: true, cooldownMs: 0 }),
+                confidence: 0.99,
+                tier: 'laya-choice',
+                reasoning: healthDecisionPayload({ grade: 'A', score: 95, readyForTraffic: true, cooldownMs: 0 }),
+            }))
+            const service = new LayaAccountHealthService()
 
-        const result = await service.evaluateHealth(accountContext({
-            banCount: 1,
-            lastBanAt: new Date().toISOString(),
-        }))
+            const result = await service.evaluateHealth(accountContext({
+                banCount: 1,
+                lastBanAt: instant.toISOString(),
+            }))
 
-        expect(result.readyForTraffic).toBe(false)
-        expect(result.cooldownMs).toBeGreaterThan(0)
+            expect(result.readyForTraffic).toBe(false)
+            expect(result.cooldownMs).toBe(7 * 24 * 60 * 60 * 1000)
+        } finally {
+            vi.useRealTimers()
+        }
     })
 })

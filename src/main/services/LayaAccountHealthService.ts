@@ -90,7 +90,7 @@ export class LayaAccountHealthService {
     const now = new Date();
     const msSinceBan = now.getTime() - lastBanDate.getTime();
     
-    if (msSinceBan > 0 && msSinceBan < BAN_COOLDOWN_MS) {
+    if (msSinceBan >= 0 && msSinceBan < BAN_COOLDOWN_MS) {
       return BAN_COOLDOWN_MS - msSinceBan;
     }
     
