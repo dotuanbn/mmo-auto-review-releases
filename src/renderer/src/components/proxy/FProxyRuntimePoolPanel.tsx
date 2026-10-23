@@ -156,18 +156,25 @@ function buildCapacityNotice(params: {
     const { mapCount, threads, capacity, waiting, translate } = params
     const tokens = { threads, capacity, maps: mapCount, waiting }
 
-    if (mapCount === 1) {
-        if (threads > 1 && capacity === 1) {
+    // Strict 1 key = 1 browser rule: whenever threads exceed enabled keys (waiting > 0),
+    // warn that concurrent browsers are capped at the number of enabled FProxy keys.
+    if (waiting > 0) {
+        if (mapCount === 1 && capacity === 1) {
             return {
                 tone: 'amber',
                 message: replaceTokens(translate('traffic.fproxyPool.singleMapMultiThreadWarning'), tokens),
             }
         }
-        if (threads === 1) {
-            return {
-                tone: 'emerald',
-                message: replaceTokens(translate('traffic.fproxyPool.singleMapSingleThreadReady'), tokens),
-            }
+        return {
+            tone: 'amber',
+            message: replaceTokens(translate('traffic.fproxyPool.capacityWarning'), tokens),
+        }
+    }
+
+    if (mapCount === 1 && threads === 1) {
+        return {
+            tone: 'emerald',
+            message: replaceTokens(translate('traffic.fproxyPool.singleMapSingleThreadReady'), tokens),
         }
     }
 
@@ -196,13 +203,6 @@ function buildCapacityNotice(params: {
         }
     }
 
-    // No maps selected, or an uncovered 1-map / thread combo: keep the original slot-capacity copy.
-    if (waiting > 0) {
-        return {
-            tone: 'amber',
-            message: replaceTokens(translate('traffic.fproxyPool.capacityWarning'), tokens),
-        }
-    }
     return {
         tone: 'emerald',
         message: replaceTokens(translate('traffic.fproxyPool.capacityReady'), tokens),

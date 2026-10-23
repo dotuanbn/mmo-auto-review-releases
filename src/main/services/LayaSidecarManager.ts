@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createServer } from 'node:net'
+import { freemem } from 'node:os'
 
 export type LayaSidecarState = 'stopped' | 'starting' | 'ready' | 'unavailable' | 'failed'
 
@@ -17,6 +18,7 @@ export type LayaSidecarSpawnOptions = {
     cwd: string
     windowsHide: boolean
     stdio: ['ignore', 'pipe', 'pipe']
+    env?: NodeJS.ProcessEnv
 }
 
 export interface LayaSidecarOptions {
@@ -30,6 +32,7 @@ export interface LayaSidecarOptions {
     allocateLoopbackPort?: () => Promise<number>
     spawnProcess?: (file: string, args: string[], options: LayaSidecarSpawnOptions) => ChildProcess
     fetchHealth?: (url: string, timeoutMs: number) => Promise<unknown>
+    freeMemoryMB?: () => number
 }
 
 const OWNED_SERVICE = 'mmo-laya-sidecar'
@@ -55,6 +58,49 @@ export class LayaSidecarManager {
     private startEpoch = 0
     private startupAbort: AbortController | null = null
     private diagnosticTail = ''
+    private lowResourceMode = false
+    private activeRequests = 0
+    private idleTimer: ReturnType<typeof setTimeout> | null = null
+    private lastInferenceAt = Date.now()
+
+    isLowResourceMode(): boolean { return this.lowResourceMode }
+
+    setLowResourceMode(enabled: boolean): void {
+        if (enabled === this.lowResourceMode) return
+        this.lowResourceMode = enabled
+        this.scheduleIdleStop()
+    }
+
+    beginUse(keepAlive = true): () => void {
+        if (keepAlive) this.lastInferenceAt = Date.now()
+        this.activeRequests += 1
+        this.clearIdleTimer()
+        let released = false
+        return () => {
+            if (released) return
+            released = true
+            this.activeRequests -= 1
+            this.scheduleIdleStop()
+        }
+    }
+
+    private clearIdleTimer(): void {
+        if (!this.idleTimer) return
+        clearTimeout(this.idleTimer)
+        this.idleTimer = null
+    }
+
+    private scheduleIdleStop(): void {
+        this.clearIdleTimer()
+        if (!this.lowResourceMode || this.activeRequests > 0 || this.status.state !== 'ready') return
+        this.idleTimer = setTimeout(() => {
+            this.idleTimer = null
+            if (this.lowResourceMode && this.activeRequests === 0) {
+                void this.stop().catch((error: unknown) => console.error('[LayaSidecar] Idle stop failed:', error))
+            }
+        }, Math.max(0, this.lastInferenceAt + 60_000 - Date.now()))
+        this.idleTimer.unref?.()
+    }
 
     constructor(options: LayaSidecarOptions = {}) {
         this.options = {
@@ -83,6 +129,9 @@ export class LayaSidecarManager {
             return this.getStatus()
         }
         if (this.startPromise) return this.startPromise
+        if (this.lowResourceMode && (this.options.freeMemoryMB?.() ?? freemem() / 1048576) < 2048) {
+            return { ...this.getStatus(), state: 'unavailable', error: 'Low-resource mode needs 2 GB free RAM before loading local AI; using existing fallback' }
+        }
         this.startPromise = this.startInternal().finally(() => {
             this.startPromise = null
         })
@@ -90,6 +139,7 @@ export class LayaSidecarManager {
     }
 
     async stop(): Promise<void> {
+        this.clearIdleTimer()
         this.startEpoch += 1
         this.startupAbort?.abort()
         this.status = { state: 'stopped', endpoint: this.endpoint }
@@ -164,6 +214,9 @@ export class LayaSidecarManager {
             cwd: this.options.cwd ?? resolve(executablePath, '..'),
             windowsHide: true,
             stdio: ['ignore', 'pipe', 'pipe'],
+            ...(this.lowResourceMode ? {
+                env: { ...process.env, OMP_NUM_THREADS: '1', MKL_NUM_THREADS: '1', OPENBLAS_NUM_THREADS: '1', TOKENIZERS_PARALLELISM: 'false' },
+            } : {}),
         }
 
         let child: ChildProcess
@@ -237,6 +290,8 @@ export class LayaSidecarManager {
                     return this.getStatus()
                 }
                 this.status = { state: 'ready', endpoint: this.endpoint, executablePath, pid }
+                this.lastInferenceAt = Date.now()
+                this.scheduleIdleStop()
                 return this.getStatus()
             }
             await sleep(POLL_INTERVAL_MS, signal)

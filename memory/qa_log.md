@@ -76,3 +76,21 @@ A: Root cause: FProxy returns two timers. `waiting_time` is rotate countdown (~2
 ## 2026-07-24 [proxy] [ui] [performance]
 Q: Fixed dual-timer bug after live API probe — why did UI show ~29 min rotate?
 A: Live FProxy getcurrent returns waiting_time == time_die (~1781s). getnew returns real waiting_time (~120s) and time_die (~1800s). App previously treated waiting_time literally, so Xoay IP showed ~29 min. Fix: resolveFProxyDeadlines() sanitizes mirrored waiting_time; fetchInitialEndpoint prefers getnew; UI caps rotate display >5 min as ready; visit budget uses rotate window (~2 min) not IP life. Packaged win-unpacked 15:58. Tests: dual-timer 5/5 + pool 17/17 pass. No secrets in docs/memory.
+
+## 2026-10-21 [proxy] [automation] [release]
+Q: Tại sao khi visit chạy xong KPI sớm thì app lại mở luôn visit mới mà không chờ FProxy xoay sang IP mới trên sv1.fproxy.me, và làm sao để đảm bảo đúng quy luật 1 Key = 1 Browser = 1 Visit / 1 IP khi chạy 1 hoặc nhiều Key?
+A: Có 3 nguyên nhân gốc trong code cũ:
+1) `FProxyRuntimePoolPanel` gọi `refreshAll()` ngầm mỗi 30s (`getCurrent`), trong đó `resolveFProxyDeadlines()` sanitize `waiting_time == time_die` thành `rotateAllowedAt = Date.now()`. Khi key vừa đóng browser sau Visit 1 và đang ở trạng thái `cooldown` (`runtime.lease === null`), `refreshSlot()` gọi `acceptEndpoint()` ghi đè `rotateAllowedAt` về `Date.now()`, làm mất bộ đếm chờ xoay IP.
+2) Khi gọi `getnew` sớm lúc server chưa hết cooldown, FProxy trả về `"Vui lòng chờ X giây"` kèm lại chính IP cũ và `time_die ~ 1745s` (không có trường `data.ip` riêng, IP nằm ở `httpuserpass` host). Code cũ chỉ kiểm tra `endpointExpiresAt - now >= minRemaining` nên nhận luôn IP cũ cho Visit 2.
+3) Multi-map từng cho phép 1 key chia sẻ nhiều lease song song (`canShareSlot`) và `drainWaiters()` chỉ kiểm tra `this.waiters[0]` gây head-of-line blocking khi chạy nhiều key.
+Fix (v1.0.18):
+- Bắt buộc `1 Key = 1 Browser = 1 Visit / 1 IP`: gỡ bỏ multi-location slot sharing, clamp `safeThreadCount <= enabledPoolSlotCount`, ghim mỗi luồng `threadIdx` vào `assignedSlotId` riêng, và sửa `drainWaiters()` duyệt độc lập từng waiter.
+- Lưu `lastUsedIp` cho mỗi slot; nếu `getnew` trả về IP trùng `lastUsedIp`, hoặc có cờ `coolingDown` (`"Vui lòng chờ X giây"`), hoặc báo `"WAITING"`, slot cập nhật lại `rotateAllowedAt` và tiếp tục chờ ở trạng thái `cooldown` (browser vẫn đóng) cho tới khi nhận được IP mới thực sự.
+- Sửa `refreshSlot()` không bao giờ ghi đè `rotateAllowedAt` hay xóa `rotationPending` khi slot đang `cooldown`.
+- Đã cập nhật `release/win-unpacked/MMO Auto Review.exe` và publish OTA `v1.0.18` lên `dotuanbn/mmo-auto-review-releases` (68 test files / 1031 tests pass).
+
+## 2026-10-23 [performance] [concurrency] [local-only]
+Q: Bật tiết kiệm tài nguyên nhưng giữ nguyên số luồng trình duyệt/map song song và không hoãn lượt mới?
+A: Đã bỏ cap một phiên, RAM admission wait, launch spacing và giảm luồng/nhường lượt do low-resource mode trong Traffic, Automation và worker nền. Giữ cấu hình người dùng, proxy/IP, khóa profile và lịch nghiệp vụ. Giữ tối ưu UI/log, viewport, AI nhàn rỗi và thu hồi Chrome thực sự không còn người dùng.
+Verification: typecheck main/renderer, lint, Vite build đạt; 71 test files / 1065 pass + 1 POSIX skip; packaged smoke 25/25; 153 vòng Chrome thật với 3 context song song, 7/7 gates đạt. Báo cáo: output/performance-parallel-unit-20261023.json và output/performance-soak/2026-10-23T01-40-04-624Z/result.json. Một lần Chrome thoát khi khởi động chưa tái hiện/nguyên nhân chưa rõ, giữ báo cáo lỗi riêng. Đây là thử ngắn trên i7/16GB với RAM tiêm/CPU CDP, chưa chứng minh i3 chạy cả ngày.
+Artifact: output/performance-parallel-20261023/MMO-Auto-Review-Setup-1.0.18.exe (NotSigned, local only, chưa cài/nâng cấp hoặc OTA). Xem memory/sessions/2026-10-23-low-resource-parallel.md.

@@ -7,6 +7,33 @@ const PORTABLE_DATA_DIR = 'data'
 const STABLE_PACKAGED_DATA_DIR = 'MMO Auto Review'
 const LEGACY_DATA_CANDIDATES = ['mmo-auto-review', 'MMO Auto Review']
 
+/** Canonicalize even a not-yet-created child through its nearest real ancestor. */
+function resolveThroughExistingAncestor(input: string): string {
+    const absolute = resolve(input)
+    let ancestor = absolute
+    const missing: string[] = []
+    while (true) {
+        try {
+            return resolve(realpathSync(ancestor), ...missing)
+        } catch (error: unknown) {
+            if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error
+            const parent = dirname(ancestor)
+            if (parent === ancestor) throw error
+            missing.unshift(ancestor.slice(parent.length).replace(/^[\\/]+/, ''))
+            ancestor = parent
+        }
+    }
+}
+
+function pathIsWithin(parent: string, child: string): boolean {
+    const normalize = (value: string) => process.platform === 'win32'
+        ? value.toLowerCase().replace(/\\/g, '/')
+        : value
+    const root = normalize(parent).replace(/\/$/, '')
+    const candidate = normalize(child)
+    return candidate === root || candidate.startsWith(root + '/')
+}
+
 export function resolveSmokeDataRootOverride(
     env: NodeJS.ProcessEnv = process.env,
     tempPath: string = tmpdir(),
@@ -18,24 +45,11 @@ export function resolveSmokeDataRootOverride(
         throw new Error('MMO_SMOKE_MODE requires SMOKE_USER_DATA_DIR')
     }
 
-    const getRealPath = (p: string): string => {
-        try {
-            return realpathSync(p)
-        } catch {
-            return resolve(p)
-        }
-    }
-
-    const realTemp = getRealPath(tempPath)
-    const allowedRoot = resolve(realTemp, 'mmo-packaged-smoke')
-    const candidate = resolve(requested)
-    const realCandidate = getRealPath(candidate)
-
-    const parentPath = allowedRoot.toLowerCase().replace(/\\/g, '/')
-    const childPath = realCandidate.toLowerCase().replace(/\\/g, '/')
-    const isContained = childPath === parentPath || childPath.startsWith(parentPath + '/')
-
-    if (!isContained) {
+    if (!isAbsolute(requested)) throw new Error('Smoke userData must be an absolute path')
+    const realTemp = resolveThroughExistingAncestor(tempPath)
+    const allowedRoot = resolveThroughExistingAncestor(join(realTemp, 'mmo-packaged-smoke'))
+    const realCandidate = resolveThroughExistingAncestor(requested)
+    if (!pathIsWithin(realTemp, allowedRoot) || !pathIsWithin(allowedRoot, realCandidate)) {
         throw new Error('Smoke userData must be under the OS temp mmo-packaged-smoke root')
     }
     return realCandidate

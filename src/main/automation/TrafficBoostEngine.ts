@@ -31,6 +31,7 @@ import { getRuntimeLogger } from '../utils/runtimeLogger'
 import { miniRagService } from '../services/MiniRagService'
 import { windowTilingService } from '../services/WindowTilingService'
 import { systemResourceDetector } from '../services/SystemResourceDetector'
+import { BrowserResourceWaitError } from '../services/BrowserResourceGovernor'
 import { classifyTrafficFailure } from './TrafficFailureClassifier'
 import {
     normalizeWebSeoTargetUrl,
@@ -1028,18 +1029,33 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
         systemResourceDetector.logCurrentStats()
         const systemRecs = systemResourceDetector.getRecommendations()
         const globalSettings = loadSettings()
-        const maxGlobalBrowsers = globalSettings.maxConcurrentBrowsers ?? 3
-        let safeThreadCount = Math.min(maxGlobalBrowsers, Math.max(1, Math.floor(Number(campaign.threadsCount || 1))))
+        const configuredMaxBrowsers = globalSettings.maxConcurrentBrowsers ?? 3
 
         // Load proxy runtime settings from a single source of truth
         const runtimeProxySettings = this.applyRuntimeProxySettings()
         const proxyEnabled = runtimeProxySettings.proxyEnabled
-        const fproxyPoolSnapshot = await fproxyPoolService.getSnapshot()
-        const enabledPoolSlotCount = fproxyPoolSnapshot.slots.filter(
+        let fproxyPoolSnapshot = await fproxyPoolService.getSnapshot()
+        let enabledPoolSlots = fproxyPoolSnapshot.slots.filter(
             slot => slot.enabled && slot.hasSecret,
-        ).length
+        )
+        if (proxyEnabled && enabledPoolSlots.length === 0 && runtimeProxySettings.fproxyApiKey) {
+            try {
+                await fproxyPoolService.upsertLegacyApiKey(runtimeProxySettings.fproxyApiKey)
+                fproxyPoolSnapshot = await fproxyPoolService.getSnapshot()
+                enabledPoolSlots = fproxyPoolSnapshot.slots.filter(
+                    slot => slot.enabled && slot.hasSecret,
+                )
+            } catch {
+                // Keep legacy single-key fallback if pool DB write fails
+            }
+        }
+        const enabledPoolSlotCount = enabledPoolSlots.length
         const fproxyPoolEnabled = proxyEnabled && enabledPoolSlotCount > 0
         const strictFproxyPool = fproxyPoolEnabled && fproxyPoolSnapshot.policy.strictUnique
+        const maxGlobalBrowsers = fproxyPoolEnabled
+            ? Math.max(configuredMaxBrowsers, Math.min(10, enabledPoolSlotCount))
+            : configuredMaxBrowsers
+        let safeThreadCount = Math.min(maxGlobalBrowsers, Math.max(1, Math.floor(Number(campaign.threadsCount || 1))))
         this.networkState = await networkOrchestrator.resolveEffectiveMode()
         if (proxyEnabled && runtimeProxySettings.fproxyApiKey && !fproxyService.getApiKey()) {
             fproxyService.setApiKey(runtimeProxySettings.fproxyApiKey)
@@ -1149,24 +1165,21 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
         // web_seo needs logged-in/profile exclusivity, so threads cannot exceed usable accounts.
         // maps traffic (direct/organic/map_search) is multi-IP: concurrent visits are OK even with 1 account.
         const mapsMultiIpTraffic = campaign.trafficMode !== 'web_seo'
-        if (strictFproxyPool) {
+        if (fproxyPoolEnabled) {
             const beforeThreads = safeThreadCount
-            // Multi-map maps traffic: one enabled FProxy key can cover several maps
-            // concurrently (one location per worker). Single-map and web_seo stay
-            // capped at the number of enabled pool slots.
-            if (mapsMultiIpTraffic && locationIds.length > 1) {
-                safeThreadCount = Math.min(safeThreadCount, locationIds.length * enabledPoolSlotCount)
-            } else {
-                safeThreadCount = Math.min(safeThreadCount, enabledPoolSlotCount)
-            }
+            // Strict 1 key = 1 browser rule: each enabled FProxy key manages its own
+            // single browser lifecycle and cannot open more than 1 concurrent browser.
+            safeThreadCount = Math.min(safeThreadCount, enabledPoolSlotCount)
             if (safeThreadCount !== beforeThreads) {
                 console.log(
-                    '[TrafficBoost] FProxy strict pool capacity clamp threads ' +
+                    '[TrafficBoost] FProxy 1-key-per-browser clamp threads ' +
                     beforeThreads + ' -> ' + safeThreadCount +
                     ' (enabledSlots=' + enabledPoolSlotCount +
                     ', maps=' + locationIds.length + ')',
                 )
             }
+        } else if (proxyEnabled && fproxyService.getApiKey()) {
+            safeThreadCount = 1
         }
         if (campaign.trafficMode === 'web_seo' && usableAccountCount > 0) {
             safeThreadCount = Math.min(safeThreadCount, usableAccountCount)
@@ -1344,6 +1357,9 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
 
                 for (let t = 0; t < safeThreadCount; t++) {
                     const threadIdx = t
+                    const assignedSlotId = fproxyPoolEnabled
+                        ? enabledPoolSlots[threadIdx % enabledPoolSlots.length]?.id
+                        : undefined
                     threadPromises.push((async () => {
                         try {
                             // Stagger thread starts to prevent huge RAM spikes on low spec PCs
@@ -1452,13 +1468,18 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                     riskType: 'campaign_step',
                                 }
 
-                            // Update thread detail
+                            const waitingForProxySync = proxyEnabled && (
+                                fproxyPoolEnabled
+                                || (Boolean(fproxyService.getApiKey()) && fproxyService.isAutoRotateActive())
+                            )
+
+                            // Update thread detail (keep status='waiting' until key rotation is ready and browser opens)
                             this.threadDetails[threadIdx] = {
                                 id: threadIdx,
                                 accountEmail,
                                 locationName,
-                                status: 'visiting',
-                                currentAction: 'Opening browser...',
+                                status: waitingForProxySync ? 'waiting' : 'visiting',
+                                currentAction: waitingForProxySync ? 'Syncing FProxy rotation...' : 'Opening browser...',
                                 currentUrl: '',
                                 progress: 0,
                             }
@@ -1469,11 +1490,12 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                 completedVisits,
                                 totalVisits,
                                 failedVisits,
-                                message: `Thread ${threadIdx + 1}: Visiting ${locationName}`,
+                                message: waitingForProxySync
+                                    ? `Thread ${threadIdx + 1}: Syncing FProxy key for ${locationName}`
+                                    : `Thread ${threadIdx + 1}: Visiting ${locationName}`,
                             }))
 
-                            // === Proxy Countdown Sync (v1.0.11 classic): wait by server waiting_time before visit ===
-                            // Multi-key pool uses the same UX/timer contract as single-key FProxyService.proxyDieAt.
+                            // === Proxy Countdown Sync (1 key = 1 browser = 1 visit per IP): wait by server waiting_time before visit ===
                             let preSyncedAvailableMs: number | null = null
                             if (proxyEnabled && fproxyPoolEnabled) {
                                 const proxyIntervalSec = 120
@@ -1486,7 +1508,7 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                         const match = /(\d+)s remaining/i.exec(msg)
                                         const leftSec = match ? Number(match[1]) : 0
                                         this.setThreadProxyTiming(threadIdx, {
-                                            status: leftSec > 0 ? 'waiting' : 'waiting',
+                                            status: 'waiting',
                                             proxyRotateAt: leftSec > 0 ? Date.now() + leftSec * 1000 : Date.now(),
                                             proxyIpExpiresAt: null,
                                             visitSoftDeadlineAt: null,
@@ -1506,6 +1528,7 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                     },
                                     undefined,
                                     task.location.id,
+                                    assignedSlotId,
                                 )
                                 preSyncedAvailableMs = waitResult.availableMs
                                 if (this.shouldStop || preSyncedAvailableMs <= 0) {
@@ -1694,6 +1717,9 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                 }
                                 await fproxyLease?.release(reason)
                                 fproxyLease = null
+                                if (usedProxyThisVisit && !fproxyPoolEnabled && fproxyService.getApiKey()) {
+                                    fproxyService.markVisitCompleted()
+                                }
                             }
 
                             // Acquire FProxy BEFORE visit watchdog so cooldown wait is not counted as visit time.
@@ -1724,17 +1750,21 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                  if (fproxyPoolEnabled) {
                                      const acquireController = new AbortController()
                                      this.proxyAcquireControllers.add(acquireController)
-                                     // Wait until a free FProxy key is past cooldown and has a fresh IP window.
-                                     // Prefer the earliest-ready slot (fair ranking inside pool service).
+                                     // Wait until this worker's assigned FProxy key is past cooldown and has rotated to a fresh IP.
                                      const snap = await fproxyPoolService.getSnapshot().catch(() => null)
                                      const nowMs = Date.now()
-                                     const freeSlots = (snap?.slots || []).filter(s =>
-                                         s.enabled && s.hasSecret && s.status !== 'leased' && s.status !== 'disabled'
-                                     )
-                                     const nextReadyAt = freeSlots
+                                     const pinnedSlotSnap = typeof assignedSlotId === 'number'
+                                         ? (snap?.slots || []).find(s => s.id === assignedSlotId)
+                                         : undefined
+                                     const candidateSlots = pinnedSlotSnap
+                                         ? [pinnedSlotSnap]
+                                         : (snap?.slots || []).filter(s =>
+                                             s.enabled && s.hasSecret && s.status !== 'leased' && s.status !== 'disabled'
+                                         )
+                                     const nextReadyAt = candidateSlots
                                          .map(s => s.cooldownUntil || s.nextRotateAt || 0)
                                          .filter((v): v is number => typeof v === 'number' && v > nowMs)
-                                         .sort((a, b) => a - b)[0] || (nowMs + providerRotateMs)
+                                         .sort((a, b) => a - b)[0] || nowMs
                                      const waitSec = Math.max(0, Math.ceil((nextReadyAt - nowMs) / 1000))
                                      this.setThreadProxyTiming(threadIdx, {
                                          status: 'waiting',
@@ -1749,26 +1779,38 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                              : 'Dang lay IP FProxy moi',
                                      })
 
-                                     // Keep UI ticking while waiting for acquire (cooldown may be up to ~2 min).
+                                     // Keep UI ticking while waiting for acquire (including server-reported cooldown updates).
                                      const waitTicker = setInterval(() => {
                                          if (this.shouldStop) return
-                                         const cur = this.threadDetails[threadIdx]
-                                         const until = cur?.proxyRotateAt
-                                         if (!until) return
-                                         const left = Math.max(0, Math.ceil((until - Date.now()) / 1000))
-                                         const timingLabel = left > 0
-                                             ? `Cho xoay IP ${this.formatProxyCountdown(left)}`
-                                             : 'Dang lay IP moi'
-                                         const action = left > 0
-                                             ? `Cho key san sang (xoay IP con ${this.formatProxyCountdown(left)})`
-                                             : 'Dang lay IP FProxy moi'
-                                         if (cur.currentAction !== action || cur.timingLabel !== timingLabel) {
-                                             this.setThreadProxyTiming(threadIdx, {
-                                                 status: 'waiting',
-                                                 timingLabel,
-                                                 action,
-                                             })
-                                         }
+                                         void fproxyPoolService.getSnapshot().then((liveSnap) => {
+                                             if (this.shouldStop) return
+                                             const cur = this.threadDetails[threadIdx]
+                                             if (!cur || cur.status !== 'waiting') return
+                                             const liveSlot = typeof assignedSlotId === 'number'
+                                                 ? liveSnap.slots.find(s => s.id === assignedSlotId)
+                                                 : undefined
+                                             const liveRotateAt = liveSlot
+                                                 ? (liveSlot.cooldownUntil || liveSlot.nextRotateAt || null)
+                                                 : null
+                                             const until = (liveRotateAt && liveRotateAt > Date.now())
+                                                 ? liveRotateAt
+                                                 : cur.proxyRotateAt
+                                             const left = until ? Math.max(0, Math.ceil((until - Date.now()) / 1000)) : 0
+                                             const timingLabel = left > 0
+                                                 ? `Cho xoay IP ${this.formatProxyCountdown(left)}`
+                                                 : 'Dang lay IP moi'
+                                             const action = left > 0
+                                                 ? `Cho key san sang (xoay IP con ${this.formatProxyCountdown(left)})`
+                                                 : 'Dang lay IP FProxy moi'
+                                             if (cur.currentAction !== action || cur.timingLabel !== timingLabel || cur.proxyRotateAt !== until) {
+                                                 this.setThreadProxyTiming(threadIdx, {
+                                                     status: 'waiting',
+                                                     proxyRotateAt: until ?? null,
+                                                     timingLabel,
+                                                     action,
+                                                 })
+                                             }
+                                         }).catch(() => {})
                                      }, 1000)
 
                                      try {
@@ -1785,6 +1827,7 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                                  threadId: threadIdx,
                                                  locationId: task.location.id,
                                              },
+                                             slotId: assignedSlotId,
                                              // Wait through full provider cooldown if needed (rotate ~2 min + buffer).
                                              timeoutMs: Math.max(180_000, providerRotateMs + 90_000),
                                              minRemainingMs: minRemainingForVisit,
@@ -1944,25 +1987,37 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
 
                                 // Config: pass profilePath (when present) so create* decides persistent vs ephemeral.
                                 const config: BrowserConfig = {
+                                    shouldAbort: () => this.shouldStop || this.paused || watchdogTriggered || shouldStopForVisitBudget() || Boolean(fproxyLease?.signal.aborted),
                                     headless: globalSettings.headless ?? false,
                                     proxy: proxyConfig,
                                     ...(profilePath ? { profilePath } : {}),
                                 }
 
-                                // Update thread detail with proxy info
+                                // Update thread detail with proxy info and mark browser opening now that fresh IP is ready
                                 this.threadDetails[threadIdx] = {
                                     ...this.threadDetails[threadIdx],
+                                    status: 'visiting',
+                                    currentAction: 'Opening browser...',
                                     proxyInfo: proxyInfoStr,
                                 }
+                                this.sendStatus(this.buildStatus({
+                                    campaignName: campaign.name,
+                                    currentRound,
+                                    completedVisits,
+                                    totalVisits,
+                                    failedVisits,
+                                    message: `Thread ${threadIdx + 1}: Visiting ${locationName}`,
+                                }))
 
                                 // Call createContext (if profilePath healed for account) else createEphemeralContext. Matches BrowserConfig.profilePath contract.
                                 contextId = await pRetry(
                                     async () => {
+                                        const attemptConfig = { ...config }
                                         try {
                                             if (profilePath) {
-                                                return await browserService.createContext(config)
+                                                return await browserService.createContext(attemptConfig)
                                             } else {
-                                                return await browserService.createEphemeralContext(config)
+                                                return await browserService.createEphemeralContext(attemptConfig)
                                             }
                                         } catch (error) {
                                             if (isBrowserContextClosedError(error)) {
@@ -2844,6 +2899,10 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                 await recycleVisitContext(
                                     watchdogTriggered ? 'watchdog_timeout' : 'visit_end',
                                 )
+                                if (error instanceof BrowserResourceWaitError) {
+                                    await trafficVisitQueue.deferRunningVisit(task.durableVisitId)
+                                    return
+                                }
                                 const errMsg = sanitizeErrorDetail(error)
                                 const errStack = error instanceof Error ? (error.stack || '') : ''
                                 console.error(`[TrafficBoost] Visit failed:`, errMsg)
@@ -3040,6 +3099,10 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                             }
                             await this.waitWhilePaused()
                                 }).catch(async (queueError: unknown) => {
+                                    if (queueError instanceof BrowserResourceWaitError) {
+                                        await trafficVisitQueue.deferRunningVisit(task.durableVisitId)
+                                        return
+                                    }
                                     console.error(`[TrafficBoost] Thread ${threadIdx + 1}: queue task crashed`, sanitizeErrorDetail(queueError))
                                     try {
                                         await trafficVisitQueue.failVisit(

@@ -14,6 +14,7 @@ import { jobQueue, Job, type JobTransitionResult } from './JobQueue'
 import { accountService } from '../services/AccountService'
 import { reviewRecoveryService } from './ReviewRecoveryService'
 import { browserService } from './BrowserService'
+import { BrowserResourceWaitError } from '../services/BrowserResourceGovernor'
 import { googleAuthHandler } from './GoogleAuthHandler'
 import { googleMapsReviewHandler } from './GoogleMapsReviewHandler'
 import { proxyService } from '../services/ProxyService'
@@ -1126,6 +1127,7 @@ class AutomationController {
             logToFile(`[Thread ${thread.id}] Profile: ${profilePath}`)
 
             const browserConfig = {
+                shouldAbort: () => this.isAbortRequested() || Boolean(proxyLease?.signal.aborted),
                 viewport: globalSettings.randomizeViewport ? browserService.getRandomViewport() : { width: 1366, height: 768 },
                 userAgent: globalSettings.randomizeUserAgent ? browserService.getRandomUserAgent() : undefined,
                 headless: globalSettings.headless ?? false,
@@ -1268,6 +1270,11 @@ class AutomationController {
             )
 
         } catch (error) {
+            if (error instanceof BrowserResourceWaitError) {
+                await jobQueue.deferRunningJob(job.id)
+                logToFile(`[Thread ${thread.id}] Job ${job.id} deferred while waiting for PC resources`)
+                return
+            }
             logToFile(`[Thread ${thread.id}] ERROR: Job ${job.id} failed: ${error instanceof Error ? error.stack || error.message : JSON.stringify(error)}`)
             thread.lastError = error instanceof Error ? error.message : 'Unknown error'
             // Only the claim owner can fail a running job; terminal/cancel wins over stale fail

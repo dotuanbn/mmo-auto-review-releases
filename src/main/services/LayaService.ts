@@ -58,6 +58,9 @@ export class LayaService {
 
     /** GET /models with round-trip timing. Offline when the owned sidecar is not ready. */
     async healthCheck(): Promise<LayaHealthStatus> {
+        if (layaSidecarManager.isLowResourceMode() && layaSidecarManager.getStatus().state !== 'ready') {
+            return { ...OFFLINE_HEALTH, latencyMs: 0 }
+        }
         const startedAt = Date.now()
         try {
             const body = await this.getJson('/models')
@@ -110,20 +113,26 @@ export class LayaService {
     }
 
     private async getJson(path: string): Promise<unknown> {
-        const response = await this.request(path, {
-            method: 'GET',
-            headers: { Accept: 'application/json' },
-        })
-        return readJson(response)
+        const release = layaSidecarManager.beginUse(false)
+        try {
+            const response = await this.request(path, {
+                method: 'GET',
+                headers: { Accept: 'application/json' },
+            })
+            return await readJson(response)
+        } finally { release() }
     }
 
     private async postJson(path: string, body: unknown): Promise<unknown> {
-        const response = await this.request(path, {
-            method: 'POST',
-            headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        })
-        return readJson(response)
+        const release = layaSidecarManager.beginUse()
+        try {
+            const response = await this.request(path, {
+                method: 'POST',
+                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            })
+            return await readJson(response)
+        } finally { release() }
     }
 
     private async request(path: string, init: RequestInit): Promise<Response> {

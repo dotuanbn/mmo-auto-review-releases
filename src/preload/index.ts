@@ -36,6 +36,7 @@ import type {
 } from '../shared/automation-contracts'
 import type { SettingsKey } from '../shared/ipc-schemas'
 import type { SettingsRecord, SettingsValue } from '../shared/types'
+import type { PerformanceSnapshot } from '../shared/performance-contracts'
 import type {
     CaptchaMetricsResetResult,
     CaptchaMetricsSnapshot,
@@ -295,6 +296,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
         saveAll: (settings: Partial<Record<SettingsKey, SettingsValue>>) =>
             ipcRenderer.invoke('settings:saveAll', settings) as Promise<SettingsRecord>,
         resetDefaults: () => ipcRenderer.invoke('settings:resetDefaults') as Promise<SettingsRecord>,
+    },
+
+    performance: {
+        getStatus: () => ipcRenderer.invoke('performance:getStatus') as Promise<PerformanceSnapshot>,
+        onChanged: (callback: (enabled: boolean) => void) => {
+            const handler = (_event: Electron.IpcRendererEvent, enabled: boolean) => callback(enabled)
+            ipcRenderer.on('performance:changed', handler)
+            return () => ipcRenderer.removeListener('performance:changed', handler)
+        },
     },
 
     // Analytics (Google Analytics + Search Console + GBP Scraping)
@@ -860,6 +870,10 @@ declare global {
                 saveAll: (settings: Partial<Record<SettingsKey, SettingsValue>>) =>
                     Promise<SettingsRecord>
                 resetDefaults: () => Promise<SettingsRecord>
+            }
+            performance: {
+                getStatus: () => Promise<PerformanceSnapshot>
+                onChanged: (callback: (enabled: boolean) => void) => () => void
             }
             automation: {
                 getConfig: () => Promise<AutomationConfigDto | null>

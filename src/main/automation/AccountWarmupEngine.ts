@@ -350,6 +350,7 @@ class AccountWarmupEngine {
             const headless = settings.headless === true
 
             contextId = await browserService.createContext({
+                shouldAbort: () => !this.registry.isLive(session),
                 headless,
                 profilePath,
                 saveProfiles: true,

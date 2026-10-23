@@ -11,6 +11,8 @@ import type {
 const { sidecarMocks } = vi.hoisted(() => ({
     sidecarMocks: {
         ensureRunning: vi.fn(),
+        isLowResourceMode: vi.fn(() => false),
+        release: vi.fn(),
         endpoint: 'http://127.0.0.1:23456',
     },
 }))
@@ -18,6 +20,9 @@ const { sidecarMocks } = vi.hoisted(() => ({
 vi.mock('../../src/main/services/LayaSidecarManager', () => ({
     layaSidecarManager: {
         ensureRunning: (...args: unknown[]) => sidecarMocks.ensureRunning(...args),
+        isLowResourceMode: () => sidecarMocks.isLowResourceMode(),
+        getStatus: () => ({ state: 'stopped' }),
+        beginUse: () => sidecarMocks.release,
         get endpoint() {
             return sidecarMocks.endpoint
         },
@@ -29,6 +34,8 @@ afterEach(() => {
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
     sidecarMocks.ensureRunning.mockReset()
+    sidecarMocks.isLowResourceMode.mockReturnValue(false)
+    sidecarMocks.release.mockClear()
 })
 
 function campaignMetrics(overrides: Partial<CampaignMetricsSnapshot> = {}): CampaignMetricsSnapshot {

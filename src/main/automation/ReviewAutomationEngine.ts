@@ -300,6 +300,7 @@ export class ReviewAutomationEngine {
             const settings = loadSettings()
             // Browser config
             const config: BrowserConfig = {
+                shouldAbort: () => this.shouldStop,
                 headless: settings.headless ?? false,
                 profilePath: account.profilePath,
                 userAgent: settings.randomizeUserAgent ? browserService.getRandomUserAgent() : undefined,

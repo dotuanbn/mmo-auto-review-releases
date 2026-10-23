@@ -1,19 +1,23 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { AppShell } from './components/layout/AppShell'
 import { Dashboard } from './pages/Dashboard'
-import { Accounts } from './pages/Accounts'
-import { Locations } from './pages/Locations'
-import { Campaigns } from './pages/Campaigns'
-import { Traffic } from './pages/Traffic'
-import { History } from './pages/History'
-import { Settings } from './pages/Settings'
-import { ContentManager } from './pages/ContentManager'
-import { Analytics } from './pages/Analytics'
-import { AIHub } from './pages/AIHub'
 import { useForegroundRecovery } from './hooks/useForegroundRecovery'
 import { type Page } from './app/navigation'
+import { useTranslation } from './i18n'
+
+// Load tools only when opened, reducing startup parsing and retained UI modules.
+const Accounts = lazy(() => import('./pages/Accounts').then(module => ({ default: module.Accounts })))
+const Locations = lazy(() => import('./pages/Locations').then(module => ({ default: module.Locations })))
+const Campaigns = lazy(() => import('./pages/Campaigns').then(module => ({ default: module.Campaigns })))
+const Traffic = lazy(() => import('./pages/Traffic').then(module => ({ default: module.Traffic })))
+const History = lazy(() => import('./pages/History').then(module => ({ default: module.History })))
+const Settings = lazy(() => import('./pages/Settings').then(module => ({ default: module.Settings })))
+const ContentManager = lazy(() => import('./pages/ContentManager').then(module => ({ default: module.ContentManager })))
+const Analytics = lazy(() => import('./pages/Analytics').then(module => ({ default: module.Analytics })))
+const AIHub = lazy(() => import('./pages/AIHub').then(module => ({ default: module.AIHub })))
 
 function App() {
+    const { t } = useTranslation()
     const [currentPage, setCurrentPage] = useState<Page>('dashboard')
     useForegroundRecovery()
 
@@ -65,7 +69,9 @@ function App() {
 
     return (
         <AppShell currentPage={currentPage} onPageChange={setCurrentPage}>
-            {renderPage()}
+            <Suspense fallback={<div className="p-6 text-sm" role="status">{t('common.loading')}</div>}>
+                {renderPage()}
+            </Suspense>
         </AppShell>
     )
 }

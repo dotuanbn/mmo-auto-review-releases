@@ -1,4 +1,4 @@
-﻿import * as https from 'https'
+import * as https from 'https'
 import type { IncomingMessage } from 'http'
 import { isIP } from 'net'
 
@@ -40,6 +40,8 @@ export interface FProxyEndpoint {
     rotateAllowedAt: number
     location: string
     receivedAt: number
+    /** True when provider indicated the key is still in rotation cooldown (e.g. "Vui lòng chờ X giây"). */
+    coolingDown?: boolean
 }
 
 export interface FProxyRequestOptions {
@@ -58,6 +60,9 @@ export interface FProxyDeadlineResolution {
 
 type ProviderPayload = {
     success?: unknown
+    message?: unknown
+    error?: unknown
+    waiting_time?: unknown
     data?: unknown
 }
 
@@ -67,12 +72,14 @@ type ProviderData = {
     location: string
     timeDie: string
     waitingTime: string
+    coolingDown: boolean
 }
 
 export class FProxyApiError extends Error {
     constructor(
         public readonly code: FProxyClientErrorCode,
         public readonly retryable: boolean,
+        public readonly retryAfterMs: number | null = null,
     ) {
         super(code)
         this.name = 'FProxyApiError'
@@ -256,26 +263,57 @@ function parseResponse(
     }
 }
 
+function extractCooldownRetryAfterMs(
+    topRecord: Record<string, unknown>,
+    dataRecord: Record<string, unknown> | null,
+    message: string,
+): number | null {
+    const waitingRaw = dataRecord
+        ? readString(dataRecord, 'waiting_time') || readString(topRecord, 'waiting_time')
+        : readString(topRecord, 'waiting_time')
+    const waitingMs = parseDurationMs(waitingRaw)
+    if (waitingMs !== null && waitingMs > 0) {
+        return Math.min(waitingMs, MAX_TRUSTED_ROTATE_WINDOW_MS)
+    }
+    const secMatch = /(\d+)\s*(?:gi[aâ]y|s\b|sec)/i.exec(message)
+    if (secMatch) {
+        const parsedSec = Number.parseInt(secMatch[1], 10)
+        if (Number.isFinite(parsedSec) && parsedSec > 0) {
+            return Math.min(parsedSec * 1000, MAX_TRUSTED_ROTATE_WINDOW_MS)
+        }
+    }
+    if (/waiting|vui\s*l.*ch|wait/i.test(message)) {
+        return 5_000
+    }
+    return null
+}
+
 function parseProviderPayload(value: unknown): ProviderData {
     if (!isRecord(value)) throw new FProxyApiError('provider_response_invalid', false)
     const payload = value as ProviderPayload
+    const message = readString(value, 'message') || readString(value, 'error')
     if (!isRecord(payload.data)) {
-        throw new FProxyApiError('provider_rejected', true)
+        const retryAfterMs = extractCooldownRetryAfterMs(value, null, message)
+        throw new FProxyApiError('provider_rejected', true, retryAfterMs)
     }
     const data = payload.data
     const httpuserpass = readString(data, 'httpuserpass')
     if (!httpuserpass) {
+        const retryAfterMs = extractCooldownRetryAfterMs(value, data, message)
         throw new FProxyApiError(
-            payload.success === false ? 'provider_rejected' : 'provider_response_invalid',
-            payload.success === false,
+            payload.success === false || retryAfterMs !== null ? 'provider_rejected' : 'provider_response_invalid',
+            payload.success === false || retryAfterMs !== null,
+            retryAfterMs,
         )
     }
+    const coolingDown = /waiting|vui\s*l.*ch|ch.*\d+\s*gi/i.test(message)
     return {
         httpuserpass,
         observedIp: normalizeObservedIp(readString(data, 'ip')),
         location: readString(data, 'location'),
         timeDie: readString(data, 'time_die'),
         waitingTime: readString(data, 'waiting_time'),
+        coolingDown,
     }
 }
 
@@ -283,13 +321,15 @@ function buildEndpoint(data: ProviderData, action: 'getnew' | 'getcurrent'): FPr
     const proxySnapshot = parseProxyCredentials(data.httpuserpass)
     const receivedAt = Date.now()
     const deadlines = resolveFProxyDeadlines(data.timeDie, data.waitingTime, receivedAt, action)
+    const observedIp = data.observedIp || normalizeObservedIp(proxySnapshot.host) || null
     return {
         proxySnapshot,
-        observedIp: data.observedIp || null,
+        observedIp,
         endpointExpiresAt: deadlines.endpointExpiresAt,
         rotateAllowedAt: deadlines.rotateAllowedAt,
         location: data.location,
         receivedAt,
+        ...(data.coolingDown ? { coolingDown: true } : {}),
     }
 }
 

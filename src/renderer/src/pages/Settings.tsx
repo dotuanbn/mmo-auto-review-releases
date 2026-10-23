@@ -47,6 +47,7 @@ import { SETTINGS_KEYS, type SettingsKey } from '../../../shared/ipc-schemas'
 import { CaptchaMetricsPanel } from '../components/captcha'
 import { BackupRestorePanel, ComplianceAuditPanel } from '../components/backup'
 import { FProxyPoolSettings } from '../components/proxy/FProxyPoolSettings'
+import type { PerformanceSnapshot } from '../../../shared/performance-contracts'
 
 interface AppSettings {
     // Browser
@@ -54,6 +55,7 @@ interface AppSettings {
     hideAutomation: boolean
     saveProfiles: boolean
     maxConcurrentBrowsers: number
+    lowResourceMode: boolean
     randomizeUserAgent: boolean
     randomizeViewport: boolean
 
@@ -81,6 +83,11 @@ interface AppSettings {
     restHoursEnd: number
     /** Opt-in only; never auto-on just because Ollama is online */
     enableAgenticReview: boolean
+    enableReviewVerification: boolean
+    enableTimeLocality: boolean
+    enableSmartPhotos: boolean
+    enableAccountHealth: boolean
+    enableHelpfulVotes: boolean
     manualReviewSubmit: boolean
     allowAutoSubmitOnTrustedHosts: boolean
     trustedAutoSubmitHosts: string
@@ -152,6 +159,7 @@ const DEFAULTS: AppSettings = {
     hideAutomation: true,
     saveProfiles: true,
     maxConcurrentBrowsers: 3,
+    lowResourceMode: false,
     randomizeUserAgent: true,
     randomizeViewport: true,
     groqApiKey: '',
@@ -172,6 +180,11 @@ const DEFAULTS: AppSettings = {
     restHoursStart: 23,
     restHoursEnd: 6,
     enableAgenticReview: false,
+    enableReviewVerification: false,
+    enableTimeLocality: true,
+    enableSmartPhotos: true,
+    enableAccountHealth: true,
+    enableHelpfulVotes: false,
     manualReviewSubmit: true,
     allowAutoSubmitOnTrustedHosts: true,
     trustedAutoSubmitHosts: 'localhost,127.0.0.1',
@@ -281,6 +294,26 @@ export function Settings() {
     const [maintenanceBusy, setMaintenanceBusy] = useState(false)
     const [storageInfo, setStorageInfo] = useState<any>(null)
     const [appVersion, setAppVersion] = useState<string>('1.0.6')
+    const [performance, setPerformance] = useState<PerformanceSnapshot | null>(null)
+
+    useEffect(() => {
+        let disposed = false
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const refresh = async () => {
+            try {
+                if (!document.hidden) {
+                    const snapshot = await window.electronAPI.performance.getStatus()
+                    if (!disposed) setPerformance(snapshot)
+                }
+            } catch (error: unknown) {
+                console.error('Failed to load performance status:', error)
+            } finally {
+                if (!disposed) timer = setTimeout(() => void refresh(), 5000)
+            }
+        }
+        void refresh()
+        return () => { disposed = true; if (timer) clearTimeout(timer) }
+    }, [])
 
     useEffect(() => {
         loadSettings()
@@ -612,6 +645,19 @@ export function Settings() {
                 </FormRow>
             </SectionPanel>
 
+            <SectionPanel icon={Cpu} title={t('settings.performanceTitle')} description={t('settings.performanceDesc')} tone="blue">
+                <div data-testid="low-resource-mode">
+                    <FormRow icon={<Cpu className="h-4 w-4 text-emerald-500" />} label={t('settings.lowResourceMode')} description={t('settings.lowResourceModeDesc')}>
+                        <DSToggle label={t('settings.lowResourceMode')} checked={settings.lowResourceMode} onChange={() => update('lowResourceMode', !settings.lowResourceMode)} />
+                    </FormRow>
+                </div>
+                {settings.lowResourceMode && <p className="mt-2 text-sm text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.lowResourceModeNote')}</p>}
+                {performance && <p className="mt-3 text-sm text-[#6f697c] dark:text-[#c8c0d8]" role="status">
+                    {t('settings.performanceRam')}: {(performance.freeMemoryMB / 1024).toFixed(1)} / {(performance.totalMemoryMB / 1024).toFixed(1)} GB · {t('settings.performanceBrowsers')}: {performance.activeContexts}
+                    {performance.memoryPressure && <span className="ml-2 text-amber-600">{t('settings.performanceWaiting')}</span>}
+                </p>}
+            </SectionPanel>
+
             {/* 2. TỰ ĐỘNG HÓA / AUTOMATION (real engine settings only) */}
             <SectionPanel icon={Zap} title={t('settings.automation')} tone="blue">
                 {/* Browser */}
@@ -804,6 +850,24 @@ export function Settings() {
                 </FormRow>
                 <FormRow label={t('settings.restHoursEnd')} description={t('settings.restHoursEndDesc')}>
                     <NumberInput value={settings.restHoursEnd} onChange={(v) => update('restHoursEnd', v)} min={0} max={23} />
+                </FormRow>
+
+                {/* Sprint 3 — Natural Behavior & Background Verification */}
+                <div className="mt-3 mb-2 text-xs font-semibold text-[#6f697c] dark:text-[#c8c0d8] uppercase tracking-wide">{t('settings.sprint3NaturalBehavior')}</div>
+                <FormRow icon={<Clock className="h-4 w-4 text-emerald-500" />} label={t('settings.enableTimeLocality')} description={t('settings.enableTimeLocalityDesc')}>
+                    <DSToggle checked={settings.enableTimeLocality} onChange={() => update('enableTimeLocality', !settings.enableTimeLocality)} />
+                </FormRow>
+                <FormRow icon={<Image className="h-4 w-4 text-blue-500" />} label={t('settings.enableSmartPhotos')} description={t('settings.enableSmartPhotosDesc')}>
+                    <DSToggle checked={settings.enableSmartPhotos} onChange={() => update('enableSmartPhotos', !settings.enableSmartPhotos)} />
+                </FormRow>
+                <FormRow icon={<Gauge className="h-4 w-4 text-amber-500" />} label={t('settings.enableAccountHealth')} description={t('settings.enableAccountHealthDesc')}>
+                    <DSToggle checked={settings.enableAccountHealth} onChange={() => update('enableAccountHealth', !settings.enableAccountHealth)} />
+                </FormRow>
+                <FormRow icon={<Star className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.enableHelpfulVotes')} description={t('settings.enableHelpfulVotesDesc')}>
+                    <DSToggle checked={settings.enableHelpfulVotes} onChange={() => update('enableHelpfulVotes', !settings.enableHelpfulVotes)} />
+                </FormRow>
+                <FormRow icon={<Eye className="h-4 w-4 text-cyan-500" />} label={t('settings.enableReviewVerification')} description={t('settings.enableReviewVerificationDesc')}>
+                    <DSToggle checked={settings.enableReviewVerification} onChange={() => update('enableReviewVerification', !settings.enableReviewVerification)} />
                 </FormRow>
             </SectionPanel>
 

@@ -166,6 +166,7 @@ export class HelpfulVoteWorker {
         let contextId: number | undefined
         try {
             contextId = await browserService.createContext({
+                shouldAbort: () => this.processing && !this.enabled,
                 headless: true,
                 cleanProfileOnStart: true,
             })

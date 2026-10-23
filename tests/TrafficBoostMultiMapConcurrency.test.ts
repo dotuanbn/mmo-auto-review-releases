@@ -40,6 +40,8 @@ import {
 import {
     FProxyPoolError,
     FProxyPoolService,
+    type FProxyLease,
+    type FProxyLeaseRequest,
 } from '../src/main/services/FProxyPoolService'
 import type { FProxyLeaseOwnerDto } from '../src/shared/fproxy-pool-contracts'
 import {
@@ -307,7 +309,7 @@ describe('TrafficVisitQueue — disallowRunningLocations', () => {
     })
 })
 
-describe('FProxyPoolService — one slot shared across locationIds', () => {
+describe('FProxyPoolService — strict 1 key = 1 browser = 1 unique IP per visit', () => {
     let db: FakeFProxyDatabase
     let provider: FakeFProxyProvider
     let pool: FProxyPoolService
@@ -320,57 +322,29 @@ describe('FProxyPoolService — one slot shared across locationIds', () => {
     })
 
     async function addSingleSlot(): Promise<void> {
-        await pool.addSlot({ label: 'Shared Slot', apiKey: PROXY_KEY })
+        await pool.addSlot({ label: 'Slot 1', apiKey: PROXY_KEY })
     }
 
-    it('issues concurrent leases on one slot for distinct locationIds and reuses the same egress IP', async () => {
+    it('never shares a single slot concurrently across distinct locationIds; second visit waits for rotation to a new IP', async () => {
         await addSingleSlot()
         provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(1, {
             observedIp: '203.0.113.10',
             rotateAllowedAt: Date.now() - 1,
         }))
-
-        const [leaseA, leaseB, leaseC] = await Promise.all([
-            pool.acquire({ owner: trafficOwner('campaign-1:loc-10:t0', 0, 10) }),
-            pool.acquire({ owner: trafficOwner('campaign-1:loc-20:t1', 1, 20) }),
-            pool.acquire({ owner: trafficOwner('campaign-1:loc-30:t2', 2, 30) }),
-        ])
-
-        expect(new Set([leaseA.slotId, leaseB.slotId, leaseC.slotId]).size).toBe(1)
-        expect(leaseA.observedIp).toBe('203.0.113.10')
-        expect(leaseB.observedIp).toBe(leaseA.observedIp)
-        expect(leaseC.observedIp).toBe(leaseA.observedIp)
-        expect(new Set([leaseA.leaseId, leaseB.leaseId, leaseC.leaseId]).size).toBe(3)
-        expect(leaseB.generation).toBe(leaseA.generation)
-        expect(leaseC.generation).toBe(leaseA.generation)
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
-        expect(provider.countCalls(PROXY_KEY, 'current')).toBe(0)
-
-        const snapshot = await pool.getSnapshot()
-        expect(snapshot.slots).toHaveLength(1)
-        expect(snapshot.slots[0]?.status).toBe('leased')
-        expect(snapshot.slots[0]?.available).toBe(false)
-        expect(snapshot.slots[0]?.currentEgress?.ip).toBe('203.0.113.10')
-        expect(snapshot.slots[0]?.activeLocationIds?.slice().sort((a, b) => a - b)).toEqual([10, 20, 30])
-
-        await Promise.all([leaseA.release('done'), leaseB.release('done'), leaseC.release('done')])
-    })
-
-    it('waits then times out when the same locationId already holds a lease on the only slot', async () => {
-        await addSingleSlot()
         provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(2, {
             observedIp: '203.0.113.20',
             rotateAllowedAt: Date.now() - 1,
         }))
 
-        const held = await pool.acquire({
+        const leaseA = await pool.acquire({
             owner: trafficOwner('campaign-1:loc-10:t0', 0, 10),
         })
+        expect(leaseA.observedIp).toBe('203.0.113.10')
 
         let secondResolved = false
-        const waiting = pool.acquire({
-            owner: trafficOwner('campaign-1:loc-10:t1', 1, 10),
-            timeoutMs: 1_000,
+        const secondPromise = pool.acquire({
+            owner: trafficOwner('campaign-1:loc-20:t1', 1, 20),
+            timeoutMs: 3_000,
         }).then(lease => {
             secondResolved = true
             return lease
@@ -378,147 +352,201 @@ describe('FProxyPoolService — one slot shared across locationIds', () => {
 
         await delay(40)
         expect(secondResolved).toBe(false)
-        await expect(waiting).rejects.toBeInstanceOf(FProxyPoolError)
-        await expect(
-            pool.acquire({
-                owner: trafficOwner('campaign-1:loc-10:t2', 2, 10),
-                timeoutMs: 1_000,
-            }),
-        ).rejects.toMatchObject({ code: 'no_slot_available' })
 
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
-        const snapshot = await pool.getSnapshot()
-        expect(snapshot.slots[0]?.activeLocationIds).toEqual([10])
-        expect(secondResolved).toBe(false)
+        const snapshotWhileLeased = await pool.getSnapshot()
+        expect(snapshotWhileLeased.slots[0]?.status).toBe('leased')
+        expect(snapshotWhileLeased.slots[0]?.activeLocationIds).toEqual([10])
 
-        await held.release('done')
+        await leaseA.release('visit_1_done')
+        const leaseB = await secondPromise
+        expect(secondResolved).toBe(true)
+        expect(leaseB.slotId).toBe(leaseA.slotId)
+        expect(leaseB.observedIp).toBe('203.0.113.20')
+        expect(leaseB.observedIp).not.toBe(leaseA.observedIp)
+        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(2)
+
+        await leaseB.release('visit_2_done')
     })
 
-    it('lets a waiting same-location acquire proceed once that locationId is free, without rotating while another location still holds the slot', async () => {
+    it('waits for server cooldown (waiting_time) when a visit completes early before opening the next visit', async () => {
         await addSingleSlot()
-        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(3, {
-            observedIp: '203.0.113.30',
-            rotateAllowedAt: Date.now() - 1,
+        const cooldownEnd = Date.now() + 120
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(1, {
+            observedIp: '203.0.113.11',
+            rotateAllowedAt: cooldownEnd,
+        }))
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(2, {
+            observedIp: '203.0.113.22',
+            rotateAllowedAt: Date.now() + 120_000,
         }))
 
-        const loc10 = await pool.acquire({
+        const visit1 = await pool.acquire({
             owner: trafficOwner('campaign-1:loc-10:t0', 0, 10),
         })
-        const loc20 = await pool.acquire({
-            owner: trafficOwner('campaign-1:loc-20:t1', 1, 20),
-        })
-        expect(loc10.observedIp).toBe(loc20.observedIp)
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
+        expect(visit1.observedIp).toBe('203.0.113.11')
+        // KPI completes early while key still has cooldown remaining
+        await visit1.release('kpi_done_early')
 
-        let waitingResolved = false
-        const waiting = pool.acquire({
-            owner: trafficOwner('campaign-1:loc-10:t2', 2, 10),
-            timeoutMs: 5_000,
+        const afterRelease = await pool.getSnapshot()
+        expect(afterRelease.slots[0]?.status).toBe('cooldown')
+        expect(afterRelease.slots[0]?.available).toBe(false)
+
+        let visit2Started = false
+        const visit2Promise = pool.acquire({
+            owner: trafficOwner('campaign-1:loc-10:t0', 0, 10),
+            slotId: 1,
+            timeoutMs: 3_000,
         }).then(lease => {
-            waitingResolved = true
+            visit2Started = true
             return lease
         })
 
-        await delay(40)
-        expect(waitingResolved).toBe(false)
+        await delay(30)
+        expect(visit2Started).toBe(false)
 
-        await loc10.release('partial_free')
-        const loc10Again = await waiting
-        expect(waitingResolved).toBe(true)
-        expect(loc10Again.slotId).toBe(loc20.slotId)
-        expect(loc10Again.observedIp).toBe('203.0.113.30')
-        expect(loc10Again.leaseId).not.toBe(loc10.leaseId)
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
+        const visit2 = await visit2Promise
+        expect(visit2Started).toBe(true)
+        expect(visit2.observedIp).toBe('203.0.113.22')
+        expect(Date.now()).toBeGreaterThanOrEqual(cooldownEnd - 15)
 
-        const snapshot = await pool.getSnapshot()
-        expect(snapshot.slots[0]?.status).toBe('leased')
-        expect(snapshot.slots[0]?.activeLocationIds?.slice().sort((a, b) => a - b)).toEqual([10, 20])
-
-        await Promise.all([loc20.release('done'), loc10Again.release('done')])
+        await visit2.release('done')
     })
 
-    it('does not rotate on a partial release; last lease release is what arms rotate_per_visit', async () => {
+    it('retries if cooldown elapses between the admission probe and wake scheduling on a busy CPU', async () => {
         await addSingleSlot()
-        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(4, {
-            observedIp: '203.0.113.40',
+        let logicalNow = Date.now()
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => logicalNow)
+        const cooldownEnd = logicalNow + 120
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(1, { rotateAllowedAt: cooldownEnd }))
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(2))
+        const first = await pool.acquire({ owner: trafficOwner('busy-cpu-first', 0, 10) })
+        await first.release('finished')
+        const internal = pool as unknown as { tryAcquire: (request: FProxyLeaseRequest) => Promise<FProxyLease | null> }
+        const originalProbe = internal.tryAcquire.bind(pool)
+        const probe = vi.spyOn(internal, 'tryAcquire').mockImplementationOnce(async request => {
+            const result = await originalProbe(request)
+            // Model CPU starvation during the await boundary, without sleeping the test host.
+            logicalNow = cooldownEnd + 1
+            return result
+        })
+        try {
+            const next = await pool.acquire({ owner: trafficOwner('busy-cpu-next', 0, 10), timeoutMs: 3000 })
+            expect(next.observedIp).toBe('203.0.113.2')
+            expect(provider.countCalls(PROXY_KEY, 'new')).toBe(2)
+            await next.release('done')
+        } finally { probe.mockRestore(); clock.mockRestore() }
+    })
+
+    it('rejects same IP returned by getnew during server cooldown ("Vui lòng chờ") and waits until IP actually rotates', async () => {
+        await addSingleSlot()
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(1, {
+            observedIp: '14.184.172.161',
             rotateAllowedAt: Date.now() - 1,
         }))
+        // Second getnew simulates FProxy returning the same old IP with "Vui lòng chờ" and 80ms remaining
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(1, {
+            observedIp: '14.184.172.161',
+            coolingDown: true,
+            rotateAllowedAt: Date.now() + 80,
+        }))
+        // Third getnew after cooldown expires returns the fresh rotated IP
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(2, {
+            observedIp: '14.184.199.88',
+            rotateAllowedAt: Date.now() + 120_000,
+        }))
 
-        const loc10 = await pool.acquire({
+        const visit1 = await pool.acquire({
             owner: trafficOwner('campaign-1:loc-10:t0', 0, 10),
         })
-        const loc20 = await pool.acquire({
-            owner: trafficOwner('campaign-1:loc-20:t1', 1, 20),
-        })
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
+        expect(visit1.observedIp).toBe('14.184.172.161')
+        await visit1.release('visit_1_done')
 
-        await loc10.release('still_shared')
-        await delay(30)
-
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
-        const afterPartial = await pool.getSnapshot()
-        expect(afterPartial.slots[0]?.status).toBe('leased')
-        expect(afterPartial.slots[0]?.currentEgress?.ip).toBe('203.0.113.40')
-        expect(afterPartial.slots[0]?.activeLocationIds).toEqual([20])
-        expect(loc20.observedIp).toBe('203.0.113.40')
-
-        const loc30 = await pool.acquire({
-            owner: trafficOwner('campaign-1:loc-30:t2', 2, 30),
-        })
-        expect(loc30.observedIp).toBe('203.0.113.40')
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
-
-        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(5, {
-            observedIp: '203.0.113.50',
-            rotateAllowedAt: Date.now() - 1,
-        }))
-
-        await Promise.all([loc20.release('last_wave'), loc30.release('last_wave')])
-        const afterLast = await pool.getSnapshot()
-        expect(afterLast.slots[0]?.status).not.toBe('leased')
-        expect(afterLast.slots[0]?.activeLocationIds ?? []).toEqual([])
-        // Rotation is armed on last release; getNew runs on the next acquire.
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(1)
-
-        const next = await pool.acquire({
-            owner: trafficOwner('campaign-1:loc-40:t3', 3, 40),
+        const visit2 = await pool.acquire({
+            owner: trafficOwner('campaign-1:loc-10:t0', 0, 10),
+            slotId: 1,
             timeoutMs: 3_000,
         })
-        expect(next.observedIp).toBe('203.0.113.50')
-        expect(next.slotId).toBe(loc10.slotId)
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(2)
+        expect(visit2.observedIp).toBe('14.184.199.88')
+        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(3)
 
-        await next.release('done')
+        await visit2.release('visit_2_done')
     })
 
-    it('rotates after the last exclusive lease is released even when a same-location waiter is queued', async () => {
+    it('preserves cooldown countdown across passive refreshAllSlots() (getCurrent mirror) between visits', async () => {
         await addSingleSlot()
-        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(6, {
-            observedIp: '203.0.113.60',
-            rotateAllowedAt: Date.now() - 1,
-        }))
-        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(7, {
-            observedIp: '203.0.113.70',
-            rotateAllowedAt: Date.now() - 1,
+        const rotateTarget = Date.now() + 60_000
+        provider.enqueueEndpoint(PROXY_KEY, 'new', createFakeEndpoint(1, {
+            observedIp: '203.0.113.50',
+            rotateAllowedAt: rotateTarget,
+            endpointExpiresAt: Date.now() + 1_800_000,
         }))
 
-        const first = await pool.acquire({
+        const visit1 = await pool.acquire({
             owner: trafficOwner('campaign-1:loc-10:t0', 0, 10),
         })
-        expect(first.observedIp).toBe('203.0.113.60')
+        await visit1.release('early_finish')
 
-        const waiting = pool.acquire({
-            owner: trafficOwner('campaign-1:loc-10:t1', 1, 10),
+        // Simulate 30s background UI refreshAllSlots() where getCurrent sanitizes mirrored waiting_time to Date.now()
+        provider.enqueueEndpoint(PROXY_KEY, 'current', createFakeEndpoint(1, {
+            observedIp: '203.0.113.50',
+            rotateAllowedAt: Date.now(),
+            endpointExpiresAt: Date.now() + 1_770_000,
+        }))
+        const snapAfterRefresh = await pool.refreshAllSlots()
+        expect(snapAfterRefresh.slots[0]?.status).toBe('cooldown')
+        expect(snapAfterRefresh.slots[0]?.cooldownUntil).toBe(rotateTarget)
+    })
+
+    it('allows 2 keys pinned to 2 threads to rotate and open browsers independently without head-of-line blocking', async () => {
+        const KEY_1 = 'fproxy-key-slot1-1111111111111111111111111'
+        const KEY_2 = 'fproxy-key-slot2-2222222222222222222222222'
+        await pool.addSlot({ label: 'Key 1', apiKey: KEY_1 })
+        await pool.addSlot({ label: 'Key 2', apiKey: KEY_2 })
+
+        // Visit 1 on Key 1 has a long cooldown (60s), Visit 1 on Key 2 has a short cooldown (40ms)
+        provider.enqueueEndpoint(KEY_1, 'new', createFakeEndpoint(1, {
+            observedIp: '203.0.113.101',
+            rotateAllowedAt: Date.now() + 60_000,
+        }))
+        provider.enqueueEndpoint(KEY_2, 'new', createFakeEndpoint(2, {
+            observedIp: '203.0.113.201',
+            rotateAllowedAt: Date.now() + 40,
+        }))
+        provider.enqueueEndpoint(KEY_2, 'new', createFakeEndpoint(3, {
+            observedIp: '203.0.113.202',
+            rotateAllowedAt: Date.now() + 120_000,
+        }))
+
+        const [lease1, lease2] = await Promise.all([
+            pool.acquire({ owner: trafficOwner('c1:t0', 0, 10), slotId: 1 }),
+            pool.acquire({ owner: trafficOwner('c1:t1', 1, 20), slotId: 2 }),
+        ])
+        expect(lease1.slotId).toBe(1)
+        expect(lease2.slotId).toBe(2)
+
+        await Promise.all([lease1.release('done_1'), lease2.release('done_2')])
+
+        // Thread 0 queues for Slot 1 first (still cooling for 60s); Thread 1 queues for Slot 2 second (ready in 40ms)
+        const abortedThread0 = new AbortController()
+        const pThread0 = pool.acquire({
+            owner: trafficOwner('c1:t0:v2', 0, 10),
+            slotId: 1,
             timeoutMs: 5_000,
+            signal: abortedThread0.signal,
         })
-        await delay(40)
+        const pThread1 = pool.acquire({
+            owner: trafficOwner('c1:t1:v2', 1, 20),
+            slotId: 2,
+            timeoutMs: 2_000,
+        })
 
-        await first.release('last_exclusive')
-        const rotated = await waiting
-        expect(rotated.observedIp).toBe('203.0.113.70')
-        expect(rotated.leaseId).not.toBe(first.leaseId)
-        expect(provider.countCalls(PROXY_KEY, 'new')).toBe(2)
+        // Thread 1 (Slot 2) must acquire its new IP without being blocked behind Thread 0 (Slot 1)
+        const nextLease2 = await pThread1
+        expect(nextLease2.slotId).toBe(2)
+        expect(nextLease2.observedIp).toBe('203.0.113.202')
 
-        await rotated.release('done')
+        abortedThread0.abort()
+        await expect(pThread0).rejects.toMatchObject({ code: 'aborted' })
+        await nextLease2.release('done')
     })
 })

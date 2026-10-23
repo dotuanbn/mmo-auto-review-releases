@@ -8,6 +8,8 @@ import {
     SecretStorageUnavailableError,
 } from '../services/SecretVault'
 import { setRuntimeLogLevel } from '../utils/runtimeLogger'
+import { browserResourceGovernor } from '../services/BrowserResourceGovernor'
+import { layaSidecarManager } from '../services/LayaSidecarManager'
 import {
     absolutePathSchema,
     settingsKeySchema,
@@ -50,6 +52,7 @@ const DEFAULT_SETTINGS: SettingsRecord = {
     hideAutomation: true,
     saveProfiles: true,
     maxConcurrentBrowsers: 3,
+    lowResourceMode: false,
     randomizeUserAgent: true,
     randomizeViewport: true,
 
@@ -444,6 +447,35 @@ function syncFProxyServiceWithSettings(settings: SettingsRecord) {
 
 function syncRuntimeLoggerWithSettings(settings: SettingsRecord) {
     setRuntimeLogLevel(settings.logLevel)
+    layaSidecarManager.setLowResourceMode(settings.lowResourceMode === true)
+    if (browserResourceGovernor.configure(settings.lowResourceMode === true)) {
+        for (const window of BrowserWindow?.getAllWindows?.() ?? []) {
+            if (!window.isDestroyed()) window.webContents.send('performance:changed', settings.lowResourceMode === true)
+        }
+    }
+}
+
+async function syncSprint3WorkersWithSettings(settings: SettingsRecord): Promise<void> {
+    try {
+        const { helpfulVoteWorker } = await import('../services/HelpfulVoteWorker')
+        if (settings.enableHelpfulVotes === true) {
+            helpfulVoteWorker.start()
+        } else {
+            helpfulVoteWorker.stop()
+        }
+    } catch {
+        // Best-effort worker sync
+    }
+    try {
+        const { reviewVerificationWorker } = await import('../services/ReviewVerificationWorker')
+        if (settings.enableReviewVerification === true) {
+            reviewVerificationWorker.start()
+        } else {
+            reviewVerificationWorker.stop()
+        }
+    } catch {
+        // Best-effort worker sync
+    }
 }
 
 function asSettingsRecord(input: Record<string, unknown>): SettingsRecord {
@@ -724,6 +756,9 @@ export function applySettingsPathGuards(channel: string, patch: SettingsRecord):
 }
 
 export function registerSettingsHandlers() {
+    ipcMain.handle('performance:getStatus', withIpcValidation('performance:getStatus', async () => {
+        return browserResourceGovernor.getSnapshot()
+    }))
     // Get a specific setting (secrets masked)
     ipcMain.handle('settings:get', withIpcValidation('settings:get', async (_event, key: unknown) => {
         const parsedKey = parseIpcPayload('settings:get', settingsKeySchema, key)
@@ -755,6 +790,9 @@ export function registerSettingsHandlers() {
                 saveSettings(settings, { explicitSecretClears })
                 if (parsedKey === 'useProxy' || parsedKey === 'fproxyApiKey') {
                     syncFProxyServiceWithSettings(loadSettings())
+                }
+                if (parsedKey === 'enableHelpfulVotes' || parsedKey === 'enableReviewVerification') {
+                    await syncSprint3WorkersWithSettings(loadSettings())
                 }
             } catch (error) {
                 if (error instanceof SecretStorageUnavailableError) {
@@ -799,6 +837,7 @@ export function registerSettingsHandlers() {
                 saveSettings(current, { explicitSecretClears })
                 const hydrated = loadSettings()
                 syncFProxyServiceWithSettings(hydrated)
+                await syncSprint3WorkersWithSettings(hydrated)
                 return maskSettingsForRenderer(hydrated)
             } catch (error) {
                 if (error instanceof SecretStorageUnavailableError) {
@@ -817,6 +856,7 @@ export function registerSettingsHandlers() {
                 explicitSecretClears: new Set<string>(SETTINGS_SECRET_KEYS),
             })
             syncFProxyServiceWithSettings(reset)
+            await syncSprint3WorkersWithSettings(reset)
             return maskSettingsForRenderer({ ...DEFAULT_SETTINGS })
         })
     }))

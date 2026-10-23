@@ -365,6 +365,36 @@ describe('TrafficVisitQueue — counters from durable queue', () => {
     })
 })
 
+describe('TrafficVisitQueue — resource backpressure', () => {
+    it('defers work without consuming retry budget, and preserves terminal outcomes', async () => {
+        mockDatabase()
+        const q = new TrafficVisitQueue()
+        q.markLoadedForTests()
+        await seedOne(q)
+        const now = new Date()
+        const visit = await q.claimNextVisit(1, 'worker', 60_000, now)
+        expect(visit!.attemptCount).toBe(1)
+        expect(await q.deferRunningVisit(visit!.id, now)).toBe(true)
+        expect(q.getVisit(visit!.id)).toMatchObject({ status: 'retry', attemptCount: 0, workerId: null })
+        expect(await q.claimNextVisit(1, 'worker', 60_000, now)).toBeNull()
+        const retried = await q.claimNextVisit(1, 'worker', 60_000, new Date(now.getTime() + 5000))
+        expect(retried!.attemptCount).toBe(1)
+        await q.completeVisit(visit!.id)
+        expect(await q.deferRunningVisit(visit!.id)).toBe(false)
+    })
+
+    it('rolls back a resource deferral when persistence fails', async () => {
+        mockDatabase()
+        const q = new TrafficVisitQueue()
+        q.markLoadedForTests()
+        await seedOne(q)
+        const visit = await q.claimNextVisit(1, 'worker')
+        vi.mocked(getDatabase).mockReturnValue({ insert: () => ({ values: () => ({ onConflictDoUpdate: async () => { throw new Error('disk full') } }) }) } as never)
+        await expect(q.deferRunningVisit(visit!.id)).rejects.toThrow('disk full')
+        expect(q.getVisit(visit!.id)).toMatchObject({ status: 'running', attemptCount: 1, workerId: 'worker' })
+    })
+})
+
 describe('TrafficVisitQueue — complete/fail persist rollback', () => {
     it('completeVisit persist fail rolls back memory', async () => {
         mockDatabase()

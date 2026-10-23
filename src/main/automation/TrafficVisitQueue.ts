@@ -560,6 +560,30 @@ export class TrafficVisitQueue {
         })
     }
 
+    /** Resource backpressure is not a failed attempt; retain durable work for later. */
+    async deferRunningVisit(visitId: string, now: Date = new Date()): Promise<boolean> {
+        await this.ensureLoaded()
+        return this.runExclusive(async () => {
+            const visit = this.visits.get(visitId)
+            if (!visit || visit.status !== 'running') return false
+            const snapshot = cloneVisit(visit)
+            visit.status = 'retry'
+            visit.workerId = null
+            visit.claimedAt = null
+            visit.leaseExpiresAt = null
+            visit.availableAt = new Date(now.getTime() + 5000).toISOString()
+            visit.attemptCount = Math.max(0, visit.attemptCount - 1)
+            visit.updatedAt = nowIso(now)
+            try {
+                await this.persistVisit(visit)
+            } catch (error) {
+                this.visits.set(visit.id, snapshot)
+                throw error
+            }
+            return true
+        })
+    }
+
     async completeVisit(
         visitId: string,
         result?: unknown,

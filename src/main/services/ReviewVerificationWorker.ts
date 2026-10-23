@@ -156,6 +156,7 @@ export class ReviewVerificationWorker {
 
         try {
             contextId = await browserService.createContext({
+                shouldAbort: () => this.processing && !this.enabled,
                 headless: true,
                 cleanProfileOnStart: true,
             })

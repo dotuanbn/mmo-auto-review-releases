@@ -53,6 +53,9 @@ export class FProxyService {
     private _lastRotatedAt: number = 0
     private rotationInFlight: Promise<FProxyData | null> | null = null
     private pausedRemaining: number | null = null
+    private lastUsedIp: string = ''
+    private visitRotationPending: boolean = false
+    private lastResponseCoolingDown: boolean = false
 
     hasConfiguration(): boolean {
         return !!(this.apiKey || this.currentProxy || this.autoRotateInterval)
@@ -73,7 +76,18 @@ export class FProxyService {
         this.proxyDieAt = 0
         this.rotationInFlight = null
         this.pausedRemaining = null
+        this.lastUsedIp = ''
+        this.visitRotationPending = false
+        this.lastResponseCoolingDown = false
         logFProxy(`[FProxy] Configuration cleared (${reason})`)
+    }
+
+    markVisitCompleted() {
+        const currentIp = this.parseHttpUserpass(this.currentProxy?.httpuserpass)?.host || ''
+        if (currentIp) {
+            this.lastUsedIp = currentIp
+        }
+        this.visitRotationPending = true
     }
 
     setApiKey(key: string) {
@@ -158,21 +172,35 @@ export class FProxyService {
         }
 
         const remainingSec = this.getNextRotateIn()
-        
-        if (remainingSec >= minTimeRequiredSec) {
-            // Enough time remaining, use current window
-            logFProxy(`[FProxy] Enough time remaining: ${remainingSec}s >= ${minTimeRequiredSec}s threshold`)
+        const currentIp = this.parseHttpUserpass(this.currentProxy?.httpuserpass)?.host || ''
+
+        if (
+            !this.visitRotationPending
+            && (!this.lastUsedIp || (currentIp && currentIp !== this.lastUsedIp))
+            && remainingSec >= minTimeRequiredSec
+        ) {
+            // Enough time remaining on an unused IP window
+            logFProxy(`[FProxy] Enough time remaining on fresh IP (${currentIp}): ${remainingSec}s >= ${minTimeRequiredSec}s threshold`)
             return remainingSec * 1000
         }
 
-        // Not enough time — wait for server countdown to reach 0, then actively rotate
-        logFProxy(`[FProxy] Only ${remainingSec}s remaining (need ${minTimeRequiredSec}s). Waiting for countdown to expire...`)
+        // Wait for server countdown to reach 0 and rotate to a genuinely new IP (1 visit = 1 IP)
+        logFProxy(`[FProxy] Waiting for fresh IP rotation (remaining=${remainingSec}s, lastUsedIp=${this.lastUsedIp || 'none'}, pending=${this.visitRotationPending})...`)
 
         while (!shouldStop()) {
             const currentRemaining = this.getNextRotateIn()
+            const activeIp = this.parseHttpUserpass(this.currentProxy?.httpuserpass)?.host || ''
+
+            // If auto-rotate timer already rotated to a new IP in the background, accept it immediately.
+            if (activeIp && this.lastUsedIp && activeIp !== this.lastUsedIp && !this.lastResponseCoolingDown) {
+                this.visitRotationPending = false
+                const freshSec = Math.max(30, this.getNextRotateIn())
+                logFProxy(`[FProxy] Background rotation detected! New IP: ${activeIp}, countdown: ${freshSec}s`)
+                return freshSec * 1000
+            }
 
             if (currentRemaining <= 0) {
-                // Server countdown expired — ACTIVELY rotate immediately (don't wait for setInterval)
+                // Server countdown expired — actively rotate immediately
                 logFProxy(`[FProxy] Countdown expired! Actively calling forceRotate()...`)
                 if (onStatus) {
                     onStatus('Proxy expired — rotating now...')
@@ -180,11 +208,15 @@ export class FProxyService {
                 const newProxy = await this.forceRotate()
                 if (newProxy) {
                     const newIp = this.parseHttpUserpass(newProxy.httpuserpass)?.host || ''
-                    logFProxy(`[FProxy] Active rotation complete! New IP: ${newIp}, countdown: ${this.getNextRotateIn()}s`)
-                    // Return available time from fresh rotation
-                    return this.getNextRotateIn() * 1000
+                    const sameAsLast = Boolean(this.lastUsedIp && newIp && newIp === this.lastUsedIp)
+                    if (!sameAsLast && !this.lastResponseCoolingDown && newIp) {
+                        this.visitRotationPending = false
+                        const nextSec = Math.max(30, this.getNextRotateIn())
+                        logFProxy(`[FProxy] Active rotation complete! New IP: ${newIp}, countdown: ${nextSec}s`)
+                        return nextSec * 1000
+                    }
+                    logFProxy(`[FProxy] Server still on previous IP (${newIp}) or cooling down (${this.getNextRotateIn()}s remaining); continuing to wait...`)
                 }
-                // If rotate failed, wait a bit and retry
                 await new Promise(resolve => setTimeout(resolve, 2000))
                 continue
             }
@@ -352,8 +384,13 @@ export class FProxyService {
         try {
             const url = `https://sv1.fproxy.me/api/rotate?key=${this.apiKey}`
             const response: FProxyResponse = await this.httpGet(url)
+            const msgLower = (response.message || '').toLowerCase()
+            const isCoolingMsg = msgLower.includes('chờ') || msgLower.includes('cho ') || msgLower.includes('wait')
+            this.lastResponseCoolingDown = isCoolingMsg
 
             if (this.isValidProxyData(response.data)) {
+                const prevIp = this.parseHttpUserpass(this.currentProxy?.httpuserpass)?.host || ''
+                const nextIp = this.parseHttpUserpass(response.data.httpuserpass)?.host || ''
                 this.currentProxy = response.data
                 const ttl = Number.parseInt(response.data.time_die || '1800', 10)
                 this.proxyExpireAt = Date.now() + ((Number.isFinite(ttl) ? ttl : 1800) * 1000)
@@ -361,14 +398,26 @@ export class FProxyService {
 
                 // Server-synced countdown: use waiting_time from API response
                 const waitingSec = Number.parseInt(response.data.waiting_time || '120', 10)
-                const safeWaitingSec = Number.isFinite(waitingSec) && waitingSec > 0 ? waitingSec : Math.round(this.rotateIntervalMs / 1000)
+                const safeWaitingSec = Number.isFinite(waitingSec) && waitingSec > 0 ? waitingSec : (isCoolingMsg ? 5 : 120)
                 this.proxyDieAt = Date.now() + (safeWaitingSec * 1000)
-                this.rotateIntervalMs = safeWaitingSec * 1000 // Sync interval with server
-                logFProxy(`[FProxy] Server countdown synced: ${safeWaitingSec}s (proxyDieAt: ${new Date(this.proxyDieAt).toISOString()})`)
+                if (!isCoolingMsg && safeWaitingSec >= 60) {
+                    this.rotateIntervalMs = safeWaitingSec * 1000 // Sync full cycle interval with server
+                }
+                if (nextIp && prevIp && nextIp !== prevIp && !isCoolingMsg) {
+                    this.visitRotationPending = false
+                }
+                logFProxy(`[FProxy] Server countdown synced: ${safeWaitingSec}s (cooling=${isCoolingMsg}, proxyDieAt: ${new Date(this.proxyDieAt).toISOString()})`)
 
                 const parsed = this.parseHttpUserpass(response.data.httpuserpass)!
                 logFProxy(`[FProxy] Proxy: ${parsed.host}:${parsed.port} (${response.data.location})`)
                 return response.data
+            }
+
+            if (isCoolingMsg) {
+                const waitMatch = /(\d+)\s*(?:s|sec|giây|giay)/i.exec(response.message || '')
+                const waitSec = waitMatch ? Math.max(1, Number.parseInt(waitMatch[1], 10)) : 5
+                this.proxyDieAt = Date.now() + waitSec * 1000
+                logFProxy(`[FProxy] Server still in cooldown (${response.message || 'WAITING'}), retry in ${waitSec}s`)
             }
 
             if (response.data && !this.isValidProxyData(response.data)) {
@@ -423,6 +472,9 @@ export class FProxyService {
             }
             return null
         }
+
+        this.lastUsedIp = parsed.host
+        this.visitRotationPending = true
 
         return {
             host: parsed.host,

@@ -232,6 +232,28 @@ async function main() {
         return await api.settings.getAll()
       })
 
+      await step('performance.settings-runtime', async () => {
+        const before = await api.settings.getAll()
+        let changed = false
+        const unsubscribe = api.performance.onChanged(enabled => { changed = enabled })
+        try {
+          await api.settings.saveAll({ lowResourceMode: true })
+          assert(await api.settings.get('lowResourceMode') === true, 'Performance toggle was not persisted')
+          const status = await api.performance.getStatus()
+          assert(status.enabled && status.maxContexts === null && status.queuedLaunches === 0, 'Performance mode must not throttle browsers')
+          assert(Number.isFinite(status.freeMemoryMB), 'Memory telemetry is missing')
+          assert(changed === true, 'Renderer was not notified of the saved mode')
+          assert(await api.settings.get('maxConcurrentBrowsers') === before.maxConcurrentBrowsers, 'User concurrency preference was overwritten')
+          let invalidRejected = false
+          try { await api.settings.set('lowResourceMode', 'true') } catch { invalidRejected = true }
+          assert(invalidRejected, 'Non-boolean performance mode bypassed IPC validation')
+          return { status, persisted: true, typeGuard: true }
+        } finally {
+          unsubscribe()
+          await api.settings.saveAll({ lowResourceMode: before.lowResourceMode === true })
+        }
+      })
+
       await step('captcha.metrics', async () => {
         assert(api.captcha && typeof api.captcha.getMetrics === 'function', 'captcha metrics API missing')
         const before = await api.captcha.getMetrics()

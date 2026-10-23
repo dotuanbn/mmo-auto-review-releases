@@ -4,7 +4,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { ChildProcess } from 'node:child_process'
-import { LayaSidecarManager } from '../../src/main/services/LayaSidecarManager'
+import { LayaSidecarManager, type LayaSidecarSpawnOptions } from '../../src/main/services/LayaSidecarManager'
 
 const tempRoots: string[] = []
 const managers: LayaSidecarManager[] = []
@@ -55,6 +55,58 @@ function track(manager: LayaSidecarManager): LayaSidecarManager {
     managers.push(manager)
     return manager
 }
+
+describe('Laya low-resource policy', () => {
+    it('does not load the local model when the PC has less than 2 GB free', async () => {
+        const spawn = vi.fn()
+        const manager = track(new LayaSidecarManager({ freeMemoryMB: () => 1700, spawnProcess: spawn }))
+        manager.setLowResourceMode(true)
+        expect(await manager.ensureRunning()).toMatchObject({ state: 'unavailable', error: expect.stringContaining('2 GB') })
+        expect(spawn).not.toHaveBeenCalled()
+    })
+
+    it('limits inference threads and unloads after idle, without interrupting in-flight work', async () => {
+        vi.useFakeTimers()
+        const child = createFakeChild(2222)
+        const spawn = vi.fn<(file: string, args: string[], options: LayaSidecarSpawnOptions) => ChildProcess>(() => child)
+        const manager = track(new LayaSidecarManager({
+            executablePath: executableFixture(), platform: 'win32', port: 18765,
+            freeMemoryMB: () => 4096, spawnProcess: spawn, fetchHealth: async () => ownedHealth(2222),
+        }))
+        manager.setLowResourceMode(true)
+        try {
+            const release = manager.beginUse()
+            expect((await manager.ensureRunning()).state).toBe('ready')
+            expect(spawn.mock.calls[0]?.[2]).toMatchObject({ env: { OMP_NUM_THREADS: '1', MKL_NUM_THREADS: '1' } })
+            await vi.advanceTimersByTimeAsync(90_000)
+            expect(child.killed).toBe(false)
+            release()
+            release()
+            await vi.advanceTimersByTimeAsync(1)
+            expect(child.killed).toBe(true)
+            expect(manager.getStatus().state).toBe('stopped')
+        } finally { await manager.stop(); vi.useRealTimers() }
+    })
+
+    it('passive health checks do not keep an unused model resident', async () => {
+        vi.useFakeTimers()
+        const child = createFakeChild(2223)
+        const manager = track(new LayaSidecarManager({
+            executablePath: executableFixture(), platform: 'win32', port: 18766,
+            freeMemoryMB: () => 4096, spawnProcess: () => child, fetchHealth: async () => ownedHealth(2223),
+        }))
+        manager.setLowResourceMode(true)
+        try {
+            await manager.ensureRunning()
+            for (let tick = 0; tick < 2; tick += 1) {
+                await vi.advanceTimersByTimeAsync(20_000)
+                manager.beginUse(false)()
+            }
+            await vi.advanceTimersByTimeAsync(20_001)
+            expect(child.killed).toBe(true)
+        } finally { await manager.stop(); vi.useRealTimers() }
+    })
+})
 
 describe('LayaSidecarManager', () => {
     it('reports an explicit unavailable state when the artifact is absent', async () => {

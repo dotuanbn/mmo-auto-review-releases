@@ -562,7 +562,7 @@ describe('HelpfulVoteWorker', () => {
         await vi.runAllTimersAsync()
         await pending
 
-        expect(createContext).toHaveBeenCalledWith({ headless: true, cleanProfileOnStart: true })
+        expect(createContext).toHaveBeenCalledWith({ headless: true, cleanProfileOnStart: true, shouldAbort: expect.any(Function) })
         expect(mocked.goto).toHaveBeenCalledWith(candidate.locationUrl, {
             waitUntil: 'domcontentloaded',
             timeout: 30_000,

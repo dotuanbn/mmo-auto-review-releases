@@ -9,6 +9,7 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { EventEmitter } from 'events'
+import { BrowserResourceGovernor } from '../src/main/services/BrowserResourceGovernor'
 import {
     ProfileLockService,
     profileLockService,
@@ -305,5 +306,82 @@ describe('ProfileLockService dispose contract (lifecycle companion)', () => {
         expect(svc.release(raw, 'browser:42')).toBe(true)
         expect(svc.release(raw, 'browser:42')).toBe(false)
         expect(svc.releaseByContextId(42)).toBeNull()
+    })
+})
+
+describe('BrowserService low-resource lifecycle', () => {
+    it('keeps persistent and ephemeral contexts parallel under low RAM and only reclaims an idle browser', async () => {
+        vi.useFakeTimers()
+        const governor = new BrowserResourceGovernor(() => ({ freeMB: 500, totalMB: 8192 }))
+        governor.configure(true)
+        const svc = new BrowserService(governor)
+        try {
+            const persistent = await svc.createContext({ headless: true, profilePath: 'C:\\profiles\\low-resource-test' })
+            expect(launchPersistentContext).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({ viewport: { width: 1280, height: 720 } }))
+            const [first, second] = await Promise.all([
+                svc.createEphemeralContext({ headless: true }),
+                svc.createEphemeralContext({ headless: true }),
+            ])
+            expect(governor.getSnapshot()).toMatchObject({ activeContexts: 3, queuedLaunches: 0, maxContexts: null, memoryPressure: true })
+            await svc.closeContext(persistent)
+            await vi.advanceTimersByTimeAsync(30_000)
+            expect(fakeBrowser.isConnected()).toBe(true)
+            expect(governor.getSnapshot().activeContexts).toBe(2)
+            await svc.closeContext(first)
+            await vi.advanceTimersByTimeAsync(30_000)
+            expect(fakeBrowser.isConnected()).toBe(true)
+            expect(governor.getSnapshot()).toMatchObject({ activeContexts: 1, queuedLaunches: 0 })
+            await svc.closeContext(second)
+            expect(governor.getSnapshot().activeContexts).toBe(0)
+            await vi.advanceTimersByTimeAsync(30_000)
+            expect(fakeBrowser.isConnected()).toBe(false)
+            expect(vi.getTimerCount()).toBe(0)
+        } finally { await svc.closeBrowser(); vi.useRealTimers() }
+    })
+
+    it('cancels before acquiring profiles or proxies and frees the resource slot when launch fails', async () => {
+        const governor = new BrowserResourceGovernor(() => ({ freeMB: 1700, totalMB: 8192 }))
+        const svc = new BrowserService(governor)
+        const controller = new AbortController()
+        controller.abort()
+        await expect(svc.createContext({ signal: controller.signal, profilePath: 'C:\\profiles\\cancelled-test' })).rejects.toThrow(/cancelled/)
+        expect(profileLockService.isHeld('C:\\profiles\\cancelled-test')).toBe(false)
+        launchPersistentContext.mockRejectedValueOnce(new Error('resource launch fixture failed'))
+        await expect(svc.createContext({ profilePath: 'C:\\profiles\\failed-resource-test' })).rejects.toThrow(/fixture failed/)
+        expect(governor.getSnapshot()).toMatchObject({ activeContexts: 0, queuedLaunches: 0 })
+    })
+
+    it('does not launch a browser if closeBrowser invalidates its in-flight admission', async () => {
+        const governor = new BrowserResourceGovernor(() => ({ freeMB: 500, totalMB: 8192 }))
+        governor.configure(true)
+        const svc = new BrowserService(governor)
+        const pending = svc.createEphemeralContext().catch((error: unknown) => error)
+        await svc.closeBrowser()
+        expect(await pending).toMatchObject({ name: 'BrowserResourceWaitError' })
+        expect(governor.getSnapshot()).toMatchObject({ activeContexts: 0, queuedLaunches: 0 })
+    })
+
+    it('does not reclaim the shared browser when an ephemeral launch starts during persistent handoff', async () => {
+        const governor = new BrowserResourceGovernor(() => ({ freeMB: 500, totalMB: 8192 }))
+        governor.configure(true)
+        const svc = new BrowserService(governor)
+        let unlock = () => {}
+        try {
+            const seed = await svc.createEphemeralContext({ headless: true })
+            await svc.closeContext(seed)
+            const locked = svc as unknown as { withBrowserLock: (operation: () => Promise<void>) => Promise<void> }
+            const lock = locked.withBrowserLock(() => new Promise<void>(resolve => { unlock = resolve }))
+            await Promise.resolve()
+            const persistent = svc.createContext({ headless: true, profilePath: 'C:\\profiles\\parallel-handoff' })
+            await Promise.resolve()
+            const ephemeral = svc.createEphemeralContext({ headless: true })
+            unlock()
+            await lock
+            const ids = await Promise.all([persistent, ephemeral])
+            expect(fakeBrowser.isConnected()).toBe(true)
+            expect(governor.getSnapshot().activeContexts).toBe(2)
+            expect(ids.every(id => svc.getContext(id) !== undefined)).toBe(true)
+        } finally { unlock(); await svc.closeBrowser() }
+        expect(governor.getSnapshot().activeContexts).toBe(0)
     })
 })

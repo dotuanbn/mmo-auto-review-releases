@@ -1315,6 +1315,23 @@ textarea {
   100% { background-position: 200% 0; }
 }
 
+/* Keep functional progress indicators while reducing decorative work on older PCs. */
+html[data-low-resource-mode="true"] *,
+html[data-low-resource-mode="true"] *::before,
+html[data-low-resource-mode="true"] *::after {
+  transition-duration: 0s !important;
+  scroll-behavior: auto !important;
+  backdrop-filter: none !important;
+}
+html[data-low-resource-mode="true"] .animate-fade-in,
+html[data-low-resource-mode="true"] .animate-slide-up,
+html[data-low-resource-mode="true"] .animate-slide-down,
+html[data-low-resource-mode="true"] .animate-scale-in,
+html[data-low-resource-mode="true"] .animate-shimmer,
+html[data-low-resource-mode="true"] .animate-pulse {
+  animation: none !important;
+}
+
 .animate-fade-in { animation: fadeIn 0.2s ease-out; }
 .animate-slide-up { animation: slideUp 0.25s ease-out; }
 .animate-slide-down { animation: slideDown 0.25s ease-out; }

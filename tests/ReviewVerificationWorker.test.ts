@@ -185,7 +185,7 @@ describe('ReviewVerificationWorker', () => {
 
         await worker.checkSingleReview(item)
 
-        expect(createContext).toHaveBeenCalledWith({ headless: true, cleanProfileOnStart: true })
+        expect(createContext).toHaveBeenCalledWith({ headless: true, cleanProfileOnStart: true, shouldAbort: expect.any(Function) })
         expect(locator).toHaveBeenCalledWith('.review-full-text, [data-review-id], .MyEned')
         expect(match.filter).toHaveBeenCalledWith({ hasText: item.reviewText.slice(0, 40) })
         expect(recordVerificationResult).toHaveBeenCalledWith(expect.objectContaining({

@@ -26,6 +26,11 @@ vi.mock('electron', () => ({
     BrowserWindow: vi.fn(),
 }))
 
+// Execution tests must not inherit real settings or the host's rest-hour window.
+vi.mock('../src/main/ipc/settings', () => ({
+    loadSettings: () => ({ restHoursEnabled: false }),
+}))
+
 import { getDatabase } from '../src/main/database'
 import {
     SchedulerService,
@@ -157,6 +162,19 @@ describe('SchedulerService — automation execution', () => {
         vi.clearAllMocks()
         service = new SchedulerService()
         service.resetRuntimeStateForTests()
+    })
+
+    it('executes at night when rest hours are disabled in the isolated settings fixture', async () => {
+        vi.useFakeTimers()
+        try {
+            vi.setSystemTime(new Date(2026, 9, 23, 23, 30))
+            const mock = createMockDb({})
+            vi.mocked(getDatabase).mockReturnValue(mock.db as never)
+            const runner = mockRunner()
+            service.setAutomationRunner(runner)
+            await service.checkAndStartDue()
+            expect(runner.startCampaign).toHaveBeenCalledWith(10)
+        } finally { vi.useRealTimers() }
     })
 
     it('calls startCampaign when no durable pending jobs', async () => {

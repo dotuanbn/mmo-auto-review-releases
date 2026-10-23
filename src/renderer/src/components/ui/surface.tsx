@@ -555,11 +555,13 @@ export function Toggle({
     checked,
     onChange,
     disabled,
+    label,
     size = 'md',
 }: {
     checked: boolean
     onChange: (value: boolean) => void
     disabled?: boolean
+    label?: string
     size?: 'sm' | 'md'
 }) {
     const w = size === 'sm' ? 'w-9' : 'w-11'
@@ -571,6 +573,7 @@ export function Toggle({
         <button
             type="button"
             role="switch"
+            aria-label={label}
             aria-checked={checked}
             disabled={disabled}
             onClick={() => onChange(!checked)}

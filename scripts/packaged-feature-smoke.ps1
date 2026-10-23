@@ -102,7 +102,7 @@ function Invoke-SilentNsisInstall {
 
     # electron-builder NSIS: /S silent, /D=absolute path (must be last, no quotes)
     Write-SmokeLog "Silent NSIS install: $SetupPath -> $targetFull"
-    $proc = Start-Process -FilePath $SetupPath -ArgumentList @('/S', "/D=$targetFull") -Wait -PassThru
+    $proc = Start-Process -FilePath $SetupPath -ArgumentList @('/S', "/D=$targetFull") -WindowStyle Hidden -Wait -PassThru
     Assert-ExitZero -Code $proc.ExitCode -What 'NSIS silent install'
 
     # Give installer a moment to flush files on slow CI disks
@@ -276,7 +276,7 @@ finally {
                         Select-Object -First 1
                     if ($null -ne $uninstaller) {
                         Write-SmokeLog "Silent uninstall: $($uninstaller.FullName)"
-                        $u = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/S') -Wait -PassThru -ErrorAction SilentlyContinue
+                        $u = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/S') -WindowStyle Hidden -Wait -PassThru -ErrorAction SilentlyContinue
                         if ($null -ne $u -and $u.ExitCode -ne 0) {
                             Write-SmokeLog "Uninstaller exit $($u.ExitCode) (ignored for cleanup)" 'WARN'
                         }

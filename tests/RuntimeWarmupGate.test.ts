@@ -60,7 +60,7 @@ vi.mock('../src/main/automation/JobQueue', () => ({
 }))
 vi.mock('../src/main/ipc/campaigns', () => ({ sendReviewProgress: vi.fn() }))
 vi.mock('../src/main/ipc/settings', () => ({
-    loadSettings: () => ({ enforceAccountWarmup: true, enableAgenticReview: false }),
+    loadSettings: vi.fn(() => ({ enforceAccountWarmup: true, enableAgenticReview: false, lowResourceMode: false })),
 }))
 vi.mock('drizzle-orm', () => ({ eq: vi.fn() }))
 vi.mock('fs', () => ({
@@ -70,12 +70,36 @@ vi.mock('fs', () => ({
 }))
 
 import {
+    automationController,
     groupJobsByAccount,
     isWarmupNonTerminalStatus,
     pickThrottledWarmupKeeper,
     selectWarmupJobsToCancel,
     type WarmupGateJobRef,
 } from '../src/main/automation/AutomationController'
+import { loadSettings } from '../src/main/ipc/settings'
+
+describe('Automation low-resource concurrency parity', () => {
+    it.each([false, true])('preserves all configured threads with lowResourceMode=%s', (lowResourceMode) => {
+        vi.mocked(loadSettings).mockReturnValue({ lowResourceMode } as ReturnType<typeof loadSettings>)
+        const controller = automationController as unknown as {
+            config: { threads: number }
+            threads: Array<{ id: number; status: string }>
+            initializeThreads: () => void
+        }
+        const previous = controller.config.threads
+        try {
+            controller.config.threads = 8
+            controller.initializeThreads()
+            expect(controller.threads).toHaveLength(8)
+            expect(controller.threads.map(thread => thread.id)).toEqual([0, 1, 2, 3, 4, 5, 6, 7])
+        } finally {
+            controller.config.threads = previous
+            controller.initializeThreads()
+            vi.mocked(loadSettings).mockReturnValue({ enforceAccountWarmup: true, enableAgenticReview: false } as ReturnType<typeof loadSettings>)
+        }
+    })
+})
 
 function job(
     overrides: Partial<WarmupGateJobRef> & Pick<WarmupGateJobRef, 'id'>,

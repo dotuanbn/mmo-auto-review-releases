@@ -302,6 +302,7 @@ class SimpleCampaignEngine {
             const globalSettings = loadSettings()
             // Simple campaign has no persistent profile — ephemeral context + BrowserService stealth
             contextId = await browserService.createEphemeralContext({
+                shouldAbort: () => this.shouldStop,
                 headless: globalSettings.headless ?? false,
                 viewport: { width: 1366, height: 768 },
             })

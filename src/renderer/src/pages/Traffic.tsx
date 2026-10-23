@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useLowResourceMode } from '../contexts/PerformanceContext'
 import {
     Eye,
     Plus,
@@ -586,6 +587,7 @@ function toMonitorActionLog(payload: RuntimeActionEventPayload): MonitorActionLo
 
 export function Traffic() {
     const { t } = useI18n()
+    const lowResourceMode = useLowResourceMode()
     const [activeTab, setActiveTab] = useState<'campaigns' | 'monitor' | 'reports'>('campaigns')
     const [campaigns, setCampaigns] = useState<Campaign[]>([])
     const [accounts, setAccounts] = useState<Account[]>([])
@@ -742,12 +744,12 @@ export function Traffic() {
         if (activeTab === 'monitor') {
             fetchStatus()
             // Live updates come from onStatusV2. This poll is only a fallback.
-            statusInterval.current = setInterval(fetchStatus, 10000)
+            statusInterval.current = setInterval(() => { if (!document.hidden) void fetchStatus() }, lowResourceMode ? 20_000 : 10_000)
         }
         return () => {
             if (statusInterval.current) clearInterval(statusInterval.current)
         }
-    }, [activeTab, fetchStatus])
+    }, [activeTab, fetchStatus, lowResourceMode])
 
     // Listen for real-time updates
     useEffect(() => {
@@ -756,6 +758,7 @@ export function Traffic() {
         if (api.runtime?.onStatusV2) {
             unsubscribers.push(
                 api.runtime.onStatusV2((status: RuntimeStatusPayload) => {
+                    if (document.hidden) return
                     if (activeTabRef.current !== 'monitor') {
                         setLiveStatus(normalizeLiveStatus(status))
                         return
@@ -766,6 +769,7 @@ export function Traffic() {
         } else if (api.trafficBoost?.onStatusUpdate) {
             unsubscribers.push(
                 api.trafficBoost.onStatusUpdate((status: LiveStatus) => {
+                    if (document.hidden) return
                     if (activeTabRef.current !== 'monitor') {
                         setLiveStatus(normalizeLiveStatus(status))
                         return
@@ -778,7 +782,7 @@ export function Traffic() {
         if (api.runtime?.onActionEvent) {
             unsubscribers.push(
                 api.runtime.onActionEvent((event: RuntimeActionEventPayload) => {
-                    if (activeTabRef.current !== 'monitor') {
+                    if (document.hidden || activeTabRef.current !== 'monitor') {
                         return
                     }
                     const log = toMonitorActionLog(event)
@@ -787,13 +791,15 @@ export function Traffic() {
                     }
                     // Keep newest-first order inside the frame (same as the old prepend).
                     actionLogBufferRef.current.unshift(log)
+                    // requestAnimationFrame pauses in hidden windows; keep the pending buffer bounded.
+                    actionLogBufferRef.current.length = Math.min(actionLogBufferRef.current.length, lowResourceMode ? 100 : 400)
                     if (!actionLogRafRef.current) {
                         actionLogRafRef.current = requestAnimationFrame(() => {
                             const batch = actionLogBufferRef.current
                             actionLogBufferRef.current = []
                             actionLogRafRef.current = 0
                             if (batch.length === 0 || activeTabRef.current !== 'monitor') return
-                            setMonitorActionLogs(prev => [...batch, ...prev].slice(0, 400))
+                            setMonitorActionLogs(prev => [...batch, ...prev].slice(0, lowResourceMode ? 150 : 400))
                         })
                     }
                 })
@@ -814,7 +820,7 @@ export function Traffic() {
                 }
             }
         }
-    }, [api.runtime, api.trafficBoost, applyStatus])
+    }, [api.runtime, api.trafficBoost, applyStatus, lowResourceMode])
 
     useEffect(() => {
         // Keep Monitor active while running OR paused (do not bounce to campaigns on pause)
@@ -1307,7 +1313,7 @@ function MonitorTab({ status, actionLogs, runtimePolicy, runtimeDiagnostics, rag
     useEffect(() => {
         // Countdown text is only rendered while the monitor tab is visible and a campaign is live.
         if (!monitorClockEnabled) return
-        const timer = setInterval(() => setNowMs(Date.now()), 1000)
+        const timer = setInterval(() => { if (!document.hidden) setNowMs(Date.now()) }, 1000)
         return () => clearInterval(timer)
     }, [monitorClockEnabled])
     const lastThreadActionRef = useRef<Record<number, string>>({})

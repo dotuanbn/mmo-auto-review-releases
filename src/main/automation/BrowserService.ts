@@ -16,12 +16,15 @@ import { proxyBridgeService, type ProxyBridgeMode } from '../services/ProxyBridg
 import { profileLockService } from '../services/ProfileLockService'
 import { applyStealth, DEFAULT_STEALTH_LEVEL, type StealthLevel } from './StealthPatcher'
 import type { ProxyRuntimeReasonCode } from '../../shared/proxy-contracts'
+import { LOW_RESOURCE_LIMITS } from '../../shared/performance-contracts'
+import { browserResourceGovernor, BrowserResourceGovernor, BrowserResourceReservation, BrowserResourceWaitError, type BrowserAdmissionOptions } from '../services/BrowserResourceGovernor'
 
 type PersistentContextOptions = NonNullable<
     Parameters<typeof chromium.launchPersistentContext>[1]
 >
 
-export interface BrowserConfig {
+export interface BrowserConfig extends BrowserAdmissionOptions {
+    resourceReservation?: BrowserResourceReservation
     headless?: boolean
     hideAutomation?: boolean
     saveProfiles?: boolean
@@ -185,6 +188,93 @@ export class BrowserService {
      */
     private ephemeralContextIds: Set<number> = new Set()
     private contextIdCounter = 0
+    private readonly resourceReleases = new Map<number, () => void>()
+    private ephemeralLaunches = 0
+    private idleBrowserTimer: ReturnType<typeof setTimeout> | null = null
+    private admissionEpoch = 0
+
+    constructor(private readonly governor: BrowserResourceGovernor = browserResourceGovernor) {}
+
+    async reserveResources(options: BrowserAdmissionOptions = {}): Promise<BrowserResourceReservation> {
+        return new BrowserResourceReservation(this.governor, await this.governor.acquire(options))
+    }
+
+    private async withContextAdmission(
+        config: BrowserConfig,
+        ephemeral: boolean,
+        create: (contextId: number) => Promise<number>,
+    ): Promise<number> {
+        const epoch = this.admissionEpoch
+        const release = config.resourceReservation?.consume(this.governor) ?? await this.governor.acquire(config)
+        const contextId = ++this.contextIdCounter
+        this.resourceReleases.set(contextId, release)
+        if (ephemeral) {
+            this.clearIdleBrowserTimer()
+            this.ephemeralLaunches += 1
+        }
+        try {
+            if (epoch !== this.admissionEpoch || config.signal?.aborted || config.shouldAbort?.()) {
+                throw new BrowserResourceWaitError('Browser launch cancelled')
+            }
+            if (!ephemeral && this.governor.isEnabled() && this.browser
+                && this.ephemeralContextIds.size === 0 && this.ephemeralLaunches === 0) {
+                await this.withBrowserLock(async () => {
+                    // A parallel ephemeral launch may have started while the
+                    // lock was pending; never reclaim a browser it now owns.
+                    if (this.ephemeralContextIds.size === 0 && this.ephemeralLaunches === 0) {
+                        await this.resetBrowserState('low_resource_persistent_handoff')
+                    }
+                })
+            }
+            const result = await create(contextId)
+            if (epoch !== this.admissionEpoch || config.signal?.aborted || config.shouldAbort?.()) {
+                await this.closeContext(result)
+                throw new BrowserResourceWaitError('Browser launch cancelled')
+            }
+            if (!this.contexts.has(result)) throw new Error('Browser closed during launch')
+            return result
+        } catch (error) {
+            await this.disposeContextState(contextId)
+            throw error
+        } finally {
+            if (ephemeral) this.ephemeralLaunches -= 1
+            this.scheduleIdleBrowserClose()
+        }
+    }
+
+    private resolveResourceViewport(config: BrowserConfig, fingerprint: BrowserFingerprint): { width: number; height: number } {
+        const requested = config.viewport ?? fingerprint.screenResolution
+        if (!this.governor.isEnabled()) return requested
+        const viewport = { width: Math.min(1280, requested.width), height: Math.min(720, requested.height) }
+        // Keep reported screen dimensions aligned with the smaller render surface.
+        fingerprint.screenResolution = viewport
+        return viewport
+    }
+
+    private clearIdleBrowserTimer(): void {
+        if (!this.idleBrowserTimer) return
+        clearTimeout(this.idleBrowserTimer)
+        this.idleBrowserTimer = null
+    }
+
+    private scheduleIdleBrowserClose(): void {
+        if (!this.governor.isEnabled() || !this.browser
+            || this.ephemeralContextIds.size > 0 || this.ephemeralLaunches > 0) {
+            this.clearIdleBrowserTimer()
+            return
+        }
+        if (this.idleBrowserTimer) return
+        this.idleBrowserTimer = setTimeout(() => {
+            this.idleBrowserTimer = null
+            void this.withBrowserLock(async () => {
+                if (this.governor.isEnabled() && this.ephemeralContextIds.size === 0
+                    && this.ephemeralLaunches === 0) {
+                    await this.resetBrowserState('low_resource_idle')
+                }
+            }).catch((error: unknown) => console.error('[BrowserService] Idle cleanup failed:', error))
+        }, LOW_RESOURCE_LIMITS.browserIdleMs)
+        this.idleBrowserTimer.unref?.()
+    }
 
     private async withBrowserLock<T>(operation: () => Promise<T>): Promise<T> {
         const previous = this.browserOpChain
@@ -202,6 +292,7 @@ export class BrowserService {
     }
 
     private clearBrowserReferences(reason: string): void {
+        this.clearIdleBrowserTimer()
         if (this.browser || this.browserHeadless !== null) {
             logProxy(`[BrowserService] Browser state cleared (${reason})`)
         }
@@ -236,6 +327,8 @@ export class BrowserService {
      * Safe for: external context close, normal close, create error, shared-browser disconnect.
      */
     private async disposeContextState(contextId: number): Promise<void> {
+        const releaseResources = this.resourceReleases.get(contextId)
+        this.resourceReleases.delete(contextId)
         // Take bridge key atomically before any await (JS single-thread until await).
         const bridgeKey = this.contextProxyBridgeKeys.get(contextId)
         this.contextProxyBridgeKeys.delete(contextId)
@@ -249,8 +342,11 @@ export class BrowserService {
 
         this.releaseProfileLock(contextId)
 
-        if (bridgeKey) {
-            await proxyBridgeService.release(bridgeKey)
+        try {
+            if (bridgeKey) await proxyBridgeService.release(bridgeKey)
+        } finally {
+            releaseResources?.()
+            this.scheduleIdleBrowserClose()
         }
 
         if (hadContext || hadPage || hadFingerprint || hadEphemeral || hadLock || bridgeKey) {
@@ -421,6 +517,8 @@ export class BrowserService {
     }
 
     async closeBrowser(): Promise<void> {
+        this.admissionEpoch += 1
+        this.clearIdleBrowserTimer()
         await this.withBrowserLock(async () => {
             // Close every tracked context (persistent + ephemeral) via unified dispose path.
             const trackedIds = new Set<number>([
@@ -445,7 +543,10 @@ export class BrowserService {
     // Create persistent context with full rendering enabled
     // ============================================================
     async createContext(config: BrowserConfig = {}): Promise<number> {
-        const contextId = ++this.contextIdCounter
+        return this.withContextAdmission(config, false, (contextId) => this.createPersistentContextInternal(contextId, config))
+    }
+
+    private async createPersistentContextInternal(contextId: number, config: BrowserConfig): Promise<number> {
         const rawProfilePath =
             config.profilePath || join(this.getProfilesPath(), `runtime_context_${contextId}`)
         const ownerToken = `browser:${contextId}`
@@ -484,6 +585,7 @@ export class BrowserService {
             }
 
             bridgeKey = resolvedProxy.bridgeKey
+            if (bridgeKey) this.contextProxyBridgeKeys.set(contextId, bridgeKey)
             const upstreamProxy = buildPlaywrightProxyServer(proxy)
             const bridgeLabel = bridgeKey ? ` (bridge -> ${upstreamProxy})` : ''
             logProxy(`[BrowserService] Context ${contextId}: proxy=${resolvedProxy.server}${bridgeLabel}`)
@@ -497,13 +599,14 @@ export class BrowserService {
             ? fingerprintService.generateForUserAgent(config.userAgent)
             : fingerprintService.generate()
         this.contextFingerprints.set(contextId, fingerprint)
+        const viewport = this.resolveResourceViewport(config, fingerprint)
 
         // Anti-detection context options — unique fingerprint per session
         const launchOptions: PersistentContextOptions = {
             headless: requestedHeadless,
             channel: 'chrome',
             args: getChromeArgs(),
-            viewport: config.viewport ?? fingerprint.screenResolution,
+            viewport,
             userAgent: fingerprint.userAgent,
             locale: fingerprint.languages[0] || 'en-US',
             timezoneId: fingerprint.timezone.name,
@@ -547,8 +650,10 @@ export class BrowserService {
             const page = context.pages().find(candidate => !candidate.isClosed()) || await context.newPage()
 
             // Inject fake cursor overlay for visual feedback
-            await injectCursorOverlay(page)
-            setupAutoReinject(page)
+            if (!this.governor.isEnabled()) {
+                await injectCursorOverlay(page)
+                setupAutoReinject(page)
+            }
 
             this.pages.set(contextId, page)
         } catch (error) {
@@ -574,7 +679,10 @@ export class BrowserService {
     // fresh cookies/localStorage, and optional proxy — all in RAM.
     // ============================================================
     async createEphemeralContext(config: BrowserConfig = {}): Promise<number> {
-        const contextId = ++this.contextIdCounter
+        return this.withContextAdmission(config, true, (contextId) => this.createEphemeralContextInternal(contextId, config))
+    }
+
+    private async createEphemeralContextInternal(contextId: number, config: BrowserConfig): Promise<number> {
         const requestedHeadless = config.headless ?? false
 
         // Ensure shared browser is running in the correct mode
@@ -601,6 +709,7 @@ export class BrowserService {
             })
 
             bridgeKey = resolvedProxy.bridgeKey
+            if (bridgeKey) this.contextProxyBridgeKeys.set(contextId, bridgeKey)
             const upstreamProxy = buildPlaywrightProxyServer(proxy)
             const bridgeLabel = bridgeKey ? ` (bridge -> ${upstreamProxy})` : ''
             logProxy(`[BrowserService] Ephemeral ${contextId}: proxy=${resolvedProxy.server}${bridgeLabel}`)
@@ -612,9 +721,10 @@ export class BrowserService {
             ? fingerprintService.generateForUserAgent(config.userAgent)
             : fingerprintService.generate()
         this.contextFingerprints.set(contextId, fingerprint)
+        const viewport = this.resolveResourceViewport(config, fingerprint)
 
         const contextOptions: BrowserContextOptions = {
-            viewport: config.viewport ?? fingerprint.screenResolution,
+            viewport,
             userAgent: fingerprint.userAgent,
             locale: fingerprint.languages[0] || 'en-US',
             timezoneId: fingerprint.timezone.name,
@@ -649,8 +759,10 @@ export class BrowserService {
             const page = await context.newPage()
 
             // Inject fake cursor overlay for visual feedback
-            await injectCursorOverlay(page)
-            setupAutoReinject(page)
+            if (!this.governor.isEnabled()) {
+                await injectCursorOverlay(page)
+                setupAutoReinject(page)
+            }
 
             this.pages.set(contextId, page)
         } catch (error) {

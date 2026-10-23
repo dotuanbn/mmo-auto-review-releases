@@ -114,4 +114,46 @@ Older project history remains available in `project_qa_log.md` and git history.
 - `ReviewPhotoStrategy`: probabilistic photo attachment mimicking real user behavior. Base 30% + modifiers from rating (+10% for 5★), text length, category (restaurants +15%, offices -10%), warmup level, first visit. Clamped to [5%, 70%]. Determines 1-3 photo count. Integrates with existing `ReviewPhotoService.resolvePhotos()`.
 - `HelpfulVoteWorker`: background worker that casts "Helpful" votes on reviews posted by other accounts after 3-7 days. Rate limited: 3 votes/day/account, 8h cooldown between votes. 30s delay between votes for human-like pacing. Uses Playwright stealth browser, always closes context in finally block. Process-lifetime state (safe restart reset).
 - `AccountHealthScorer`: composite 0-100 health score from warmup level, account age, birth story completion, review history, survival rate, recent failures, and overuse detection. Grades: excellent/good/fair/poor/blocked. Smart rotation with `shouldRest` + `restDays`. `pickBestAccount()` selects healthiest non-resting account.
-- All Sprint 3 services are standalone — not yet integrated into review engines. Integration is next step.
+- All Sprint 3 services wired into `AutomationController`, `ReviewAutomationEngine`, `TrafficBoostEngine`, and `src/main/index.ts` on 2026-10-13.
+
+## 2026-10-21 — Release v1.0.17: Sprint 3 & Review Verification Settings UI + OTA
+
+- Exposed 5 toggles in Settings UI (`enableTimeLocality`, `enableSmartPhotos`, `enableAccountHealth`, `enableHelpfulVotes`, `enableReviewVerification`) with bilingual `vi.json` / `en.json` labels and added them to `settingsPatchSchema` whitelist in `src/shared/ipc-schemas.ts`.
+- Saving settings immediately starts/stops `helpfulVoteWorker` and `reviewVerificationWorker` in `src/main/ipc/settings.ts`.
+- Published NSIS OTA release `v1.0.17` (with bundled Laya AI sidecar) to `dotuanbn/mmo-auto-review-releases`.
+
+## 2026-10-21 — Release v1.0.18: Strict `1 Key = 1 Browser = 1 Visit per IP` FProxy Sync
+
+- Supersedes the 2026-09-21 multi-location single-slot sharing rule: **1 FProxy key never opens more than 1 concurrent browser** (`safeThreadCount = Math.min(safeThreadCount, enabledPoolSlotCount)`), and **1 visit strictly corresponds to 1 unique IP** (`1 visit = 1 IP`).
+- Each worker thread `threadIdx` is pinned to its dedicated FProxy slot (`assignedSlotId`) via `slotId` affinity in `FProxyPoolService.acquire()` and `preferredSlotId` in `waitForFreshRotation()`.
+- `drainWaiters()` iterates across queued waiters by index so a worker pinned to Key 2 is never head-of-line blocked while Key 1 is cooling down.
+- When a visit completes KPI early, its browser closes immediately (`recycleVisitContext`) and the slot enters `cooldown` (`rotationPending = true`).
+- `refreshSlot()` (30s background `getCurrent`) updates `runtime.endpoint` in-place whenever `runtime.endpoint` exists (including during `cooldown` when `runtime.lease === null`) and never overwrites an active `rotateAllowedAt` countdown with `getCurrent`'s sanitized `Date.now()` or clears `rotationPending`.
+- `FProxyApiClient` parses real FProxy cooldown responses (`{"success":true,"message":"Vui lòng chờ X giây","data":{...,"waiting_time":"X"}}` and `"WAITING"`) and falls back `observedIp` to `proxySnapshot.host` when `data.ip` is omitted.
+- `ensureLeaseEndpoint()` tracks `lastUsedIp` per slot and rejects any `getnew` response that returns the same IP as the previous visit or `coolingDown === true`, updating `rotateAllowedAt` and continuing to wait in `cooldown` until the key rotates to a fresh IP on `sv1.fproxy.me`.
+- Updated `release/win-unpacked/MMO Auto Review.exe` and published OTA `v1.0.18` to `dotuanbn/mmo-auto-review-releases`.
+
+## 2026-10-21 — Opt-in low-resource mode (local, not published)
+
+- A shared BrowserResourceGovernor caps all BrowserService owners at one context, with RAM hysteresis (pause below 768 MB, resume at 1280 MB), 4-second launch spacing, bounded/cancellable waiters and single-use pre-proxy reservations. Toggling on drains existing sessions; toggling off restores normal admission without overwriting user preferences.
+- Browser idle cleanup, 1280x720 viewport/fingerprint alignment, background-worker deference and durable resource deferral protect long sessions. Laya uses one compute thread, requires 2 GB free to cold-start and unloads when idle without interrupting active requests.
+- Lazy renderer pages, reduced decorative effects and bounded hidden-window monitor buffers reduce CPU/memory work without blocking website assets.
+- CPU-load testing exposed and repaired the FProxy cooldown wake race. Smoke path canonicalization handles real ancestors/Windows aliases while rejecting escaping junctions. Release jobs reject tag/source-version mismatches; signature requirements stay enforced.
+- Laya architecture consultation returned needs_fallback (0.5353); host chose the central governor. Codex implemented directly because Grok quota was exhausted. No Git/release/production writes.
+
+## 2026-10-23 — Low-resource mode preserves configured parallelism
+
+- User explicitly rejected browser/thread/map caps and delaying new visits. This supersedes the admission policy of 2026-10-21, not the FProxy/IP correctness rules.
+- BrowserResourceGovernor now only tracks lifecycle/cancellation and advisory memory pressure. No admission queue, memory gate, context cap, queue timeout or 4-second launch spacing remains. Snapshot compatibility fields are fixed at `maxContexts: null`, `queuedLaunches: 0`.
+- Removed low-resource overrides from Traffic, Automation, SystemResourceDetector, WarmupScheduler, HelpfulVoteWorker and ReviewVerificationWorker. Existing user limits, profile locks, proxy capacity/cooldowns and business policies remain unchanged.
+- Keep lazy UI, bounded monitor buffers, reduced effects, smaller render surface, Laya idle/thread controls and genuinely idle browser reclamation. Recheck ephemeral ownership inside the browser lock before persistent handoff cleanup.
+- Laya consultation initially failed with a UTF-8 encoding error; an ASCII-only retry selected `tracking_only` with confidence 0.6785, no fallback needed. Single file owner Codex; Grok/subagents not invoked.
+- Acceptance: requested concurrent sessions are admitted even at injected 500 MB free RAM; switching modes preserves configured threads; active sessions survive idle/handoff cleanup; build, tests and isolated packaged runtime must be freshly checked. No publish or Git writes.
+
+## 2026-10-23 — Defer paid code signing; accept manual unsigned installers
+
+- User explicitly asked to skip code signing and accepts customer-facing Windows warnings. Authenticode acquisition is deferred, not a development or manual-packaging blocker.
+- Use the existing unsigned local packaging path for manual distribution. This is not authorization to publish, install over customer data, commit or push.
+- Explain that SmartScreen may offer More info / Run anyway, but enterprise policy or Windows 11 Smart App Control can block unsigned apps without a per-app override. Do not advise disabling Windows protection or ignoring malware detections.
+- Keep existing signed release/CI gates and updater verification unchanged; manual unsigned installation does not establish OTA compatibility or successful update QA.
+- No bounded architecture decision required: the user selected unsigned distribution; this checkpoint changes documentation only.
