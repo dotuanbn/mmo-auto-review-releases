@@ -1,15 +1,34 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { join } from 'path'
 import { existsSync, mkdirSync } from 'fs'
-import { dataRootService } from './services/DataRootService'
+import { dataRootService, resolveSmokeDataRootOverride } from './services/DataRootService'
 import { getRotatingLogger } from './utils/RotatingLogger'
-import { layaSidecarManager } from './services/LayaSidecarManager'
+import {
+    containConsolePipeErrors,
+    isStreamPipeError,
+    rendererRecoveryController,
+    resolveBootstrapLogPath,
+    runtimeHealthService,
+} from './services/RuntimeHealthService'
+import {
+    AppShutdownService,
+    registerLifecycleRouter,
+} from './services/AppShutdownService'
+
+// Contain broken console pipe errors early so a closed terminal/pipe cannot
+// trigger recursive uncaughtException / logBootstrap loops.
+containConsolePipeErrors()
 
 type RuntimeServices = {
     soakTestService: typeof import('./services/SoakTestService')['soakTestService']
     automationController: typeof import('./automation/AutomationController')['automationController']
     trafficBoostEngine: typeof import('./automation/TrafficBoostEngine')['trafficBoostEngine']
     schedulerService: typeof import('./services/SchedulerService')['schedulerService']
+}
+
+type ActiveCleanableService = {
+    name: string
+    stop: () => Promise<void> | void
 }
 
 // Keep renderer stable when the app regains focus on Windows.
@@ -22,8 +41,165 @@ app.disableHardwareAcceleration()
 let mainWindow: BrowserWindow | null = null
 let closeDatabaseRef: (() => void) | null = null
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
-let rendererRecoveryAttempts = 0
 let runtimeServices: RuntimeServices | null = null
+
+const activeBackgroundWorkers: ActiveCleanableService[] = []
+
+const appShutdownService = new AppShutdownService({
+    defaultStepTimeoutMs: 15_000,
+    logger: (message, error) => logBootstrap(message, error),
+})
+
+// 1. Dispose renderer recovery timers
+appShutdownService.registerStep({
+    name: 'renderer_recovery',
+    run: () => {
+        rendererRecoveryController.dispose()
+    },
+})
+
+// 2. Stop soak/schedulers/background workers before accepting new work
+// Calls each actually started worker independently, aggregates failures, and marks clean=false if any fail
+appShutdownService.registerStep({
+    name: 'background_workers',
+    run: async () => {
+        const failures: string[] = []
+        for (const worker of activeBackgroundWorkers) {
+            try {
+                await worker.stop()
+            } catch (error) {
+                failures.push(worker.name)
+                logBootstrap(`Failed to stop background worker: ${worker.name}`, error)
+            }
+        }
+        if (failures.length > 0) {
+            throw new Error(`background_workers_failed:${failures.join(',')}`)
+        }
+    },
+})
+
+// 3. Await automationController.stop and trafficBoostEngine.stopCampaign
+// Guarded to runtimeServices initialization: skips unstarted automation on early quit/startup failure
+appShutdownService.registerStep({
+    name: 'automation_engines',
+    run: async () => {
+        if (!runtimeServices) {
+            return
+        }
+        const failures: string[] = []
+        try {
+            await runtimeServices.automationController.stop()
+        } catch (error) {
+            failures.push('automation_controller')
+            logBootstrap('Failed to stop automation during shutdown', error)
+        }
+        try {
+            await runtimeServices.trafficBoostEngine.stopCampaign()
+        } catch (error) {
+            failures.push('traffic_boost_engine')
+            logBootstrap('Failed to stop traffic campaigns during shutdown', error)
+        }
+        if (failures.length > 0) {
+            throw new Error(`automation_engines_failed:${failures.join(',')}`)
+        }
+    },
+})
+
+// 4. Close BrowserService remaining owned browser contexts
+// Guarded to runtime initialization: does not dynamically load browser automation if never started
+appShutdownService.registerStep({
+    name: 'browser_service',
+    run: async () => {
+        if (!runtimeServices) {
+            return
+        }
+        try {
+            const { browserService } = await import('./automation/BrowserService')
+            await browserService.closeBrowser()
+        } catch (error) {
+            logBootstrap('Failed to close browser contexts during shutdown', error)
+            throw error
+        }
+    },
+})
+
+// 5. Dispose HFModelService (no downloading)
+// Guarded to runtime initialization: does not dynamically load AI service if never started
+appShutdownService.registerStep({
+    name: 'hf_models',
+    run: async () => {
+        if (!runtimeServices) {
+            return
+        }
+        try {
+            const { hfModelService } = await import('./services/HFModelService')
+            await hfModelService.dispose()
+        } catch (error) {
+            logBootstrap('Failed to dispose HFModelService during shutdown', error)
+            throw error
+        }
+    },
+})
+
+// 6. Close proxy bridges
+// Guarded to runtime initialization: does not dynamically load proxy bridges if never started
+appShutdownService.registerStep({
+    name: 'proxy_bridges',
+    run: async () => {
+        if (!runtimeServices) {
+            return
+        }
+        try {
+            const { proxyBridgeService } = await import('./services/ProxyBridgeService')
+            await proxyBridgeService.closeAll()
+        } catch (error) {
+            logBootstrap('Failed to close proxy bridges during shutdown', error)
+            throw error
+        }
+    },
+})
+
+// 7. Close DB last
+appShutdownService.registerStep({
+    name: 'database',
+    run: () => {
+        if (closeDatabaseRef) {
+            try {
+                closeDatabaseRef()
+            } catch (error) {
+                logBootstrap('Failed to close database during shutdown', error)
+                throw error
+            } finally {
+                closeDatabaseRef = null
+            }
+        }
+    },
+})
+
+// Wire canonical lifecycle event routing directly to app (zero unsafe any or assertions)
+registerLifecycleRouter({
+    port: app,
+    shutdownService: appShutdownService,
+    onShutdownComplete: (result) => {
+        try {
+            logBootstrap(`[AppShutdown] Completed clean=${result.clean} failedSteps=${JSON.stringify(result.failedSteps)}`)
+            runtimeHealthService.stop(result.clean)
+        } catch (error) {
+            logBootstrap('Failed to stop runtime health during shutdown', error)
+        }
+    },
+    onWillQuit: (isClean) => {
+        try {
+            if (runtimeHealthService.isRunning()) {
+                runtimeHealthService.stop(isClean)
+            }
+        } catch (error) {
+            logBootstrap('Failed to stop runtime health on will-quit', error)
+        }
+    },
+    isMac: process.platform === 'darwin',
+    logger: (message, error) => logBootstrap(message, error),
+})
 
 function openExternalUrl(url: string): Promise<void> {
     const parsed = new URL(url)
@@ -34,15 +210,23 @@ function openExternalUrl(url: string): Promise<void> {
 }
 
 function getBootstrapLogPath(): string {
+    let smokeRoot: string | null = null
     try {
-        const base = join(app.getPath('appData'), 'MMO Auto Review')
-        if (!existsSync(base)) {
-            mkdirSync(base, { recursive: true })
-        }
-        return join(base, 'bootstrap.log')
+        smokeRoot = resolveSmokeDataRootOverride()
     } catch {
-        return join(process.cwd(), 'bootstrap.log')
+        smokeRoot = null
     }
+    return resolveBootstrapLogPath({
+        smokeDataRoot: smokeRoot,
+        appDataPath: (() => {
+            try {
+                return app.getPath('appData')
+            } catch {
+                return undefined
+            }
+        })(),
+        fallbackCwd: process.cwd(),
+    })
 }
 
 function stringifyError(error: unknown): string {
@@ -59,10 +243,16 @@ function logBootstrap(message: string, error?: unknown): void {
     } catch {
         // Last-resort logging: keep startup path resilient.
     }
-    if (error) {
-        console.error(message, error)
-    } else {
-        console.log(message)
+    try {
+        if (error) {
+            console.error(message, error)
+        } else {
+            console.log(message)
+        }
+    } catch (err) {
+        if (!isStreamPipeError(err)) {
+            throw err
+        }
     }
 }
 
@@ -77,23 +267,30 @@ function focusMainWindow(): void {
     mainWindow.focus()
 }
 
-function reloadRenderer(reason: string): void {
-    if (!mainWindow || mainWindow.isDestroyed()) {
+function reloadWindow(targetWindow: BrowserWindow, reason: string): void {
+    if (!targetWindow || targetWindow.isDestroyed()) {
         return
     }
 
-    rendererRecoveryAttempts += 1
-    logBootstrap(`Reloading renderer after ${reason} (attempt ${rendererRecoveryAttempts})`)
-    try {
-        mainWindow.webContents.reloadIgnoringCache()
-    } catch (error) {
-        logBootstrap('Failed to reload renderer', error)
-    }
-    focusMainWindow()
+    rendererRecoveryController.scheduleRecovery(
+        targetWindow,
+        reason,
+        () => {
+            if (!targetWindow || targetWindow.isDestroyed()) {
+                return
+            }
+            logBootstrap(`Reloading renderer after ${reason} (attempt ${rendererRecoveryController.getAttempts()})`)
+            try {
+                targetWindow.webContents.reloadIgnoringCache()
+            } catch (error) {
+                logBootstrap('Failed to reload renderer', error)
+            }
+        }
+    )
 }
 
 function createWindow(): void {
-    mainWindow = new BrowserWindow({
+    const window = new BrowserWindow({
         width: 1400,
         height: 900,
         minWidth: 1200,
@@ -109,9 +306,10 @@ function createWindow(): void {
         show: false,
         backgroundColor: '#0f172a',
     })
+    mainWindow = window
 
     const forceShowTimer = setTimeout(() => {
-        if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isVisible()) {
+        if (!window || window.isDestroyed() || window.isVisible()) {
             return
         }
         logBootstrap('ready-to-show timeout, forcing window visible')
@@ -119,12 +317,12 @@ function createWindow(): void {
     }, 12000)
 
     // Wait until ready to show to prevent visual flash
-    mainWindow.once('ready-to-show', () => {
+    window.once('ready-to-show', () => {
         clearTimeout(forceShowTimer)
         focusMainWindow()
     })
 
-    mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    window.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
         if (!isMainFrame) {
             return
         }
@@ -136,48 +334,64 @@ function createWindow(): void {
         focusMainWindow()
     })
 
-    mainWindow.webContents.on('did-finish-load', () => {
-        rendererRecoveryAttempts = 0
+    window.webContents.on('did-finish-load', () => {
+        rendererRecoveryController.onRendererLoaded(window)
         logBootstrap('Main window renderer finished load')
     })
 
-    mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    window.webContents.on('console-message', (_event, level, message, line, sourceId) => {
         if (level < 2) {
             return
         }
         logBootstrap(`Renderer console [level=${level}] ${message} (${sourceId}:${line})`)
     })
 
-    mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    window.webContents.on('render-process-gone', (_event, details) => {
         logBootstrap(`Renderer process gone (reason=${details.reason}, exitCode=${details.exitCode})`)
-        reloadRenderer(`render_process_gone:${details.reason}`)
+        runtimeHealthService.recordRendererLoss({
+            reason: details.reason,
+            exitCode: details.exitCode,
+        })
+        reloadWindow(window, `render_process_gone:${details.reason}`)
     })
 
-    mainWindow.on('unresponsive', () => {
+    window.on('unresponsive', () => {
         logBootstrap('Main window is unresponsive')
     })
 
-    mainWindow.on('focus', () => {
+    window.on('focus', () => {
         // Do not reloadIgnoringCache() on focus. That wiped React state and
         // leaked memory whenever automation was running in the background.
     })
 
     // Load the app
     if (process.env.VITE_DEV_SERVER_URL) {
-        mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
-        mainWindow.webContents.openDevTools()
+        window.loadURL(process.env.VITE_DEV_SERVER_URL)
+        window.webContents.openDevTools()
     } else {
-        mainWindow.loadFile(join(__dirname, '../../dist/index.html'))
+        window.loadFile(join(__dirname, '../../dist/index.html'))
     }
 
-    mainWindow.on('closed', () => {
-        mainWindow = null
-        runtimeServices?.schedulerService.setMainWindow(null)
+    window.on('closed', () => {
+        rendererRecoveryController.onWindowClosed(window)
+        if (mainWindow === window) {
+            mainWindow = null
+            runtimeServices?.schedulerService.setMainWindow(null)
+        }
     })
 
     // Keep scheduler notifications bound to the live BrowserWindow.
-    runtimeServices?.schedulerService.setMainWindow(mainWindow)
+    runtimeServices?.schedulerService.setMainWindow(window)
 }
+
+app.on('child-process-gone', (_event, details) => {
+    logBootstrap(`Child process gone (type=${details.type}, reason=${details.reason}, exitCode=${details.exitCode})`)
+    runtimeHealthService.recordChildProcessLoss({
+        type: details.type,
+        reason: details.reason,
+        exitCode: details.exitCode,
+    })
+})
 
 // Initialize app
 app.whenReady().then(async () => {
@@ -185,10 +399,29 @@ app.whenReady().then(async () => {
         app.quit()
         return
     }
+    if (appShutdownService.isShuttingDown() || appShutdownService.isComplete()) {
+        logBootstrap('[Bootstrap] Shutdown already active at whenReady, aborting startup')
+        return
+    }
     try {
         logBootstrap('App startup begin')
         const dataRoot = dataRootService.configurePortableUserDataPath()
         logBootstrap(`[Bootstrap] Data root: ${dataRoot.dataRoot} (portable=${dataRoot.portable})`)
+
+        if (appShutdownService.isShuttingDown() || appShutdownService.isComplete()) {
+            logBootstrap('[Bootstrap] Shutdown active after dataRoot configured, aborting startup')
+            return
+        }
+
+        // Start health diagnostics only after dataRoot has been finalized; non-fatal on error
+        try {
+            runtimeHealthService.start({
+                logsDir: join(dataRoot.dataRoot, 'logs'),
+            })
+            logBootstrap(`[RuntimeHealth] Started session ${runtimeHealthService.getSessionId()}`)
+        } catch (healthErr) {
+            logBootstrap('[RuntimeHealth] Failed to start runtime health service (non-fatal)', healthErr)
+        }
 
         const { initDatabase, closeDatabase } = await import('./database')
         closeDatabaseRef = closeDatabase
@@ -197,6 +430,11 @@ app.whenReady().then(async () => {
         logBootstrap('Initializing database...')
         initDatabase()
         logBootstrap('Database initialized successfully')
+
+        if (appShutdownService.isShuttingDown() || appShutdownService.isComplete()) {
+            logBootstrap('[Bootstrap] Shutdown active after database init, aborting remaining startup')
+            return
+        }
 
         const [soakModule, automationModule, trafficModule, schedulerModule] = await Promise.all([
             import('./services/SoakTestService'),
@@ -215,6 +453,24 @@ app.whenReady().then(async () => {
             automationController,
             schedulerService,
         } = runtimeServices
+
+        activeBackgroundWorkers.push({
+            name: 'soak_test_service',
+            stop: () => {
+                soakTestService.stop('app_shutdown')
+            },
+        })
+        activeBackgroundWorkers.push({
+            name: 'scheduler_service',
+            stop: () => {
+                schedulerService.stop()
+            },
+        })
+
+        if (appShutdownService.isShuttingDown() || appShutdownService.isComplete()) {
+            logBootstrap('[Bootstrap] Shutdown active after async imports, aborting before recovery/window/schedulers')
+            return
+        }
 
         // Durable review queue crash recovery (job_queue load + zombie campaign reconcile)
         // Does not auto-start browsers; resume is deterministic via AutomationController.
@@ -241,9 +497,20 @@ app.whenReady().then(async () => {
             logBootstrap(`[SoakTest] Started session ${soakBoot.sessionId} (${soakBoot.durationHours}h, ${soakBoot.intervalSeconds}s) -> ${soakBoot.logPath}`)
         }
 
+        if (appShutdownService.isShuttingDown() || appShutdownService.isComplete()) {
+            logBootstrap('[Bootstrap] Shutdown active before window creation, aborting')
+            return
+        }
+
         // Create window
         createWindow()
         logBootstrap('Main window created')
+
+        // Guard before starting schedulers/workers
+        if (appShutdownService.isShuttingDown() || appShutdownService.isComplete()) {
+            logBootstrap('[Bootstrap] Shutdown active before scheduler start, aborting')
+            return
+        }
 
         // Wire scheduler → real automation via DI (no circular import in SchedulerService).
         // start/resume only; schedule lastRunAt/nextRunAt advance only on runner success.
@@ -261,6 +528,12 @@ app.whenReady().then(async () => {
             schedulerService.start()
             const { warmupSchedulerService } = await import('./services/WarmupSchedulerService')
             warmupSchedulerService.start()
+            activeBackgroundWorkers.push({
+                name: 'warmup_scheduler',
+                stop: () => {
+                    warmupSchedulerService.stop()
+                },
+            })
             logBootstrap('Scheduler service started (automation runner wired)')
 
             // Sprint 3: start background workers if enabled
@@ -270,11 +543,23 @@ app.whenReady().then(async () => {
                 if (s3.enableHelpfulVotes) {
                     const { helpfulVoteWorker } = await import('./services/HelpfulVoteWorker')
                     helpfulVoteWorker.start()
+                    activeBackgroundWorkers.push({
+                        name: 'helpful_vote_worker',
+                        stop: () => {
+                            helpfulVoteWorker.stop()
+                        },
+                    })
                     logBootstrap('HelpfulVoteWorker started')
                 }
                 if (s3.enableReviewVerification) {
                     const { reviewVerificationWorker } = await import('./services/ReviewVerificationWorker')
                     reviewVerificationWorker.start()
+                    activeBackgroundWorkers.push({
+                        name: 'review_verification_worker',
+                        stop: () => {
+                            reviewVerificationWorker.stop()
+                        },
+                    })
                     logBootstrap('ReviewVerificationWorker started')
                 }
             } catch (workerErr) {
@@ -307,70 +592,22 @@ if (!gotSingleInstanceLock) {
 }
 
 process.on('unhandledRejection', (reason) => {
+    if (isStreamPipeError(reason)) {
+        return
+    }
     logBootstrap('Unhandled rejection', reason)
 })
 
 process.on('uncaughtException', (error) => {
+    if (isStreamPipeError(error)) {
+        return
+    }
+    runtimeHealthService.recordExitReason('uncaught_exception')
     logBootstrap('Uncaught exception', error)
     dialog.showErrorBox(
         'MMO Auto Review - Fatal Error',
         `${stringifyError(error)}\n\nXem log: ${getBootstrapLogPath()}`
     )
-})
-
-app.on('window-all-closed', async () => {
-    try {
-        runtimeServices?.soakTestService.stop('app_shutdown')
-    } catch (error) {
-        logBootstrap('Failed to stop soak test during shutdown', error)
-    }
-
-    try {
-        runtimeServices?.schedulerService.stop()
-        const { warmupSchedulerService } = require('./services/WarmupSchedulerService')
-        warmupSchedulerService.stop()
-        // Sprint 3: stop background workers
-        try { require('./services/HelpfulVoteWorker').helpfulVoteWorker.stop() } catch { /* may not be started */ }
-        try { require('./services/ReviewVerificationWorker').reviewVerificationWorker.stop() } catch { /* may not be started */ }
-    } catch (error) {
-        logBootstrap('Failed to stop scheduler during shutdown', error)
-    }
-
-    // Stop browsers before closing the database so Chrome is not orphaned.
-    try {
-        await runtimeServices?.automationController.stop()
-    } catch (error) {
-        logBootstrap('Failed to stop automation during shutdown', error)
-    }
-
-    try {
-        await runtimeServices?.trafficBoostEngine.stopCampaign()
-    } catch (error) {
-        logBootstrap('Failed to stop traffic campaigns during shutdown', error)
-    }
-
-    try {
-        await layaSidecarManager.stop()
-    } catch (error) {
-        logBootstrap('Failed to stop Laya sidecar during shutdown', error)
-    }
-
-    try {
-        const { proxyBridgeService } = await import('./services/ProxyBridgeService')
-        await proxyBridgeService.closeAll()
-    } catch (error) {
-        logBootstrap('Failed to close proxy bridges during shutdown', error)
-    }
-
-    // Close database on app quit
-    if (closeDatabaseRef) {
-        closeDatabaseRef()
-    }
-
-
-    if (process.platform !== 'darwin') {
-        app.quit()
-    }
 })
 
 app.on('activate', () => {
@@ -383,7 +620,9 @@ app.on('activate', () => {
 ipcMain.handle('app:getVersion', () => app.getVersion())
 ipcMain.handle('app:openExternal', (_event, url: string) => openExternalUrl(url))
 ipcMain.handle('app:reloadWindow', (_event, reason?: string) => {
-    reloadRenderer(reason || 'renderer_requested_reload')
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        reloadWindow(mainWindow, reason || 'renderer_requested_reload')
+    }
     return { success: true }
 })
 ipcMain.handle('app:reportRendererEvent', (_event, payload: { level?: 'info' | 'warn' | 'error'; message: string }) => {

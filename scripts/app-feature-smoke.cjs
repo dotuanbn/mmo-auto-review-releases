@@ -49,6 +49,56 @@ function serializeError(error) {
   return error && error.stack ? error.stack : String(error)
 }
 
+function withTimeout(promise, timeoutMs, description = 'operation') {
+  let timer = null
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Timed out after ${timeoutMs}ms waiting for ${description}`))
+    }, timeoutMs)
+  })
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+  })
+}
+
+function waitForProcessClose(record, timeoutMs = 15000) {
+  if (record.exited) {
+    return Promise.resolve({ code: record.exitCode, signal: record.exitSignal })
+  }
+  return new Promise(resolve => {
+    let timer = null
+    const onClose = (code, signal) => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      record.child?.removeListener('close', onClose)
+      resolve({ code, signal })
+    }
+    timer = setTimeout(() => {
+      timer = null
+      record.child?.removeListener('close', onClose)
+      resolve({ timeout: true })
+    }, timeoutMs)
+    if (timer.unref) timer.unref()
+    record.child?.once('close', onClose)
+  })
+}
+
+function readHealthSnapshot(healthFilePath) {
+  if (!fs.existsSync(healthFilePath)) return null
+  try {
+    const raw = fs.readFileSync(healthFilePath, 'utf8')
+    if (!raw || !raw.trim()) return null
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
 /** Strip ELECTRON_RUN_AS_NODE so Playwright launches a real Electron GUI process. */
 function buildLaunchEnv(isPackaged) {
   const env = { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'true' }
@@ -84,19 +134,36 @@ function resolveLaunchConfig() {
 }
 
 async function main() {
-  let app
+  const keepAlive = setInterval(() => {}, 5000)
+  const ownedLauncher = {
+    child: null,
+    launcherPid: null,
+    mainPid: null,
+    exited: false,
+    exitCode: null,
+    exitSignal: null,
+    timeout: false,
+  }
+
+  let app = null
   const launch = resolveLaunchConfig()
   const result = {
     ok: false,
+    status: 'starting',
     mode: launch.mode,
     executablePath: launch.executablePath,
     outDir,
     userDataDir,
+    launcher: null,
+    exitOutcome: null,
+    healthAtExit: null,
+    cleanupError: null,
     passed: 0,
     failed: 0,
     results: [],
     pageErrors: [],
     consoleErrors: [],
+    errors: [],
     credentialGated: [
       'accounts.testLogin/loginVisible/checkLiveDie/openManualLogin require a disposable Google account and browser login approval',
       'fproxy.test/network proxy checks require valid proxy or FProxy credentials',
@@ -114,27 +181,60 @@ async function main() {
       args: launch.args,
       cwd: launch.cwd,
       env: launch.env,
+      timeout: 60_000,
     })
 
-    const page = await app.firstWindow({ timeout: 30_000 })
-    page.on('pageerror', error => result.pageErrors.push(serializeError(error)))
+    const launcherChild = app.process()
+    ownedLauncher.child = launcherChild
+    ownedLauncher.launcherPid = launcherChild.pid
+    launcherChild.once('close', (code, signal) => {
+      ownedLauncher.exited = true
+      ownedLauncher.exitCode = code
+      ownedLauncher.exitSignal = signal
+    })
+
+    const actualMainPid = await withTimeout(
+      app.evaluate(() => process.pid),
+      15_000,
+      'obtain actual main process PID'
+    )
+    ownedLauncher.mainPid = actualMainPid
+
+    result.launcher = {
+      launcherPid: ownedLauncher.launcherPid,
+      mainPid: ownedLauncher.mainPid,
+    }
+
+    const page = await withTimeout(app.firstWindow({ timeout: 30_000 }), 35_000, 'firstWindow')
+    page.on('pageerror', error => {
+      const errStr = serializeError(error)
+      result.pageErrors.push(errStr)
+      if (result.pageErrors.length > 50) result.pageErrors.shift()
+    })
     page.on('console', message => {
       if (message.type() === 'error') {
-        result.consoleErrors.push(message.text())
+        const text = message.text()
+        result.consoleErrors.push(text)
+        if (result.consoleErrors.length > 100) result.consoleErrors.shift()
       }
     })
 
-    await page.waitForLoadState('domcontentloaded', { timeout: 30_000 })
-    await page.waitForFunction(
-      () => typeof window.electronAPI === 'object' && !!window.electronAPI.settings,
-      null,
-      { timeout: 30_000 }
+    await withTimeout(page.waitForLoadState('domcontentloaded', { timeout: 30_000 }), 35_000, 'waitForLoadState domcontentloaded')
+    await withTimeout(
+      page.waitForFunction(
+        () => typeof window.electronAPI === 'object' && !!window.electronAPI.settings,
+        null,
+        { timeout: 30_000 }
+      ),
+      35_000,
+      'waitForFunction electronAPI.settings'
     )
 
     const resolvedUserData = path.resolve(userDataDir)
-    const resolvedOutputRoot = path.resolve(path.join(cwd, 'output'))
+    const resolvedOutputRoot = path.resolve(path.join(launch.cwd, 'output'))
     const requestedIsolatedRestore =
       resolvedUserData.startsWith(`${resolvedOutputRoot}${path.sep}`) ||
+      resolvedUserData.startsWith(`${path.resolve(outDir)}${path.sep}`) ||
       resolvedUserData.toLowerCase().includes(`${path.sep}mmo-packaged-smoke${path.sep}`) ||
       resolvedUserData.toLowerCase().includes(`${path.sep}electron-feature-smoke${path.sep}`) ||
       resolvedUserData.toLowerCase().includes(`${path.sep}packaged-feature-smoke${path.sep}`)
@@ -143,7 +243,6 @@ async function main() {
       imageDir,
       expectedUserDataDir,
       requestedIsolatedRestore,
-      requireLaya,
     }) => {
       const api = window.electronAPI
       const results = []
@@ -200,27 +299,12 @@ async function main() {
         return { version, userData: paths.userData }
       })
 
-      if (requireLaya) {
-        await step('laya.bundled-runtime-and-inference', async () => {
-          assert(api.laya && hasFn(api.laya, 'healthCheck'), 'Laya IPC API missing')
-          const health = await api.laya.healthCheck()
-          assert(health.online === true && health.tier1Ready === true, 'Bundled Laya did not start')
-          assert(health.version === 'laya-0.3.20-local', 'Unexpected Laya runtime')
-          const metrics = {
-            campaignId: 1, campaignName: 'Smoke', trafficMode: 'web_seo',
-            totalVisits: 20, completedVisits: 18, failedVisits: 2,
-            successRate: 0.9, consecutiveFailures: 0, currentThreadCount: 1,
-            avgVisitDurationMs: 5000, elapsedMs: 100000, locationCount: 1,
-          }
-          const decision = await api.laya.decide('campaign_optimization', metrics)
-          assert(decision.tier === 'laya-choice', 'Laya inference silently fell back')
-          assert(['aggressive', 'normal', 'cautious', 'pause'].includes(decision.decision), 'Invalid model choice')
-          assert(Number.isFinite(decision.confidence), 'Missing model confidence')
-          const pause = await api.laya.optimizeCampaign({ ...metrics, consecutiveFailures: 16 })
-          assert(pause.shouldContinue === false && pause.suggestedPacing === 'pause', 'Local hard pause gate was bypassed')
-          return { health, decision, hardPauseGate: true }
-        })
-      }
+      await step('laya.api-absent', async () => {
+        assert(typeof api.laya === 'undefined', 'window.electronAPI.laya must be undefined')
+        assert(!('laya' in api), 'laya property must not exist on window.electronAPI')
+        assert(typeof window.laya === 'undefined', 'window.laya must be undefined')
+        return { apiLayaAbsent: true }
+      })
 
       await step('settings.crud', async () => {
         const before = await api.settings.getAll()
@@ -662,8 +746,31 @@ async function main() {
       imageDir,
       expectedUserDataDir: userDataDir,
       requestedIsolatedRestore,
-      requireLaya: Boolean(packagedExecutable) && process.platform === 'win32',
     })
+
+    // Host FS check: packaged Laya resource directory and executable must be absent
+    // Use launch.executablePath and launch.cwd with verified actual executable path from owned app
+    const actualExecPath = (await withTimeout(app.evaluate(() => process.execPath).catch(() => null), 5000, 'process.execPath')) || launch.executablePath
+    const actualExecRoot = launch.mode === 'packaged'
+      ? path.dirname(actualExecPath)
+      : launch.cwd
+    const layaResourceDir = path.join(actualExecRoot, 'resources', 'laya-sidecar')
+    const layaExePath = path.join(layaResourceDir, 'laya-sidecar.exe')
+    const layaDirExists = fs.existsSync(layaResourceDir)
+    const layaExeExists = fs.existsSync(layaExePath)
+
+    const hostLayaCheck = {
+      name: 'package.laya-resources-absent',
+      ok: !layaDirExists && !layaExeExists,
+      actualExecRoot,
+      layaResourceDir,
+    }
+    if (!hostLayaCheck.ok) {
+      hostLayaCheck.error = `Packaged Laya resources still present at ${layaResourceDir} (dirExists=${layaDirExists}, exeExists=${layaExeExists})`
+    } else {
+      hostLayaCheck.value = { actualExecRoot, layaResourceDir, absent: true }
+    }
+    apiResults.push(hostLayaCheck)
 
     result.results = apiResults
     result.failed = apiResults.filter(item => !item.ok && !item.optional).length
@@ -672,37 +779,138 @@ async function main() {
     if (result.pageErrors.length > 0) {
       result.failed += result.pageErrors.length
     }
+  } catch (error) {
+    result.failed += 1
+    const errStr = serializeError(error)
+    result.errors.push(errStr)
+    result.error = errStr
+  } finally {
+    // 1. If app was launched, ensure graceful shutdown if still running
+    if (app) {
+      if (!ownedLauncher.exited) {
+        const closePromise = waitForProcessClose(ownedLauncher, 15_000)
+        try {
+          // Request native app.quit() while retaining inspector connection until exit (do not use SDK electronApp.close())
+          await withTimeout(
+            app.evaluate(({ app }) => {
+              app.quit()
+            }).catch(err => {
+              // Expected transport disconnection as native process terminates
+              return { transportClosed: true, error: String(err) }
+            }),
+            10_000,
+            'app.quit()'
+          )
+        } catch (cleanupErr) {
+          const errText = serializeError(cleanupErr)
+          result.cleanupError = (result.cleanupError ? result.cleanupError + '; ' : '') + errText
+          result.failed += 1
+          result.errors.push(`Shutdown evaluate RPC failed: ${errText}`)
+        }
 
-    result.ok = result.failed === 0
-    fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf8')
+        const exitOutcome = await closePromise
+        if (exitOutcome.timeout) {
+          ownedLauncher.timeout = true
+          result.failed += 1
+          result.errors.push('Owned launcher process timed out waiting for exit after app.quit()')
+          // Fallback kill of ONLY the owned child process handle (never unverified numeric PID)
+          try {
+            ownedLauncher.child?.kill()
+          } catch {}
+          await waitForProcessClose(ownedLauncher, 5000)
+        }
+      } else {
+        // App already exited before finally; drain any remaining close event boundedly
+        await waitForProcessClose(ownedLauncher, 5000)
+      }
+
+      // 2. Unconditional exit outcome verification whenever app was launched
+      result.exitOutcome = {
+        launcherPid: ownedLauncher.launcherPid,
+        mainPid: ownedLauncher.mainPid,
+        exited: ownedLauncher.exited,
+        exitCode: ownedLauncher.exitCode,
+        exitSignal: ownedLauncher.exitSignal,
+        timeout: ownedLauncher.timeout,
+      }
+
+      // Require exact native exit code 0
+      if (!ownedLauncher.exited) {
+        result.failed += 1
+        result.errors.push('Owned launcher process did not exit')
+      } else if (ownedLauncher.exitCode !== 0) {
+        result.failed += 1
+        result.errors.push(
+          `Owned launcher exited with non-zero exit code: ${ownedLauncher.exitCode} (signal: ${ownedLauncher.exitSignal})`
+        )
+      }
+
+      // 3. Require healthSnap?.current?.cleanExit === true (missing health snapshot fails)
+      const healthFile = path.join(userDataDir, 'logs', 'runtime-health.json')
+      const healthSnap = readHealthSnapshot(healthFile)
+      result.healthAtExit = healthSnap?.current || null
+
+      if (!healthSnap || !healthSnap.current) {
+        result.failed += 1
+        result.errors.push(
+          `Runtime health snapshot missing or unreadable at shutdown: ${healthFile}`
+        )
+      } else if (healthSnap.current.cleanExit !== true) {
+        result.failed += 1
+        result.errors.push(
+          `Runtime health snapshot cleanExit is not true at shutdown (cleanExit=${healthSnap.current.cleanExit}, exitReason=${healthSnap.current.exitReason})`
+        )
+      }
+    } else {
+      // App was never successfully launched
+      result.failed += 1
+      result.errors.push('Electron application failed to launch or app reference is null')
+    }
+
+    // 4. Final completedAt/status/ok receipt after all cleanup checks
+    result.completedAt = new Date().toISOString()
+    result.ok =
+      result.failed === 0 &&
+      !result.cleanupError &&
+      ownedLauncher.exited === true &&
+      ownedLauncher.exitCode === 0 &&
+      result.healthAtExit?.cleanExit === true
+    result.status = result.ok ? 'completed' : 'failed'
+
+    fs.mkdirSync(outDir, { recursive: true })
+    const tmpResult = path.join(outDir, 'result.json.tmp')
+    fs.writeFileSync(tmpResult, JSON.stringify(result, null, 2), 'utf8')
+    try {
+      fs.renameSync(tmpResult, resultPath)
+    } catch {
+      fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf8')
+    }
 
     console.log(JSON.stringify({
       ok: result.ok,
+      status: result.status,
+      completedAt: result.completedAt,
       mode: result.mode,
       executablePath: result.executablePath,
       outDir,
       userDataDir,
+      launcher: result.launcher,
+      exitOutcome: result.exitOutcome,
+      healthAtExit: result.healthAtExit,
+      cleanupError: result.cleanupError,
       passed: result.passed,
       failed: result.failed,
       failedSteps: result.results.filter(item => !item.ok && !item.optional).map(item => ({ name: item.name, error: item.error })),
       pageErrors: result.pageErrors.length,
       consoleErrors: result.consoleErrors.length,
+      errors: result.errors,
     }, null, 2))
 
     if (!result.ok) {
       process.exitCode = 1
     }
-  } catch (error) {
-    result.failed += 1
-    result.error = serializeError(error)
-    fs.mkdirSync(outDir, { recursive: true })
-    fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf8')
-    console.error(JSON.stringify({ ok: false, mode: result.mode, outDir, error: String(error) }, null, 2))
-    process.exitCode = 1
-  } finally {
-    if (app) {
-      await app.close().catch(() => {})
-    }
+
+    clearInterval(keepAlive)
   }
 
   // Strict exit: never soft-succeed after a recorded failure.

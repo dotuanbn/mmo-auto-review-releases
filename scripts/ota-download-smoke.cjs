@@ -41,6 +41,56 @@ async function hashFile(file, algorithm, encoding) {
   return hash.digest(encoding)
 }
 
+function withTimeout(promise, timeoutMs, description = 'operation') {
+  let timer = null
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Timed out after ${timeoutMs}ms waiting for ${description}`))
+    }, timeoutMs)
+  })
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+  })
+}
+
+function waitForProcessClose(record, timeoutMs = 15000) {
+  if (record.exited) {
+    return Promise.resolve({ code: record.exitCode, signal: record.exitSignal })
+  }
+  return new Promise(resolve => {
+    let timer = null
+    const onClose = (code, signal) => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      record.child?.removeListener('close', onClose)
+      resolve({ code, signal })
+    }
+    timer = setTimeout(() => {
+      timer = null
+      record.child?.removeListener('close', onClose)
+      resolve({ timeout: true })
+    }, timeoutMs)
+    if (timer.unref) timer.unref()
+    record.child?.once('close', onClose)
+  })
+}
+
+function readHealthSnapshot(healthFilePath) {
+  if (!fs.existsSync(healthFilePath)) return null
+  try {
+    const raw = fs.readFileSync(healthFilePath, 'utf8')
+    if (!raw || !raw.trim()) return null
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
 async function startFeed() {
   const manifest = yaml.load(fs.readFileSync(path.join(releaseDir, 'latest.yml'), 'utf8'))
   assert.equal(manifest.version, expectedVersion)
@@ -98,8 +148,20 @@ async function main() {
   let electron
   let feed
   let originalConfig
+  let actualVersion = null
   const configFile = path.join(path.dirname(executable), 'resources', 'app-update.yml')
   persist()
+
+  const ownedLauncher = {
+    child: null,
+    launcherPid: null,
+    mainPid: null,
+    exited: false,
+    exitCode: null,
+    exitSignal: null,
+    timeout: false,
+  }
+
   try {
     if (!github && !verifyOnly) feed = await startFeed()
     const settingsFile = path.join(userData, 'settings.json')
@@ -120,6 +182,24 @@ async function main() {
       executablePath: executable, args: [`--user-data-dir=${userData}`],
       cwd: path.dirname(executable), env, timeout: 120_000,
     })
+
+    const launcherChild = electron.process()
+    ownedLauncher.child = launcherChild
+    ownedLauncher.launcherPid = launcherChild.pid
+    launcherChild.once('close', (code, signal) => {
+      ownedLauncher.exited = true
+      ownedLauncher.exitCode = code
+      ownedLauncher.exitSignal = signal
+    })
+
+    const actualMainPid = await withTimeout(
+      electron.evaluate(() => process.pid).catch(() => null),
+      15_000,
+      'obtain actual main process PID'
+    )
+    assert(actualMainPid, 'Actual main process PID must not be null or undefined')
+    ownedLauncher.mainPid = actualMainPid
+
     for (const stream of [electron.process().stdout, electron.process().stderr]) {
       stream?.on('data', chunk => fs.appendFileSync(path.join(outDir, 'runtime.log'), chunk))
     }
@@ -128,9 +208,18 @@ async function main() {
     const paths = await page.evaluate(() => window.electronAPI.getPaths())
     assert.equal(path.resolve(paths.userData).toLowerCase(), userData.toLowerCase())
     report.gates.isolatedUserData = true
-    const actualVersion = await page.evaluate(() => window.electronAPI.getVersion())
+    actualVersion = await page.evaluate(() => window.electronAPI.getVersion())
     assert.equal(actualVersion, verifyOnly ? expectedVersion : currentVersion)
     report.gates.installedVersion = true
+
+    // Minimal useful gate for no Laya in expected 1.0.20 fixture
+    if (actualVersion === '1.0.20') {
+      const layaResourceDir = path.join(path.dirname(executable), 'resources', 'laya-sidecar')
+      const layaExePath = path.join(layaResourceDir, 'laya-sidecar.exe')
+      assert(!fs.existsSync(layaResourceDir) && !fs.existsSync(layaExePath), `Packaged Laya resources should not exist in 1.0.20: ${layaResourceDir}`)
+      report.gates.noLayaResources = true
+    }
+
     if (verifyOnly) {
       assert.equal(await page.evaluate(() => window.electronAPI.settings.get('maxConcurrentBrowsers')), 7)
       assert.equal(await page.evaluate(() => window.electronAPI.settings.get('updateMode')), 'manual')
@@ -172,11 +261,88 @@ async function main() {
     report.ok = true
   } finally {
     try {
-      if (electron) await electron.close()
+      if (electron) {
+        if (!ownedLauncher.exited) {
+          const closePromise = waitForProcessClose(ownedLauncher, 15_000)
+          try {
+            // Request native app.quit() while retaining inspector connection until exit (do not use SDK electron.close())
+            await withTimeout(
+              electron.evaluate(({ app }) => {
+                app.quit()
+              }).catch(err => {
+                // Expected transport disconnection as native process terminates
+                return { transportClosed: true, error: String(err) }
+              }),
+              10_000,
+              'app.quit()'
+            )
+          } catch (cleanupErr) {
+            report.cleanupError = String(cleanupErr.stack || cleanupErr)
+          }
+
+          const exitOutcome = await closePromise
+          if (exitOutcome.timeout) {
+            ownedLauncher.timeout = true
+            try {
+              ownedLauncher.child?.kill()
+            } catch {}
+            await waitForProcessClose(ownedLauncher, 5000)
+          }
+        } else {
+          await waitForProcessClose(ownedLauncher, 5000)
+        }
+
+        report.exitOutcome = {
+          launcherPid: ownedLauncher.launcherPid,
+          mainPid: ownedLauncher.mainPid,
+          exited: ownedLauncher.exited,
+          exitCode: ownedLauncher.exitCode,
+          exitSignal: ownedLauncher.exitSignal,
+          timeout: ownedLauncher.timeout,
+        }
+
+        assert.equal(ownedLauncher.exited, true, 'Owned launcher process did not exit')
+        assert.equal(ownedLauncher.exitCode, 0, `Owned launcher exited with non-zero exit code: ${ownedLauncher.exitCode} (signal: ${ownedLauncher.exitSignal})`)
+        report.gates.cleanProcessExit = true
+
+        const healthFile = path.join(userData, 'logs', 'runtime-health.json')
+        const healthSnap = readHealthSnapshot(healthFile)
+        if (actualVersion === '1.0.20') {
+          assert(healthSnap && healthSnap.current, `Runtime health snapshot missing or unreadable at shutdown for 1.0.20: ${healthFile}`)
+          assert.equal(healthSnap.current.cleanExit, true, `Runtime health snapshot cleanExit is not true for 1.0.20 (cleanExit=${healthSnap.current.cleanExit}, exitReason=${healthSnap.current.exitReason})`)
+          report.healthAtExit = healthSnap.current
+          report.gates.cleanHealthExit = true
+        } else if (healthSnap?.current) {
+          report.healthAtExit = healthSnap.current
+          if (healthSnap.current.cleanExit === true) {
+            report.gates.cleanHealthExit = true
+          }
+        }
+
+        report.gates.cleanShutdown = true
+      }
     } finally {
-      if (originalConfig !== undefined) fs.writeFileSync(configFile, originalConfig)
-      if (feed) await new Promise(resolve => feed.server.close(resolve))
+      let restoreError = null
+      if (originalConfig !== undefined) {
+        try {
+          fs.writeFileSync(configFile, originalConfig)
+        } catch (restoreErr) {
+          restoreError = restoreErr
+        }
+      }
+      if (feed) {
+        try {
+          await new Promise(resolve => feed.server.close(resolve))
+        } catch (feedErr) {
+          if (!restoreError) restoreError = feedErr
+        }
+      }
       persist()
+      if (restoreError) {
+        report.ok = false
+        report.configRestoreError = String(restoreError.stack || restoreError)
+        throw restoreError
+      }
     }
   }
 }

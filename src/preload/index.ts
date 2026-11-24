@@ -67,16 +67,6 @@ import type {
     TrafficVisitQueueStatsDto,
     TrafficVisitRecoverResult,
 } from '../shared/traffic-visit-contracts'
-import type {
-    LayaHealthStatus,
-    LayaRiskContext,
-    LayaRiskResult,
-    LayaDecisionResult,
-    CampaignMetricsSnapshot,
-    CampaignOptimizationResult,
-    AccountHealthContext,
-    AccountHealthResult,
-} from '../shared/laya-types'
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
@@ -425,17 +415,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
             ipcRenderer.on('trafficBoost:status', handler)
             return () => ipcRenderer.removeListener('trafficBoost:status', handler)
         },
-    },
-
-    // Laya AI Integration
-    laya: {
-        healthCheck: () => ipcRenderer.invoke('laya:healthCheck'),
-        riskScore: (ctx: LayaRiskContext) => ipcRenderer.invoke('laya:riskScore', ctx),
-        decide: (type: string, payload: Record<string, unknown>) => ipcRenderer.invoke('laya:decide', { type, payload }),
-        optimizeCampaign: (metrics: CampaignMetricsSnapshot) => ipcRenderer.invoke('laya:optimizeCampaign', metrics),
-        shouldPauseCampaign: (metrics: CampaignMetricsSnapshot) => ipcRenderer.invoke('laya:shouldPauseCampaign', metrics),
-        evaluateAccountHealth: (ctx: AccountHealthContext) => ipcRenderer.invoke('laya:evaluateAccountHealth', ctx),
-        rankAccounts: (accounts: AccountHealthContext[]) => ipcRenderer.invoke('laya:rankAccounts', accounts),
     },
 
     // Runtime V2
@@ -920,15 +899,6 @@ declare global {
                 getVisitQueueStats: (campaignId: number) => Promise<TrafficVisitQueueStatsDto>
                 recoverVisitLeases: (campaignId: number) => Promise<TrafficVisitRecoverResult>
                 onStatusUpdate: (callback: (status: any) => void) => () => void
-            }
-            laya: {
-                healthCheck: () => Promise<LayaHealthStatus>
-                riskScore: (ctx: LayaRiskContext) => Promise<LayaRiskResult>
-                decide: (type: string, payload: Record<string, unknown>) => Promise<LayaDecisionResult>
-                optimizeCampaign: (metrics: CampaignMetricsSnapshot) => Promise<CampaignOptimizationResult>
-                shouldPauseCampaign: (metrics: CampaignMetricsSnapshot) => Promise<boolean>
-                evaluateAccountHealth: (ctx: AccountHealthContext) => Promise<AccountHealthResult>
-                rankAccounts: (accounts: AccountHealthContext[]) => Promise<Array<AccountHealthContext & { health: AccountHealthResult }>>
             }
             runtime: {
                 getStatusV2: () => Promise<any>

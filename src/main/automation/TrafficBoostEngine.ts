@@ -92,9 +92,6 @@ import {
     pickRandomActions,
 } from './traffic/TrafficVisitExecutor'
 import { trafficReportService } from './traffic/TrafficReportService'
-import { layaService } from '../services/LayaService'
-import { layaCampaignOptimizer } from '../services/LayaCampaignOptimizer'
-import { LayaRiskContext, type CampaignMetricsSnapshot } from '../../shared/laya-types'
 
 // ============================================================
 // Web SEO result helpers
@@ -1325,28 +1322,6 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                 }))
                 this.currentQueueDepth = waveCounters.remaining
 
-                // === Laya Campaign Optimizer (Phase 2) — advisory only, never stops campaign ===
-                try {
-                    const optimizerMetrics: CampaignMetricsSnapshot = {
-                        campaignId,
-                        campaignName: campaign.name,
-                        trafficMode: campaign.trafficMode || 'direct',
-                        totalVisits,
-                        completedVisits,
-                        failedVisits,
-                        successRate: totalVisits > 0 ? completedVisits / totalVisits : 1,
-                        consecutiveFailures: 0, // Not tracked at wave level; per-visit tracking is separate
-                        currentThreadCount: safeThreadCount,
-                        avgVisitDurationMs: 0,
-                        elapsedMs: Date.now() - startTime,
-                        locationCount: locationIds.length,
-                    }
-                    const optimization = await layaCampaignOptimizer.optimize(optimizerMetrics)
-                    console.log(`[TrafficBoost] Laya optimizer: pacing=${optimization.suggestedPacing} threads=${optimization.suggestedThreadCount} continue=${optimization.shouldContinue}`)
-                } catch (optErr) {
-                    console.log('[TrafficBoost] Laya optimizer offline, using default pacing')
-                }
-
                 // Keep campaign workers fully utilized via atomic durable claims.
                 const queueConcurrency = safeThreadCount
                 const visitQueue = new PQueue({
@@ -1418,32 +1393,6 @@ private ensureThreadDetail(threadIdx: number): ThreadDetail {
                                     this._currentRound = currentRound
                                 }
                                 await visitQueue.add(async () => {
-                                // === Laya AI Risk Gate ===
-                                try {
-                                    const layaCtx: LayaRiskContext = {
-                                        accountEmail: task.account?.email || 'anonymous',
-                                        locationName: task.location.name,
-                                        trafficMode: campaign.trafficMode || 'direct',
-                                        threadCount: safeThreadCount,
-                                        consecutiveFailures: failedVisits,
-                                    }
-                                    const risk = await layaService.riskScore(layaCtx)
-                                    console.log(`[TrafficBoost] Laya risk: score=${risk.score} level=${risk.level}`)
-                                    if (!risk.shouldProceed) {
-                                        console.warn(`[TrafficBoost] Laya risk gate BLOCKED visit (score=${risk.score}, reason=${risk.reason})`)
-                                        await trafficVisitQueue.failVisit(claimed.id, `laya_risk_gate:${risk.reason}`, { permanent: false })
-                                        return
-                                    }
-                                    const suggestedDelayMs = risk.suggestedDelayMs
-                                    if (suggestedDelayMs !== undefined && suggestedDelayMs > 0) {
-                                        console.log(`[TrafficBoost] Laya suggested delay: ${suggestedDelayMs}ms`)
-                                        await new Promise(resolve => setTimeout(resolve, Math.min(suggestedDelayMs, 30000)))
-                                    }
-                                } catch (layaErr) {
-                                    // Laya offline = silent skip, don't block the visit
-                                    console.log('[TrafficBoost] Laya AI offline, skipping risk check')
-                                }
-
                                 // Maps multi-IP traffic uses ephemeral browsers so one selected account
                                 // never serializes N concurrent proxy visits on the same map.
                                 const usePersistentProfile = !mapsMultiIpTraffic && !!task.account

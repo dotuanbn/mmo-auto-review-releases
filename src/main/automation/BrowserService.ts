@@ -344,8 +344,14 @@ export class BrowserService {
 
         try {
             if (bridgeKey) await proxyBridgeService.release(bridgeKey)
+        } catch {
+            logProxy(`[BrowserService] Failed to release proxy bridge for context ${contextId} (bridge_release_failed)`)
         } finally {
-            releaseResources?.()
+            try {
+                releaseResources?.()
+            } catch {
+                /* ignore */
+            }
             this.scheduleIdleBrowserClose()
         }
 
@@ -372,7 +378,13 @@ export class BrowserService {
             `[BrowserService] Disposing ${ids.length} ephemeral context(s) after ${reason}` +
                 ` (persistent locks/bridges preserved)`
         )
-        await Promise.all(ids.map((id) => this.disposeContextState(id)))
+        await Promise.all(
+            ids.map((id) =>
+                this.disposeContextState(id).catch(() => {
+                    logProxy(`[BrowserService] Ephemeral cleanup error for context ${id} (ephemeral_dispose_failed)`)
+                })
+            )
+        )
     }
 
     /** Remove locks whose context is no longer tracked (crash / missed close). */
@@ -596,8 +608,8 @@ export class BrowserService {
 
         // Single source of truth: fingerprint UA + Client Hints + WebGL stay in sync
         const fingerprint = config.userAgent
-            ? fingerprintService.generateForUserAgent(config.userAgent)
-            : fingerprintService.generate()
+            ? fingerprintService.generateForUserAgent(config.userAgent, { cache: false })
+            : fingerprintService.generate({ cache: false })
         this.contextFingerprints.set(contextId, fingerprint)
         const viewport = this.resolveResourceViewport(config, fingerprint)
 
@@ -644,7 +656,9 @@ export class BrowserService {
 
             // External/user close: full idempotent dispose (maps + bridge + lock).
             context.on('close', () => {
-                void this.disposeContextState(contextId)
+                void this.disposeContextState(contextId).catch(() => {
+                    logProxy(`[BrowserService] Context ${contextId} on-close cleanup error (persistent_close_failed)`)
+                })
             })
 
             const page = context.pages().find(candidate => !candidate.isClosed()) || await context.newPage()
@@ -718,8 +732,8 @@ export class BrowserService {
 
         // Single source of truth: fingerprint stays consistent with effective UA
         const fingerprint = config.userAgent
-            ? fingerprintService.generateForUserAgent(config.userAgent)
-            : fingerprintService.generate()
+            ? fingerprintService.generateForUserAgent(config.userAgent, { cache: false })
+            : fingerprintService.generate({ cache: false })
         this.contextFingerprints.set(contextId, fingerprint)
         const viewport = this.resolveResourceViewport(config, fingerprint)
 
@@ -753,7 +767,9 @@ export class BrowserService {
 
             // External close / shared-browser teardown: full idempotent dispose.
             context.on('close', () => {
-                void this.disposeContextState(contextId)
+                void this.disposeContextState(contextId).catch(() => {
+                    logProxy(`[BrowserService] Ephemeral ${contextId} on-close cleanup error (ephemeral_close_failed)`)
+                })
             })
 
             const page = await context.newPage()
@@ -783,6 +799,13 @@ export class BrowserService {
 
     getPage(contextId: number): Page | undefined {
         return this.pages.get(contextId)
+    }
+
+    /**
+     * Get fingerprint for a live context (transient per-context object).
+     */
+    getFingerprint(contextId: number): BrowserFingerprint | undefined {
+        return this.contextFingerprints.get(contextId)
     }
 
     getRuntimeStats(): BrowserRuntimeStats {

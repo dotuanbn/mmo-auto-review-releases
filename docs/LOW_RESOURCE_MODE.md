@@ -11,8 +11,9 @@ Trong Cài đặt → Hiệu năng & máy cấu hình thấp, bật **Chế đ�
 - Vùng render tối đa 1280×720. Đồng bộ kích thước màn hình trong fingerprint, giữ đầy đủ ảnh, bản đồ, JavaScript và các yêu cầu mạng.
 - Chrome dùng chung không có phiên hoạt động được đóng sau 30 giây. Khi chuyển sang phiên profile riêng, thu hồi Chrome dùng chung đang nhàn rỗi trước. Profile đăng nhập của người dùng được giữ nguyên.
 - Warmup, xác minh review và Helpful Vote không bị hoãn hoặc giảm mức song song do công tắc tiết kiệm. Các quy tắc tài khoản, lịch và tốc độ nghiệp vụ vốn có vẫn áp dụng.
-- Laya cục bộ chỉ khởi động khi RAM trống từ 2 GB; thiếu RAM dùng chính cơ chế dự phòng hiện có. Giới hạn thư viện tính toán còn 1 luồng và tắt model sau 60 giây không suy luận, không ngắt yêu cầu đang xử lý. Kiểm tra sức khỏe thụ động không giữ model trong RAM.
 - Giảm hiệu ứng trang trí và tải giao diện theo trang. Hoãn polling/nhật ký monitor khi cửa sổ ẩn; bộ đệm sự kiện và số nhật ký hiển thị có giới hạn. Nhật ký bền vững không bị xóa.
+
+Ghi chú ngày 24/11/2026: ứng dụng không còn đóng gói sidecar/model Laya.
 
 ## Kiểm chứng
 

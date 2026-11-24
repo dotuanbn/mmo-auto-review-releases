@@ -1,11 +1,43 @@
 import { getDatabase } from '../../database'
 import * as schema from '../../database/schema'
-import { desc, eq } from 'drizzle-orm'
+import { and, asc, desc, eq, gt, inArray } from 'drizzle-orm'
 import {
     classifyTrafficFailureMessage,
     readTrafficFailureBucketFromActions,
 } from '../TrafficFailureClassifier'
 import type { TrafficReport, VisitActionRecord } from './types'
+
+const REPORT_PAGE_SIZE = 500
+const MAX_RECENT_LOGS = 100
+
+function recordActionCounts(rawActions: string, counts: Map<string, number>): void {
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(rawActions || '[]')
+    } catch {
+        return
+    }
+
+    if (!Array.isArray(parsed)) {
+        return
+    }
+
+    for (let index = 0; index < parsed.length; index++) {
+        const item = parsed[index]
+        let action: string
+        if (typeof item === 'string') {
+            action = item
+        } else if (!item || typeof item !== 'object') {
+            action = `step_${index + 1}`
+        } else {
+            const record = item as Record<string, unknown>
+            action = typeof record.action === 'string'
+                ? record.action
+                : `step_${index + 1}`
+        }
+        counts.set(action, (counts.get(action) || 0) + 1)
+    }
+}
 
 /**
  * Stateless traffic report queries. Reads the database only; no engine runtime state.
@@ -16,30 +48,137 @@ export class TrafficReportService {
         const campaign = db.select().from(schema.trafficCampaigns).where(eq(schema.trafficCampaigns.id, campaignId)).get()
         if (!campaign) throw new Error('Campaign not found')
 
-        const logs = db.select().from(schema.trafficLogs)
-            .where(eq(schema.trafficLogs.campaignId, campaignId))
-            .all()
-
-        // Aggregate by location
+        // Aggregate by location (projected typed select - no secret columns)
         const locationMap = new Map<number, { name: string; visits: number; totalDuration: number }>()
-        const locationIds: number[] = JSON.parse(campaign.locationIds || '[]')
-        const allLocations = db.select().from(schema.locations).all().filter(l => locationIds.includes(l.id))
-        for (const loc of allLocations) {
-            locationMap.set(loc.id, { name: loc.name, visits: 0, totalDuration: 0 })
+        let locationIds: number[] = []
+        try {
+            const parsed = JSON.parse(campaign.locationIds || '[]')
+            if (Array.isArray(parsed)) {
+                locationIds = parsed.filter((id): id is number => typeof id === 'number')
+            }
+        } catch {
+            locationIds = []
         }
 
-        // Aggregate by account
+        if (locationIds.length > 0) {
+            const uniqueLocIds = Array.from(new Set(locationIds))
+            const locRows = db.select({
+                id: schema.locations.id,
+                name: schema.locations.name,
+            })
+                .from(schema.locations)
+                .where(inArray(schema.locations.id, uniqueLocIds))
+                .all()
+
+            for (const loc of locRows) {
+                locationMap.set(loc.id, { name: loc.name, visits: 0, totalDuration: 0 })
+            }
+        }
+
+        // Aggregate by account (projected typed select - no secret columns like password/2FA)
         const accountMap = new Map<number, { email: string; visits: number }>()
-        const accountIds: number[] = JSON.parse(campaign.accountIds || '[]')
+        let accountIds: number[] = []
+        try {
+            const parsed = JSON.parse(campaign.accountIds || '[]')
+            if (Array.isArray(parsed)) {
+                accountIds = parsed.filter((id): id is number => typeof id === 'number')
+            }
+        } catch {
+            accountIds = []
+        }
+
         if (accountIds.length > 0) {
-            const allAccounts = db.select().from(schema.accounts).all().filter(a => accountIds.includes(a.id))
-            for (const acc of allAccounts) {
+            const uniqueAccIds = Array.from(new Set(accountIds))
+            const accRows = db.select({
+                id: schema.accounts.id,
+                email: schema.accounts.email,
+            })
+                .from(schema.accounts)
+                .where(inArray(schema.accounts.id, uniqueAccIds))
+                .all()
+
+            for (const acc of accRows) {
                 accountMap.set(acc.id, { email: acc.email, visits: 0 })
             }
         }
 
         const actionCounts = new Map<string, number>()
         let totalDuration = 0
+        let successCount = 0
+        let lastId = 0
+
+        // Keyset pagination in bounded pages of 500 rows on increasing id (O(1) CPU per row)
+        while (true) {
+            const whereClause = lastId === 0
+                ? eq(schema.trafficLogs.campaignId, campaignId)
+                : and(
+                    eq(schema.trafficLogs.campaignId, campaignId),
+                    gt(schema.trafficLogs.id, lastId)
+                )
+
+            const page = db.select({
+                id: schema.trafficLogs.id,
+                status: schema.trafficLogs.status,
+                duration: schema.trafficLogs.duration,
+                locationId: schema.trafficLogs.locationId,
+                accountId: schema.trafficLogs.accountId,
+                actions: schema.trafficLogs.actions,
+            })
+                .from(schema.trafficLogs)
+                .where(whereClause)
+                .orderBy(asc(schema.trafficLogs.id))
+                .limit(REPORT_PAGE_SIZE)
+                .all()
+
+            if (page.length === 0) break
+
+            for (const log of page) {
+                // Location stats
+                const locData = locationMap.get(log.locationId)
+                if (locData && log.status === 'success') {
+                    locData.visits++
+                    locData.totalDuration += log.duration || 0
+                }
+
+                // Account stats
+                if (log.accountId) {
+                    const accData = accountMap.get(log.accountId)
+                    if (accData && log.status === 'success') {
+                        accData.visits++
+                    }
+                }
+
+                // Action stats (streaming count, raw action objects not retained)
+                recordActionCounts(log.actions, actionCounts)
+
+                totalDuration += log.duration || 0
+                if (log.status === 'success') {
+                    successCount++
+                }
+            }
+
+            lastId = page[page.length - 1].id
+            if (page.length < REPORT_PAGE_SIZE) break
+        }
+
+        // Separately bounded recent-row query: orderBy(desc(createdAt), asc(id)).limit(100)
+        // Preserves existing stable timestamp ties (earlier insertion id comes first on tie)
+        const recentRows = db.select({
+            id: schema.trafficLogs.id,
+            status: schema.trafficLogs.status,
+            round: schema.trafficLogs.round,
+            duration: schema.trafficLogs.duration,
+            createdAt: schema.trafficLogs.createdAt,
+            locationId: schema.trafficLogs.locationId,
+            accountId: schema.trafficLogs.accountId,
+            errorMessage: schema.trafficLogs.errorMessage,
+            actions: schema.trafficLogs.actions,
+        })
+            .from(schema.trafficLogs)
+            .where(eq(schema.trafficLogs.campaignId, campaignId))
+            .orderBy(desc(schema.trafficLogs.createdAt), asc(schema.trafficLogs.id))
+            .limit(MAX_RECENT_LOGS)
+            .all()
 
         const normalizeActions = (rawActions: string, fallbackTimestamp: unknown): VisitActionRecord[] => {
             let parsed: unknown
@@ -53,7 +192,7 @@ export class TrafficReportService {
                 return []
             }
 
-            const fallbackDate = new Date(fallbackTimestamp as any)
+            const fallbackDate = new Date(fallbackTimestamp as string | number | Date)
             const fallbackIso = Number.isNaN(fallbackDate.getTime())
                 ? new Date().toISOString()
                 : fallbackDate.toISOString()
@@ -111,29 +250,9 @@ export class TrafficReportService {
             })
         }
 
-        const normalizedLogs = logs.map(log => {
-            // Location stats
-            const locData = locationMap.get(log.locationId)
-            if (locData && log.status === 'success') {
-                locData.visits++
-                locData.totalDuration += log.duration || 0
-            }
-
-            // Account stats
-            if (log.accountId) {
-                const accData = accountMap.get(log.accountId)
-                if (accData && log.status === 'success') {
-                    accData.visits++
-                }
-            }
-
+        // Normalize at most 100 recent rows
+        const recentLogs = recentRows.map(log => {
             const actions = normalizeActions(log.actions || '[]', log.createdAt)
-            for (const action of actions) {
-                actionCounts.set(action.action, (actionCounts.get(action.action) || 0) + 1)
-            }
-
-            totalDuration += log.duration || 0
-
             const accountEmail = log.accountId
                 ? (accountMap.get(log.accountId)?.email || `Account #${log.accountId}`)
                 : 'Anonymous'
@@ -158,16 +277,6 @@ export class TrafficReportService {
             }
         })
 
-        const successLogs = logs.filter(l => l.status === 'success')
-        const recentLogs = normalizedLogs
-            .slice()
-            .sort((left, right) => {
-                const leftTime = new Date(left.createdAt as any).getTime() || 0
-                const rightTime = new Date(right.createdAt as any).getTime() || 0
-                return rightTime - leftTime
-            })
-            .slice(0, 100)
-
         return {
             campaignId,
             campaignName: campaign.name,
@@ -176,7 +285,7 @@ export class TrafficReportService {
             failedVisits: campaign.failedVisits,
             totalRounds: campaign.currentRound,
             totalDuration,
-            avgVisitDuration: successLogs.length > 0 ? Math.round(totalDuration / successLogs.length) : 0,
+            avgVisitDuration: successCount > 0 ? Math.round(totalDuration / successCount) : 0,
             visitsByLocation: Array.from(locationMap.entries()).map(([id, data]) => ({
                 locationId: id,
                 locationName: data.name,
@@ -199,34 +308,20 @@ export class TrafficReportService {
     /**
      * Traffic Audit Report — analyzes visit quality to explain the gap
      * between "successful visits" in the app and actual visits counted by Google.
+     * Processed in bounded keyset pages on increasing id.
      */
     getAuditReport(campaignId: number) {
         const db = getDatabase()
         const campaign = db.select().from(schema.trafficCampaigns).where(eq(schema.trafficCampaigns.id, campaignId)).get()
         if (!campaign) throw new Error('Campaign not found')
 
-        const logs = db.select().from(schema.trafficLogs)
-            .where(eq(schema.trafficLogs.campaignId, campaignId))
-            .all()
-
-        const successLogs = logs.filter(l => l.status === 'success')
-        const failedLogs = logs.filter(l => l.status === 'failed')
-
         // Analyze failed visits by error category
         const failureReasons: Record<string, number> = {}
-        for (const log of failedLogs) {
-            const msg = log.errorMessage || 'unknown'
-            let category = classifyTrafficFailureMessage(msg).bucket
-            try {
-                const parsedActions = JSON.parse(log.actions || '[]') as unknown
-                category = readTrafficFailureBucketFromActions(parsedActions) || category
-            } catch {
-                // Legacy or malformed rows still fall back to error_message classification.
-            }
-            failureReasons[category] = (failureReasons[category] || 0) + 1
-        }
 
         // Analyze success visits by quality
+        let totalAttempted = 0
+        let totalSuccess = 0
+        let totalFailed = 0
         let highQualityVisits = 0
         let mediumQualityVisits = 0
         let lowQualityVisits = 0
@@ -238,58 +333,105 @@ export class TrafficReportService {
         let legacyHighQualityVisits = 0
         let legacyMediumQualityVisits = 0
 
-        for (const log of successLogs) {
-            if ((log.duration || 0) < 15) veryShortVisits++
+        let lastId = 0
+        while (true) {
+            const whereClause = lastId === 0
+                ? eq(schema.trafficLogs.campaignId, campaignId)
+                : and(
+                    eq(schema.trafficLogs.campaignId, campaignId),
+                    gt(schema.trafficLogs.id, lastId)
+                )
 
-            let actions: unknown[] = []
-            try {
-                const parsed: unknown = JSON.parse(log.actions || '[]')
-                actions = Array.isArray(parsed) ? parsed : []
-            } catch { /* ignore */ }
-
-            // Prefer structured quality_score column (web_seo numeric + new logs); fallback legacy detail regex for generic modes
-            const hasStructuredQuality = log.discoverySource !== null || log.countable === true || log.qualityScore > 0
-            let score: number | null =
-                hasStructuredQuality && typeof log.qualityScore === 'number' && Number.isFinite(log.qualityScore)
-                    ? log.qualityScore
-                    : null
-
-            if (score == null) {
-                const qualityAction = actions.find((entry) => {
-                    if (!entry || typeof entry !== 'object') return false
-                    return (entry as { action?: unknown }).action === 'visit_quality_assessment'
-                }) as { detail?: unknown } | undefined
-                if (qualityAction && typeof qualityAction.detail === 'string') {
-                    const match = qualityAction.detail.match(/Quality=(\d+)\/100/)
-                    if (match) {
-                        score = parseInt(match[1], 10)
-                    }
-                }
-            }
-
-            if (score != null) {
-                totalQualityScore += score
-                qualityAssessmentCount++
-                if (score >= 60) {
-                    highQualityVisits++
-                    if (log.discoverySource === null) legacyHighQualityVisits++
-                } else if (score >= 40) {
-                    mediumQualityVisits++
-                    if (log.discoverySource === null) legacyMediumQualityVisits++
-                } else {
-                    lowQualityVisits++
-                }
-            }
-
-            if (log.discoverySource !== null && log.countable === true) {
-                structuredCountableVisits++
-            }
-
-            const proxyAction = actions.find((entry) => {
-                if (!entry || typeof entry !== 'object') return false
-                return (entry as { action?: unknown }).action === 'proxy_rotated_visit_ended'
+            const page = db.select({
+                id: schema.trafficLogs.id,
+                status: schema.trafficLogs.status,
+                duration: schema.trafficLogs.duration,
+                errorMessage: schema.trafficLogs.errorMessage,
+                actions: schema.trafficLogs.actions,
+                discoverySource: schema.trafficLogs.discoverySource,
+                qualityScore: schema.trafficLogs.qualityScore,
+                countable: schema.trafficLogs.countable,
             })
-            if (proxyAction) proxyRotatedVisits++
+                .from(schema.trafficLogs)
+                .where(whereClause)
+                .orderBy(asc(schema.trafficLogs.id))
+                .limit(REPORT_PAGE_SIZE)
+                .all()
+
+            if (page.length === 0) break
+
+            for (const log of page) {
+                totalAttempted++
+
+                if (log.status === 'failed') {
+                    totalFailed++
+                    const msg = log.errorMessage || 'unknown'
+                    let category = classifyTrafficFailureMessage(msg).bucket
+                    try {
+                        const parsedActions = JSON.parse(log.actions || '[]') as unknown
+                        category = readTrafficFailureBucketFromActions(parsedActions) || category
+                    } catch {
+                        // Legacy or malformed rows still fall back to error_message classification.
+                    }
+                    failureReasons[category] = (failureReasons[category] || 0) + 1
+                } else if (log.status === 'success') {
+                    totalSuccess++
+                    if ((log.duration || 0) < 15) veryShortVisits++
+
+                    let actions: unknown[] = []
+                    try {
+                        const parsed: unknown = JSON.parse(log.actions || '[]')
+                        actions = Array.isArray(parsed) ? parsed : []
+                    } catch { /* ignore */ }
+
+                    // Prefer structured quality_score column (web_seo numeric + new logs); fallback legacy detail regex for generic modes
+                    const hasStructuredQuality = log.discoverySource !== null || log.countable === true || log.qualityScore > 0
+                    let score: number | null =
+                        hasStructuredQuality && typeof log.qualityScore === 'number' && Number.isFinite(log.qualityScore)
+                            ? log.qualityScore
+                            : null
+
+                    if (score == null) {
+                        const qualityAction = actions.find((entry) => {
+                            if (!entry || typeof entry !== 'object') return false
+                            return (entry as { action?: unknown }).action === 'visit_quality_assessment'
+                        }) as { detail?: unknown } | undefined
+                        if (qualityAction && typeof qualityAction.detail === 'string') {
+                            const match = qualityAction.detail.match(/Quality=(\d+)\/100/)
+                            if (match) {
+                                score = parseInt(match[1], 10)
+                            }
+                        }
+                    }
+
+                    if (score != null) {
+                        totalQualityScore += score
+                        qualityAssessmentCount++
+                        if (score >= 60) {
+                            highQualityVisits++
+                            if (log.discoverySource === null) legacyHighQualityVisits++
+                        } else if (score >= 40) {
+                            mediumQualityVisits++
+                            if (log.discoverySource === null) legacyMediumQualityVisits++
+                        } else {
+                            lowQualityVisits++
+                        }
+                    }
+
+                    if (log.discoverySource !== null && log.countable === true) {
+                        structuredCountableVisits++
+                    }
+
+                    const proxyAction = actions.find((entry) => {
+                        if (!entry || typeof entry !== 'object') return false
+                        return (entry as { action?: unknown }).action === 'proxy_rotated_visit_ended'
+                    })
+                    if (proxyAction) proxyRotatedVisits++
+                }
+            }
+
+            lastId = page[page.length - 1].id
+            if (page.length < REPORT_PAGE_SIZE) break
         }
 
         const avgQuality = qualityAssessmentCount > 0 ? Math.round(totalQualityScore / qualityAssessmentCount) : 0
@@ -300,18 +442,18 @@ export class TrafficReportService {
         return {
             campaignId,
             campaignName: campaign.name,
-            totalAttempted: logs.length,
-            totalSuccess: successLogs.length,
-            totalFailed: failedLogs.length,
-            successRate: logs.length > 0 ? Math.round((successLogs.length / logs.length) * 100) : 0,
+            totalAttempted,
+            totalSuccess,
+            totalFailed,
+            successRate: totalAttempted > 0 ? Math.round((totalSuccess / totalAttempted) * 100) : 0,
             quality: {
                 highQuality: highQualityVisits,
                 mediumQuality: mediumQualityVisits,
                 lowQuality: lowQualityVisits,
                 avgQualityScore: avgQuality,
                 estimatedGoogleCountable,
-                estimatedGoogleRate: successLogs.length > 0
-                    ? Math.round((estimatedGoogleCountable / successLogs.length) * 100)
+                estimatedGoogleRate: totalSuccess > 0
+                    ? Math.round((estimatedGoogleCountable / totalSuccess) * 100)
                     : 0,
             },
             issues: {
@@ -326,7 +468,7 @@ export class TrafficReportService {
                 otherErrors: failureReasons['other'] || 0,
             },
             summary: this.buildAuditSummary(
-                logs.length, successLogs.length, failedLogs.length,
+                totalAttempted, totalSuccess, totalFailed,
                 highQualityVisits, mediumQualityVisits, lowQualityVisits,
                 estimatedGoogleCountable, failureReasons, proxyRotatedVisits, veryShortVisits
             ),

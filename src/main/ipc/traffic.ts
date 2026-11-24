@@ -2,7 +2,7 @@ import { ipcMain } from 'electron'
 import { z } from 'zod'
 import { getDatabase } from '../database'
 import { trafficTasks, TrafficTask, locations, trafficCampaigns, trafficLogs, accounts } from '../database/schema'
-import { eq, inArray } from 'drizzle-orm'
+import { desc, eq, inArray } from 'drizzle-orm'
 import { trafficBoostEngine } from '../automation/TrafficBoostEngine'
 import { trafficVisitQueue } from '../automation/TrafficVisitQueue'
 import {
@@ -110,14 +110,20 @@ function loadLocationNameMap(db: TrafficDb, locationIds: number[]): Map<number, 
     return names
 }
 
+const MAX_IPC_LOG_SAMPLE = 1000
+
 /**
  * Campaign logs plus display names.
+ * UI sample feed: returns at most 1000 latest rows sorted deterministically.
  * Three queries total (logs, accounts, locations) instead of two lookups per row.
  */
-function loadTrafficBoostLogs(campaignId: number) {
+export function loadTrafficBoostLogs(campaignId: number, limit: number = MAX_IPC_LOG_SAMPLE) {
     const db = getDatabase()
+    const boundedLimit = Math.max(1, Math.min(limit, MAX_IPC_LOG_SAMPLE))
     const logs = db.select().from(trafficLogs)
         .where(eq(trafficLogs.campaignId, campaignId))
+        .orderBy(desc(trafficLogs.id))
+        .limit(boundedLimit)
         .all()
     const accountEmails = loadAccountEmailMap(db, uniqueNumericIds(logs.map((log) => log.accountId)))
     const locationNames = loadLocationNameMap(db, uniqueNumericIds(logs.map((log) => log.locationId)))

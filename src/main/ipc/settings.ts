@@ -9,7 +9,6 @@ import {
 } from '../services/SecretVault'
 import { setRuntimeLogLevel } from '../utils/runtimeLogger'
 import { browserResourceGovernor } from '../services/BrowserResourceGovernor'
-import { layaSidecarManager } from '../services/LayaSidecarManager'
 import {
     absolutePathSchema,
     settingsKeySchema,
@@ -447,7 +446,6 @@ function syncFProxyServiceWithSettings(settings: SettingsRecord) {
 
 function syncRuntimeLoggerWithSettings(settings: SettingsRecord) {
     setRuntimeLogLevel(settings.logLevel)
-    layaSidecarManager.setLowResourceMode(settings.lowResourceMode === true)
     if (browserResourceGovernor.configure(settings.lowResourceMode === true)) {
         for (const window of BrowserWindow?.getAllWindows?.() ?? []) {
             if (!window.isDestroyed()) window.webContents.send('performance:changed', settings.lowResourceMode === true)

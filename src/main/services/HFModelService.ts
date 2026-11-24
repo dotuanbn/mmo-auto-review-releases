@@ -34,8 +34,20 @@ import type {
 // ============================================================
 
 const DEFAULT_TIMEOUT_MS = 120_000 // 2 minutes for model loading + inference
+const INIT_TIMEOUT_MS = 30_000
 const IDLE_DISPOSE_MS = 5 * 60 * 1000 // Auto-unload after 5 min idle
 const WORKER_SCRIPT_FILENAME = 'hf-inference.worker.js'
+
+type PendingWorkerRequest = {
+  resolve: (data: unknown) => void
+  reject: (err: Error) => void
+  timeout: ReturnType<typeof setTimeout>
+  generation: number
+}
+
+function asError(err: unknown, fallback: string): Error {
+  return err instanceof Error ? err : new Error(fallback)
+}
 
 // ============================================================
 // HFModelService
@@ -44,13 +56,16 @@ const WORKER_SCRIPT_FILENAME = 'hf-inference.worker.js'
 class HFModelService {
   private worker: Worker | null = null
   private workerReady = false
+  /** Bumped on every spawn and on dispose so stale worker callbacks cannot mutate the replacement. */
+  private workerGeneration = 0
+  /** Bumped only on dispose; queued work captures this at admission. */
+  private disposalEpoch = 0
+  private initPromise: Promise<void> | null = null
+  private initTimeout: ReturnType<typeof setTimeout> | null = null
+  private initReject: ((err: Error) => void) | null = null
 
   /** Pending requests awaiting worker response, keyed by taskId */
-  private pendingRequests: Map<string, {
-    resolve: (data: unknown) => void
-    reject: (err: Error) => void
-    timeout: ReturnType<typeof setTimeout>
-  }> = new Map()
+  private pendingRequests: Map<string, PendingWorkerRequest> = new Map()
 
   /** Tracks which models are currently loaded */
   private activeModels: Map<HFTaskType, { model: string; loadedAt: number }> = new Map()
@@ -78,13 +93,16 @@ class HFModelService {
    */
   async generateText(prompt: string, options?: TextGenOptions): Promise<string> {
     this.assertEnabled()
+    const epoch = this.disposalEpoch
     const task: HFTaskType = 'text-generation'
     const startTime = performance.now()
     const modelId = this.activeModels.get(task)?.model ?? 'unknown'
 
     try {
       const result = await this.queue.add(async () => {
-        await this.ensureModelLoaded(task)
+        this.assertAdmission(epoch)
+        await this.ensureModelLoaded(task, epoch)
+        this.assertAdmission(epoch)
         this.resetIdleTimer(task)
 
         const predictOptions: Record<string, unknown> = {
@@ -108,7 +126,7 @@ class HFModelService {
           input: chatInput,
           options: predictOptions,
         })
-
+        this.assertAdmission(epoch)
         return response
       })
 
@@ -146,12 +164,15 @@ class HFModelService {
    */
   async classifyImage(imageBase64: string, labels: string[]): Promise<ClassifyResult[]> {
     this.assertEnabled()
+    const epoch = this.disposalEpoch
     const task: HFTaskType = 'zero-shot-image-classification'
     const startTime = performance.now()
 
     try {
       const result = await this.queue.add(async () => {
-        await this.ensureModelLoaded(task)
+        this.assertAdmission(epoch)
+        await this.ensureModelLoaded(task, epoch)
+        this.assertAdmission(epoch)
         this.resetIdleTimer(task)
 
         const response = await this.sendToWorker({
@@ -161,7 +182,7 @@ class HFModelService {
           input: imageBase64,
           options: { candidate_labels: labels },
         })
-
+        this.assertAdmission(epoch)
         return response
       })
 
@@ -199,12 +220,15 @@ class HFModelService {
    */
   async detectObjects(imageBase64: string, queries: string[]): Promise<DetectionResult[]> {
     this.assertEnabled()
+    const epoch = this.disposalEpoch
     const task: HFTaskType = 'zero-shot-object-detection'
     const startTime = performance.now()
 
     try {
       const result = await this.queue.add(async () => {
-        await this.ensureModelLoaded(task)
+        this.assertAdmission(epoch)
+        await this.ensureModelLoaded(task, epoch)
+        this.assertAdmission(epoch)
         this.resetIdleTimer(task)
 
         const response = await this.sendToWorker({
@@ -214,7 +238,7 @@ class HFModelService {
           input: imageBase64,
           options: { candidate_labels: queries },
         })
-
+        this.assertAdmission(epoch)
         return response
       })
 
@@ -304,7 +328,8 @@ class HFModelService {
    */
   async preloadModel(task: HFTaskType, modelOverride?: string): Promise<void> {
     this.assertEnabled()
-    await this.ensureModelLoaded(task, modelOverride)
+    const epoch = this.disposalEpoch
+    await this.ensureModelLoaded(task, epoch, modelOverride)
   }
 
   /**
@@ -324,28 +349,34 @@ class HFModelService {
   }
 
   /**
-   * Dispose all resources — kill worker, clear timers.
+   * Dispose all resources — cancel in-flight init, kill owned worker, clear timers.
+   * Later explicit requests may initialize a new worker.
    */
   async dispose(): Promise<void> {
-    // Clear all idle timers
-    Array.from(this.idleTimers.values()).forEach((timer) => clearTimeout(timer))
-    this.idleTimers.clear()
+    this.disposalEpoch += 1
+    this.workerGeneration += 1
+    this.clearInitTimeout()
+
+    const rejectInit = this.initReject
+    this.initReject = null
+    this.initPromise = null
+
+    this.clearAllIdleTimers()
     this.activeModels.clear()
+    this.rejectAllPending(new Error('HFModelService disposed'))
 
-    // Reject all pending requests
-    Array.from(this.pendingRequests.values()).forEach((pending) => {
-      clearTimeout(pending.timeout)
-      pending.reject(new Error('HFModelService disposed'))
-    })
-    this.pendingRequests.clear()
+    const worker = this.worker
+    this.worker = null
+    this.workerReady = false
 
-    // Kill worker
-    if (this.worker) {
+    if (rejectInit) {
+      rejectInit(new Error('HFModelService disposed'))
+    }
+
+    if (worker) {
       try {
-        await this.worker.terminate()
+        await worker.terminate()
       } catch { /* ignore */ }
-      this.worker = null
-      this.workerReady = false
     }
   }
 
@@ -380,61 +411,146 @@ class HFModelService {
 
   private async ensureWorkerAlive(): Promise<void> {
     if (this.worker && this.workerReady) return
+    if (this.initPromise) return this.initPromise
 
-    // Kill existing dead worker
-    if (this.worker) {
-      try { await this.worker.terminate() } catch { /* ignore */ }
-      this.worker = null
-      this.workerReady = false
+    // Generation is bumped before leftover terminate so a stale exit cannot clobber the replacement.
+    const generation = ++this.workerGeneration
+    const spawnPromise = this.spawnWorker(generation)
+    this.initPromise = spawnPromise
+    try {
+      await spawnPromise
+    } finally {
+      if (this.initPromise === spawnPromise) {
+        this.initPromise = null
+      }
+    }
+  }
+
+  private spawnWorker(generation: number): Promise<void> {
+    const leftover = this.worker
+    this.worker = null
+    this.workerReady = false
+    if (leftover) {
+      void leftover.terminate().catch(() => undefined)
     }
 
     return new Promise<void>((resolve, reject) => {
-      const workerPath = this.getWorkerScriptPath()
-      console.log(`[HFModelService] Spawning worker from: ${workerPath}`)
+      let settled = false
 
-      // NOTE: Electron blocks execArgv flags (e.g. --expose-gc) on worker_threads.
-      // The worker has a defensive try/catch for global.gc(), so it's safe without the flag.
-      this.worker = new Worker(workerPath)
+      const settle = (error?: Error): void => {
+        if (settled) return
+        settled = true
+        this.clearInitTimeout()
+        if (this.initReject === settleReject) {
+          this.initReject = null
+        }
+        if (error) reject(error)
+        else resolve()
+      }
 
-      const initTimeout = setTimeout(() => {
-        reject(new Error('Worker failed to initialize within 30s'))
-      }, 30_000)
+      const settleReject = (error: Error): void => {
+        settle(error)
+      }
+      this.initReject = settleReject
 
-      this.worker.on('message', (msg: WorkerResponse) => {
-        // Handle init ready signal
+      let worker: Worker
+      try {
+        const workerPath = this.getWorkerScriptPath()
+        console.log(`[HFModelService] Spawning worker from: ${workerPath}`)
+        // NOTE: Electron blocks execArgv flags (e.g. --expose-gc) on worker_threads.
+        // The worker has a defensive try/catch for global.gc(), so it's safe without the flag.
+        worker = new Worker(workerPath)
+      } catch (err) {
+        settle(asError(err, 'Failed to spawn HF worker'))
+        return
+      }
+
+      this.worker = worker
+
+      this.initTimeout = setTimeout(() => {
+        if (settled || this.workerGeneration !== generation) return
+        const error = new Error('Worker failed to initialize within 30s')
+        settle(error)
+        this.failOwnedWorker(worker, generation, error, true)
+      }, INIT_TIMEOUT_MS)
+
+      worker.on('message', (msg: WorkerResponse) => {
+        if (this.workerGeneration !== generation) return
         if (msg.type === 'ready' && msg.taskId === '__init__') {
-          clearTimeout(initTimeout)
+          if (settled || this.worker !== worker) return
           this.workerReady = true
           console.log('[HFModelService] Worker thread ready')
-          resolve()
+          settle()
           return
         }
-
-        // Route response to pending request
         this.handleWorkerMessage(msg)
       })
 
-      this.worker.on('error', (err) => {
+      worker.on('error', (err) => {
+        if (this.workerGeneration !== generation) return
         console.error('[HFModelService] Worker error:', err.message)
-        clearTimeout(initTimeout)
-        this.workerReady = false
-        reject(err)
+        const error = asError(err, 'HF worker error')
+        settle(error)
+        this.failOwnedWorker(worker, generation, error, true)
       })
 
-      this.worker.on('exit', (code) => {
+      worker.on('exit', (code) => {
+        if (this.workerGeneration !== generation) return
         console.warn(`[HFModelService] Worker exited with code ${code}`)
-        this.workerReady = false
-        this.worker = null
-        this.activeModels.clear()
-
-        // Reject all pending
-        Array.from(this.pendingRequests.values()).forEach((pending) => {
-          clearTimeout(pending.timeout)
-          pending.reject(new Error(`Worker exited unexpectedly (code=${code})`))
-        })
-        this.pendingRequests.clear()
+        const error = new Error(`Worker exited unexpectedly (code=${code})`)
+        this.failOwnedWorker(worker, generation, error, false)
+        settle(error)
       })
     })
+  }
+
+  private failOwnedWorker(
+    worker: Worker,
+    generation: number,
+    error: Error,
+    terminate: boolean,
+  ): void {
+    if (this.workerGeneration !== generation) return
+
+    this.workerReady = false
+    if (this.worker === worker) {
+      this.worker = null
+    }
+    this.activeModels.clear()
+    this.clearAllIdleTimers()
+    this.rejectPendingForGeneration(generation, error)
+
+    if (terminate) {
+      void worker.terminate().catch(() => undefined)
+    }
+  }
+
+  private clearInitTimeout(): void {
+    if (!this.initTimeout) return
+    clearTimeout(this.initTimeout)
+    this.initTimeout = null
+  }
+
+  private clearAllIdleTimers(): void {
+    Array.from(this.idleTimers.values()).forEach((timer) => clearTimeout(timer))
+    this.idleTimers.clear()
+  }
+
+  private rejectAllPending(error: Error): void {
+    Array.from(this.pendingRequests.values()).forEach((pending) => {
+      clearTimeout(pending.timeout)
+      pending.reject(error)
+    })
+    this.pendingRequests.clear()
+  }
+
+  private rejectPendingForGeneration(generation: number, error: Error): void {
+    for (const [taskId, pending] of Array.from(this.pendingRequests.entries())) {
+      if (pending.generation !== generation) continue
+      clearTimeout(pending.timeout)
+      this.pendingRequests.delete(taskId)
+      pending.reject(error)
+    }
   }
 
   // ============================================================
@@ -484,23 +600,33 @@ class HFModelService {
   private async sendToWorker(request: WorkerRequest, timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<unknown> {
     await this.ensureWorkerAlive()
 
-    if (!this.worker) {
+    if (!this.worker || !this.workerReady) {
       throw new Error('Worker not available')
     }
 
+    const generation = this.workerGeneration
+    const worker = this.worker
+
     return new Promise((resolve, reject) => {
+      if (this.workerGeneration !== generation || this.worker !== worker || !this.workerReady) {
+        reject(new Error('Worker not available'))
+        return
+      }
+
       const timeout = setTimeout(() => {
+        const pending = this.pendingRequests.get(request.taskId)
+        if (!pending) return
         this.pendingRequests.delete(request.taskId)
         reject(new Error(`Worker request timed out after ${timeoutMs}ms (taskId=${request.taskId})`))
       }, timeoutMs)
 
-      this.pendingRequests.set(request.taskId, { resolve, reject, timeout })
+      this.pendingRequests.set(request.taskId, { resolve, reject, timeout, generation })
       try {
-        this.worker?.postMessage(request)
+        worker.postMessage(request)
       } catch (err) {
         clearTimeout(timeout)
         this.pendingRequests.delete(request.taskId)
-        reject(err)
+        reject(asError(err, 'Failed to post message to HF worker'))
       }
     })
   }
@@ -509,7 +635,12 @@ class HFModelService {
   // Internal — Model Lifecycle
   // ============================================================
 
-  private async ensureModelLoaded(task: HFTaskType, modelOverride?: string): Promise<void> {
+  private async ensureModelLoaded(
+    task: HFTaskType,
+    epoch: number,
+    modelOverride?: string,
+  ): Promise<void> {
+    this.assertAdmission(epoch)
     const settings = loadSettings()
     const userModel = task === 'text-generation' ? settings.hfTextGenModel : undefined
     const modelId = resolveModelId(task, modelOverride || userModel)
@@ -543,6 +674,7 @@ class HFModelService {
       cacheDir: this.getModelCacheDir(),
     })
 
+    this.assertAdmission(epoch)
     this.activeModels.set(task, { model: modelId, loadedAt: Date.now() })
     console.log(`[HFModelService] Model loaded: ${modelId}`)
   }
@@ -587,6 +719,12 @@ class HFModelService {
     const settings = loadSettings()
     if (settings.hfModelEnabled !== true) {
       throw new Error('Hugging Face AI chưa được bật. Vào Settings → In-house AI → Bật toggle.')
+    }
+  }
+
+  private assertAdmission(epoch: number): void {
+    if (epoch !== this.disposalEpoch) {
+      throw new Error('HFModelService disposed')
     }
   }
 

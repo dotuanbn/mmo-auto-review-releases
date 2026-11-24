@@ -118,6 +118,10 @@ export interface BrowserFingerprint {
     createdAt: Date
 }
 
+export interface FingerprintGenerationOptions {
+    cache?: boolean
+}
+
 export class FingerprintService {
     private fingerprints: Map<string, BrowserFingerprint> = new Map()
 
@@ -160,15 +164,15 @@ export class FingerprintService {
     }
 
     // Generate a new fingerprint
-    generate(): BrowserFingerprint {
-        return this.generateForUserAgent(this.getRandomUserAgent())
+    generate(options?: FingerprintGenerationOptions): BrowserFingerprint {
+        return this.generateForUserAgent(this.getRandomUserAgent(), options)
     }
 
     /**
      * Build a fingerprint whose UA / platform / WebGL / Client Hints stay consistent.
      * Use when a caller already chose a User-Agent (randomizeUserAgent path).
      */
-    generateForUserAgent(userAgent: string): BrowserFingerprint {
+    generateForUserAgent(userAgent: string, options?: FingerprintGenerationOptions): BrowserFingerprint {
         // Normalize invalid Windows 11 UA token if any external caller passes it
         const normalizedUa = userAgent.replace(/Windows NT 11\.0/g, 'Windows NT 10.0')
         const isWindows = !normalizedUa.includes('Macintosh')
@@ -191,7 +195,9 @@ export class FingerprintService {
         }
         fingerprint.clientHints = this.getClientHints(fingerprint)
 
-        this.fingerprints.set(fingerprint.id, fingerprint)
+        if (options?.cache !== false) {
+            this.fingerprints.set(fingerprint.id, fingerprint)
+        }
         return fingerprint
     }
 
@@ -203,6 +209,16 @@ export class FingerprintService {
     // Store fingerprint (for persistence)
     store(fingerprint: BrowserFingerprint): void {
         this.fingerprints.set(fingerprint.id, fingerprint)
+    }
+
+    // Number of cached fingerprints (for diagnostics and tests)
+    getCacheSize(): number {
+        return this.fingerprints.size
+    }
+
+    // Clear cached fingerprints (for test isolation)
+    clearCache(): void {
+        this.fingerprints.clear()
     }
 
     // Generate Playwright browser launch args for fingerprint

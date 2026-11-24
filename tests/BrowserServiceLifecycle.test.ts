@@ -44,22 +44,43 @@ vi.mock('../src/main/automation/BrowserCursorOverlay', () => ({
     setupAutoReinject: vi.fn(() => {}),
 }))
 
+const mockGenerate = vi.fn((_options?: { cache?: boolean }) => ({
+    id: 'mock-fp-generate',
+    userAgent: 'Mozilla/5.0 Test',
+    languages: ['en-US'],
+    platform: 'Win32',
+    hardwareConcurrency: 4,
+    deviceMemory: 8,
+    screenResolution: { width: 1366, height: 768 },
+    colorDepth: 24,
+    devicePixelRatio: 1,
+    timezone: { name: 'UTC' },
+    webgl: { vendor: 'Test', renderer: 'Test' },
+    canvasNoise: 0.1,
+    audioNoise: 0.1,
+}))
+
+const mockGenerateForUserAgent = vi.fn((ua: string, _options?: { cache?: boolean }) => ({
+    id: 'mock-fp-ua',
+    userAgent: ua,
+    languages: ['en-US'],
+    platform: 'Win32',
+    hardwareConcurrency: 4,
+    deviceMemory: 8,
+    screenResolution: { width: 1366, height: 768 },
+    colorDepth: 24,
+    devicePixelRatio: 1,
+    timezone: { name: 'UTC' },
+    webgl: { vendor: 'Test', renderer: 'Test' },
+    canvasNoise: 0.1,
+    audioNoise: 0.1,
+}))
+
 vi.mock('../src/main/services/FingerprintService', () => ({
     fingerprintService: {
-        generate: () => ({
-            userAgent: 'Mozilla/5.0 Test',
-            languages: ['en-US'],
-            platform: 'Win32',
-            hardwareConcurrency: 4,
-            deviceMemory: 8,
-            screenResolution: { width: 1366, height: 768 },
-            colorDepth: 24,
-            devicePixelRatio: 1,
-            timezone: { name: 'UTC' },
-            webgl: { vendor: 'Test', renderer: 'Test' },
-            canvasNoise: 0.1,
-            audioNoise: 0.1,
-        }),
+        generate: (options?: { cache?: boolean }) => mockGenerate(options),
+        generateForUserAgent: (ua: string, options?: { cache?: boolean }) => mockGenerateForUserAgent(ua, options),
+        getRandomUserAgent: () => 'Mozilla/5.0 Test',
     },
 }))
 
@@ -177,6 +198,8 @@ describe('BrowserService lifecycle (ephemeral vs persistent)', () => {
         })
         launch.mockClear()
         launchPersistentContext.mockClear()
+        mockGenerate.mockClear()
+        mockGenerateForUserAgent.mockClear()
         // Drop any leftover process-global locks from prior tests.
         profileLockService.releaseAll()
         fakeBrowser._setConnected(true)
@@ -288,6 +311,66 @@ describe('BrowserService lifecycle (ephemeral vs persistent)', () => {
         expect(mockCloseAll).not.toHaveBeenCalled()
         // Idempotent second close must not throw
         await svc.closeContext(id)
+    })
+
+    it('passes { cache: false } for transient fingerprints in persistent and ephemeral contexts', async () => {
+        const svc = new BrowserService()
+        const persistentId = await svc.createContext({
+            headless: true,
+            profilePath: 'C:\\profiles\\transient-fp-persistent',
+        })
+        expect(mockGenerate).toHaveBeenCalledWith({ cache: false })
+        expect(svc.getFingerprint(persistentId)).toBeDefined()
+        expect(svc.getFingerprint(persistentId)?.id).toBe('mock-fp-generate')
+
+        const ephemeralId = await svc.createEphemeralContext({
+            headless: true,
+            userAgent: 'Custom-Ephemeral-UA',
+        })
+        expect(mockGenerateForUserAgent).toHaveBeenCalledWith('Custom-Ephemeral-UA', { cache: false })
+        expect(svc.getFingerprint(ephemeralId)).toBeDefined()
+        expect(svc.getFingerprint(ephemeralId)?.userAgent).toBe('Custom-Ephemeral-UA')
+
+        await svc.closeContext(persistentId)
+        await svc.closeContext(ephemeralId)
+        expect(svc.getFingerprint(persistentId)).toBeUndefined()
+        expect(svc.getFingerprint(ephemeralId)).toBeUndefined()
+    })
+
+    it('passes { cache: false } and cleans up context fingerprint on repeated failed launches', async () => {
+        const svc = new BrowserService()
+        launchPersistentContext.mockRejectedValueOnce(new Error('Persistent launch failure 1'))
+        await expect(svc.createContext({ headless: true, profilePath: 'C:\\profiles\\failed-launch-1' }))
+            .rejects.toThrow(/Persistent launch failure 1/)
+        expect(mockGenerate).toHaveBeenCalledWith({ cache: false })
+
+        launchPersistentContext.mockRejectedValueOnce(new Error('Persistent launch failure 2'))
+        await expect(
+            svc.createContext({
+                headless: true,
+                profilePath: 'C:\\profiles\\failed-launch-2',
+                userAgent: 'Failed-UA',
+            })
+        ).rejects.toThrow(/Persistent launch failure 2/)
+        expect(mockGenerateForUserAgent).toHaveBeenCalledWith('Failed-UA', { cache: false })
+
+        expect(svc.getFingerprint(1)).toBeUndefined()
+        expect(svc.getFingerprint(2)).toBeUndefined()
+        expect(svc.getContext(1)).toBeUndefined()
+        expect(svc.getContext(2)).toBeUndefined()
+    })
+
+    it('safely contains proxy release or cleanup rejections during disposeContextState', async () => {
+        const svc = new BrowserService()
+        mockRelease.mockRejectedValueOnce(new Error('Simulated proxy release network error'))
+        const id = await svc.createEphemeralContext({
+            headless: true,
+            proxy: { host: '10.0.0.1', port: 8080, type: 'http' },
+        })
+        // Closing context must not reject even when proxy bridge release rejects
+        await expect(svc.closeContext(id)).resolves.toBeUndefined()
+        expect(svc.getContext(id)).toBeUndefined()
+        expect(svc.getFingerprint(id)).toBeUndefined()
     })
 })
 
