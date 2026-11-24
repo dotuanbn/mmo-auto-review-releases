@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EventEmitter } from 'events'
+import { join, resolve } from 'node:path'
 import {
     RuntimeHealthService,
     RendererRecoveryController,
@@ -20,6 +21,9 @@ import {
 } from '../src/main/services/RuntimeHealthService'
 
 describe('RuntimeHealthService', () => {
+    const FAKE_LOGS_DIR = resolve('fake', 'userData', 'logs')
+    const SNAPSHOT_PATH = join(FAKE_LOGS_DIR, 'runtime-health.json')
+
     let mockStorage: Map<string, string>
     let mockFs: RuntimeHealthFs
     let currentTime: number
@@ -74,7 +78,7 @@ describe('RuntimeHealthService', () => {
                 { type: 'Tab', memory: { workingSetSize: 50 * 1024 } },
                 { type: 'GPU', memory: { workingSetSize: 30 * 1024 } },
             ],
-            logsDir: 'C:\\fake\\userData\\logs',
+            logsDir: FAKE_LOGS_DIR,
             heartbeatIntervalMs: 10000,
             ...overrides,
         })
@@ -96,7 +100,7 @@ describe('RuntimeHealthService', () => {
             expect(snapshot?.current.appMetrics?.totalWorkingSetMb).toBe(80)
             expect(snapshot?.previous).toBeNull()
 
-            const savedRaw = mockStorage.get('C:\\fake\\userData\\logs\\runtime-health.json')
+            const savedRaw = mockStorage.get(SNAPSHOT_PATH)
             expect(savedRaw).toBeDefined()
             const parsed = JSON.parse(savedRaw!) as RuntimeHealthSnapshot
             expect(parsed.current.cleanExit).toBe(false)
@@ -116,7 +120,7 @@ describe('RuntimeHealthService', () => {
             expect(snapshot?.current.exitReason).toBe('clean_shutdown')
             expect(snapshot?.current.endedAt).toBeDefined()
 
-            const savedRaw = mockStorage.get('C:\\fake\\userData\\logs\\runtime-health.json')
+            const savedRaw = mockStorage.get(SNAPSHOT_PATH)
             const parsed = JSON.parse(savedRaw!) as RuntimeHealthSnapshot
             expect(parsed.current.cleanExit).toBe(true)
             expect(parsed.current.exitReason).toBe('clean_shutdown')
@@ -178,7 +182,7 @@ describe('RuntimeHealthService', () => {
             const service = createService({ logger: loggerMock })
             service.start()
 
-            const originalContent = mockStorage.get('C:\\fake\\userData\\logs\\runtime-health.json')
+            const originalContent = mockStorage.get(SNAPSHOT_PATH)
             expect(originalContent).toBeDefined()
 
             mockFs.renameSync = vi.fn(() => {
@@ -189,7 +193,7 @@ describe('RuntimeHealthService', () => {
                 service.recordExitReason('clean_shutdown')
             }).not.toThrow()
 
-            expect(mockStorage.get('C:\\fake\\userData\\logs\\runtime-health.json')).toBe(originalContent)
+            expect(mockStorage.get(SNAPSHOT_PATH)).toBe(originalContent)
             expect(loggerMock).toHaveBeenCalled()
 
             service.stop(false)
@@ -200,7 +204,7 @@ describe('RuntimeHealthService', () => {
             const service = createService({ logger: loggerMock })
             service.start()
 
-            const originalContent = mockStorage.get('C:\\fake\\userData\\logs\\runtime-health.json')
+            const originalContent = mockStorage.get(SNAPSHOT_PATH)
             expect(originalContent).toBeDefined()
 
             mockFs.writeFileSync = vi.fn(() => {
@@ -211,7 +215,7 @@ describe('RuntimeHealthService', () => {
                 service.recordExitReason('clean_shutdown')
             }).not.toThrow()
 
-            expect(mockStorage.get('C:\\fake\\userData\\logs\\runtime-health.json')).toBe(originalContent)
+            expect(mockStorage.get(SNAPSHOT_PATH)).toBe(originalContent)
             expect(loggerMock).toHaveBeenCalled()
 
             service.stop(false)
@@ -220,7 +224,7 @@ describe('RuntimeHealthService', () => {
 
     describe('Untrusted / corrupt / oversized previous JSON handling', () => {
         it('safely handles corrupt prior snapshot with fixed diagnostic reason', () => {
-            mockStorage.set('C:\\fake\\userData\\logs\\runtime-health.json', '{ corrupt json content ...')
+            mockStorage.set(SNAPSHOT_PATH, '{ corrupt json content ...')
 
             const service = createService()
             service.start()
@@ -241,7 +245,7 @@ describe('RuntimeHealthService', () => {
                     extraData: 'x'.repeat(MAX_SNAPSHOT_BYTES + 1000),
                 },
             })
-            mockStorage.set('C:\\fake\\userData\\logs\\runtime-health.json', hugePayload)
+            mockStorage.set(SNAPSHOT_PATH, hugePayload)
 
             const service = createService()
             service.start()
@@ -268,7 +272,7 @@ describe('RuntimeHealthService', () => {
                     mainMemoryMb: { rssMb: 120, heapTotalMb: 60, heapUsedMb: 40, secretMem: 999 },
                 },
             })
-            mockStorage.set('C:\\fake\\userData\\logs\\runtime-health.json', priorWithExtras)
+            mockStorage.set(SNAPSHOT_PATH, priorWithExtras)
 
             const service = createService()
             service.start()
@@ -295,7 +299,7 @@ describe('RuntimeHealthService', () => {
                     appMetrics: { processCount: -5, totalWorkingSetMb: NaN },
                 },
             })
-            mockStorage.set('C:\\fake\\userData\\logs\\runtime-health.json', priorWithInvalidMetrics)
+            mockStorage.set(SNAPSHOT_PATH, priorWithInvalidMetrics)
 
             const service = createService()
             service.start()
@@ -325,7 +329,7 @@ describe('RuntimeHealthService', () => {
                     lastChildLossReason: 'malicious child payload',
                 },
             })
-            mockStorage.set('C:\\fake\\userData\\logs\\runtime-health.json', priorWithUnsafeStrings)
+            mockStorage.set(SNAPSHOT_PATH, priorWithUnsafeStrings)
 
             const service = createService()
             service.start()
@@ -340,7 +344,7 @@ describe('RuntimeHealthService', () => {
         })
 
         it('safely ignores prior snapshot when statSync throws without doing unbounded read', () => {
-            mockStorage.set('C:\\fake\\userData\\logs\\runtime-health.json', '{"version":1}')
+            mockStorage.set(SNAPSHOT_PATH, '{"version":1}')
             mockFs.statSync = vi.fn(() => {
                 throw new Error('EPERM: cannot stat')
             })
@@ -430,20 +434,30 @@ describe('RuntimeHealthService', () => {
     })
 
     describe('Bootstrap log path resolution', () => {
+        const SMOKE_DATA_ROOT = resolve('smoke-temp', 'mmo-packaged-smoke', 'test-user-data')
+        const EXPECTED_SMOKE_LOGS_DIR = join(SMOKE_DATA_ROOT, 'logs')
+        const EXPECTED_SMOKE_BOOTSTRAP_LOG = join(EXPECTED_SMOKE_LOGS_DIR, 'bootstrap.log')
+
+        const FAKE_APP_DATA_PATH = resolve('Users', 'User', 'AppData', 'Roaming')
+        const EXPECTED_PROD_BOOTSTRAP_LOG = join(FAKE_APP_DATA_PATH, 'MMO Auto Review', 'bootstrap.log')
+
+        const FALLBACK_CWD = resolve('fake', 'mmo-app')
+        const EXPECTED_FALLBACK_BOOTSTRAP_LOG = join(FALLBACK_CWD, 'bootstrap.log')
+
         it('routes to smoke userData logs folder when smokeDataRoot is provided', () => {
             const fsMock = {
                 existsSync: vi.fn(() => false),
                 mkdirSync: vi.fn(),
             }
             const path = resolveBootstrapLogPath({
-                smokeDataRoot: 'C:\\smoke-temp\\mmo-packaged-smoke\\test-user-data',
-                appDataPath: 'C:\\Users\\User\\AppData\\Roaming',
+                smokeDataRoot: SMOKE_DATA_ROOT,
+                appDataPath: FAKE_APP_DATA_PATH,
                 fs: fsMock,
             })
 
-            expect(path).toBe('C:\\smoke-temp\\mmo-packaged-smoke\\test-user-data\\logs\\bootstrap.log')
+            expect(path).toBe(EXPECTED_SMOKE_BOOTSTRAP_LOG)
             expect(fsMock.mkdirSync).toHaveBeenCalledWith(
-                'C:\\smoke-temp\\mmo-packaged-smoke\\test-user-data\\logs',
+                EXPECTED_SMOKE_LOGS_DIR,
                 { recursive: true }
             )
         })
@@ -455,21 +469,21 @@ describe('RuntimeHealthService', () => {
             }
             const path = resolveBootstrapLogPath({
                 smokeDataRoot: null,
-                appDataPath: 'C:\\Users\\User\\AppData\\Roaming',
+                appDataPath: FAKE_APP_DATA_PATH,
                 fs: fsMock,
             })
 
-            expect(path).toBe('C:\\Users\\User\\AppData\\Roaming\\MMO Auto Review\\bootstrap.log')
+            expect(path).toBe(EXPECTED_PROD_BOOTSTRAP_LOG)
         })
 
         it('falls back to cwd when appDataPath is unavailable', () => {
             const path = resolveBootstrapLogPath({
                 smokeDataRoot: null,
                 appDataPath: '',
-                fallbackCwd: 'C:\\mmo-app',
+                fallbackCwd: FALLBACK_CWD,
             })
 
-            expect(path).toBe('C:\\mmo-app\\bootstrap.log')
+            expect(path).toBe(EXPECTED_FALLBACK_BOOTSTRAP_LOG)
         })
     })
 
