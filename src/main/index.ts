@@ -568,6 +568,27 @@ app.whenReady().then(async () => {
         } catch (schedulerError) {
             logBootstrap('Scheduler service failed to start (non-fatal)', schedulerError)
         }
+
+        try {
+            const {
+                configureAgentBridge,
+                getAgentBridgeService,
+                syncAgentBridgeFromSettings,
+            } = await import('./services/AgentBridgeService')
+            const { createAgentBridgeController } = await import('./services/agentBridgeController')
+            configureAgentBridge({
+                statePath: join(dataRoot.dataRoot, 'agent-bridge.json'),
+                controller: createAgentBridgeController(),
+            })
+            await syncAgentBridgeFromSettings()
+            activeBackgroundWorkers.push({
+                name: 'agent_bridge',
+                stop: () => getAgentBridgeService().stop(),
+            })
+            logBootstrap('Agent bridge synced from settings')
+        } catch (bridgeError) {
+            logBootstrap('Agent bridge failed to start (non-fatal)', bridgeError)
+        }
     } catch (error) {
         logBootstrap('Failed to initialize app', error)
         dialog.showErrorBox(

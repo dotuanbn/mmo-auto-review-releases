@@ -56,6 +56,7 @@ interface AppSettings {
     saveProfiles: boolean
     maxConcurrentBrowsers: number
     lowResourceMode: boolean
+    agentBridgeEnabled: boolean
     randomizeUserAgent: boolean
     randomizeViewport: boolean
 
@@ -160,6 +161,7 @@ const DEFAULTS: AppSettings = {
     saveProfiles: true,
     maxConcurrentBrowsers: 3,
     lowResourceMode: false,
+    agentBridgeEnabled: false,
     randomizeUserAgent: true,
     randomizeViewport: true,
     groqApiKey: '',
@@ -295,6 +297,16 @@ export function Settings() {
     const [storageInfo, setStorageInfo] = useState<any>(null)
     const [appVersion, setAppVersion] = useState<string>('1.0.6')
     const [performance, setPerformance] = useState<PerformanceSnapshot | null>(null)
+    const [bridge, setBridge] = useState<{
+        enabled: boolean
+        listening: boolean
+        host: string
+        port: number | null
+        token: string | null
+        baseUrl: string | null
+        statePath: string | null
+        error: string | null
+    } | null>(null)
 
     useEffect(() => {
         let disposed = false
@@ -344,6 +356,15 @@ export function Settings() {
         return () => { if (unsub) unsub() }
     }, [])
 
+    const refreshBridge = async () => {
+        try {
+            const state = await window.electronAPI.agentBridge.getState()
+            setBridge(state)
+        } catch (error) {
+            console.error('Failed to load agent bridge state:', error)
+        }
+    }
+
     const loadSettings = async () => {
         try {
             setLoading(true)
@@ -357,6 +378,7 @@ export function Settings() {
                 setOriginalSettings(merged)
             }
             await loadStorageInfo()
+            await refreshBridge()
         } catch (error) {
             console.error('Failed to load settings:', error)
         } finally {
@@ -403,6 +425,7 @@ export function Settings() {
             setSettings(next)
             setOriginalSettings(next)
             setHasChanges(false)
+            await refreshBridge()
             showMsg('success', t('settings.saved'))
         } catch (error) {
             console.error('Failed to save:', error)
@@ -656,6 +679,29 @@ export function Settings() {
                     {t('settings.performanceRam')}: {(performance.freeMemoryMB / 1024).toFixed(1)} / {(performance.totalMemoryMB / 1024).toFixed(1)} GB · {t('settings.performanceBrowsers')}: {performance.activeContexts}
                     {performance.memoryPressure && <span className="ml-2 text-amber-600">{t('settings.performanceWaiting')}</span>}
                 </p>}
+            </SectionPanel>
+
+            <SectionPanel icon={Key} title={t('settings.agentBridgeTitle')} description={t('settings.agentBridgeDesc')} tone="blue">
+                <div data-testid="agent-bridge">
+                    <FormRow icon={<Key className="h-4 w-4 text-[#8d74e8]" />} label={t('settings.agentBridgeToggle')} description={t('settings.agentBridgeToggleDesc')}>
+                        <DSToggle label={t('settings.agentBridgeToggle')} checked={settings.agentBridgeEnabled} onChange={() => update('agentBridgeEnabled', !settings.agentBridgeEnabled)} />
+                    </FormRow>
+                </div>
+                <p className="mt-2 text-sm text-[#6f697c] dark:text-[#c8c0d8]">{t('settings.agentBridgeNote')}</p>
+                {bridge?.listening && bridge.baseUrl && bridge.token ? (
+                    <div className="mt-3 space-y-2 text-sm text-[#3c3648] dark:text-[#e6e0f2]">
+                        <p>{t('settings.agentBridgeAddress')}: <code>{bridge.baseUrl}</code></p>
+                        <p className="break-all">{t('settings.agentBridgeToken')}: <code>{bridge.token}</code></p>
+                        <div className="flex gap-2">
+                            <button type="button" className="rounded-full border border-[#e9e4f2] px-3 py-1 dark:border-[#3d3558]" onClick={() => void navigator.clipboard.writeText(`${bridge.baseUrl}\n${bridge.token}`)}>{t('settings.agentBridgeCopy')}</button>
+                            <button type="button" className="rounded-full border border-[#e9e4f2] px-3 py-1 dark:border-[#3d3558]" onClick={() => void window.electronAPI.agentBridge.rotateToken().then(setBridge)}>{t('settings.agentBridgeRotate')}</button>
+                        </div>
+                    </div>
+                ) : (
+                    <p className="mt-3 text-sm text-[#6f697c] dark:text-[#c8c0d8]">
+                        {bridge?.error ? `${t('settings.agentBridgeError')}: ${bridge.error}` : t('settings.agentBridgeOff')}
+                    </p>
+                )}
             </SectionPanel>
 
             {/* 2. TỰ ĐỘNG HÓA / AUTOMATION (real engine settings only) */}

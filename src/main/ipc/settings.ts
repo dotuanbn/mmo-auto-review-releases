@@ -52,6 +52,7 @@ const DEFAULT_SETTINGS: SettingsRecord = {
     saveProfiles: true,
     maxConcurrentBrowsers: 3,
     lowResourceMode: false,
+    agentBridgeEnabled: false,
     randomizeUserAgent: true,
     randomizeViewport: true,
 
@@ -453,6 +454,15 @@ function syncRuntimeLoggerWithSettings(settings: SettingsRecord) {
     }
 }
 
+async function syncAgentBridgeSetting(): Promise<void> {
+    try {
+        const { syncAgentBridgeFromSettings } = await import('../services/AgentBridgeService')
+        await syncAgentBridgeFromSettings()
+    } catch (error) {
+        console.warn('[settings] Agent bridge sync failed:', error)
+    }
+}
+
 async function syncSprint3WorkersWithSettings(settings: SettingsRecord): Promise<void> {
     try {
         const { helpfulVoteWorker } = await import('../services/HelpfulVoteWorker')
@@ -792,6 +802,9 @@ export function registerSettingsHandlers() {
                 if (parsedKey === 'enableHelpfulVotes' || parsedKey === 'enableReviewVerification') {
                     await syncSprint3WorkersWithSettings(loadSettings())
                 }
+                if (parsedKey === 'agentBridgeEnabled') {
+                    await syncAgentBridgeSetting()
+                }
             } catch (error) {
                 if (error instanceof SecretStorageUnavailableError) {
                     throw createIpcError('settings:set', error)
@@ -836,6 +849,7 @@ export function registerSettingsHandlers() {
                 const hydrated = loadSettings()
                 syncFProxyServiceWithSettings(hydrated)
                 await syncSprint3WorkersWithSettings(hydrated)
+                await syncAgentBridgeSetting()
                 return maskSettingsForRenderer(hydrated)
             } catch (error) {
                 if (error instanceof SecretStorageUnavailableError) {
@@ -855,6 +869,7 @@ export function registerSettingsHandlers() {
             })
             syncFProxyServiceWithSettings(reset)
             await syncSprint3WorkersWithSettings(reset)
+            await syncAgentBridgeSetting()
             return maskSettingsForRenderer({ ...DEFAULT_SETTINGS })
         })
     }))

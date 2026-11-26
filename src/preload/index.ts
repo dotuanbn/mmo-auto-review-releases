@@ -288,6 +288,29 @@ contextBridge.exposeInMainWorld('electronAPI', {
         resetDefaults: () => ipcRenderer.invoke('settings:resetDefaults') as Promise<SettingsRecord>,
     },
 
+    agentBridge: {
+        getState: () => ipcRenderer.invoke('agentBridge:getState') as Promise<{
+            enabled: boolean
+            listening: boolean
+            host: string
+            port: number | null
+            token: string | null
+            baseUrl: string | null
+            statePath: string | null
+            error: string | null
+        }>,
+        rotateToken: () => ipcRenderer.invoke('agentBridge:rotateToken') as Promise<{
+            enabled: boolean
+            listening: boolean
+            host: string
+            port: number | null
+            token: string | null
+            baseUrl: string | null
+            statePath: string | null
+            error: string | null
+        }>,
+    },
+
     performance: {
         getStatus: () => ipcRenderer.invoke('performance:getStatus') as Promise<PerformanceSnapshot>,
         onChanged: (callback: (enabled: boolean) => void) => {
@@ -849,6 +872,28 @@ declare global {
                 saveAll: (settings: Partial<Record<SettingsKey, SettingsValue>>) =>
                     Promise<SettingsRecord>
                 resetDefaults: () => Promise<SettingsRecord>
+            }
+            agentBridge: {
+                getState: () => Promise<{
+                    enabled: boolean
+                    listening: boolean
+                    host: string
+                    port: number | null
+                    token: string | null
+                    baseUrl: string | null
+                    statePath: string | null
+                    error: string | null
+                }>
+                rotateToken: () => Promise<{
+                    enabled: boolean
+                    listening: boolean
+                    host: string
+                    port: number | null
+                    token: string | null
+                    baseUrl: string | null
+                    statePath: string | null
+                    error: string | null
+                }>
             }
             performance: {
                 getStatus: () => Promise<PerformanceSnapshot>

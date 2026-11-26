@@ -116,6 +116,31 @@ function delay(minMs: number, maxMs: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, randomInt(minMs, maxMs)))
 }
 
+/** Absent retryable keeps the legacy single retry. Skipped websites set it false. */
+function isNonRetryableKpiResult(result: KpiSkillResult): boolean {
+    return (result as KpiSkillResult & { retryable?: boolean }).retryable === false
+}
+
+// Match failure tokens, not substrings such as "fallback".
+function isWebsiteFailureAction(actionName: string): boolean {
+    return /(^|_)(skipped|failed|failure|error|unloaded|not_restored|blocked)(_|$)/i.test(actionName)
+        || /website_skipped_/i.test(actionName)
+}
+
+function isWebsiteClickAction(actionName: string): boolean {
+    return /click/i.test(actionName) && !isWebsiteFailureAction(actionName)
+}
+
+function websiteEvidenceSuccess(actionName: string, clicked: boolean, visitSucceeded: boolean): boolean {
+    if (isWebsiteFailureAction(actionName)) {
+        return false
+    }
+    if (isWebsiteClickAction(actionName)) {
+        return clicked
+    }
+    return visitSucceeded
+}
+
 function shuffleArray<T>(arr: T[]): T[] {
     const result = [...arr]
     for (let i = result.length - 1; i > 0; i--) {
@@ -510,15 +535,15 @@ export class AutonomousMapAgent {
 
             this.pushAction(actions, {
                 action: `kpi_${kpiType}`,
-                success: result.executed,
+                success: kpiType === 'website' ? result.verified : result.executed,
                 source: 'kpi_skill',
                 detail: result.detail,
                 durationMs,
             })
             this.recordKpiEvidenceActions(actions, kpiType, result)
 
-            // If executed but not verified, retry once
-            if (result.executed && !result.verified && !shouldStop()) {
+            // Clicked-but-unverified skills retry once, except an explicit non-retryable skip.
+            if (result.executed && !result.verified && !isNonRetryableKpiResult(result) && !shouldStop()) {
                 log(`T${threadId}: KPI "${kpiType}" unverified, retrying once...`)
                 onStatusUpdate(`⚠️ ${kpiLabel} unverified, retrying...`)
 
@@ -529,7 +554,7 @@ export class AutonomousMapAgent {
                     const retryResult = await kpiSkills.executeKpi(page, threadId, kpiType, { placeUrl: targetMapUrl })
                     this.pushAction(actions, {
                         action: `kpi_retry_${kpiType}`,
-                        success: retryResult.executed,
+                        success: kpiType === 'website' ? retryResult.verified : retryResult.executed,
                         source: 'kpi_skill',
                         detail: `Retry: ${retryResult.detail}`,
                         durationMs: Date.now() - start,
@@ -543,6 +568,9 @@ export class AutonomousMapAgent {
                 } catch (err) {
                     log(`T${threadId}: KPI retry "${kpiType}" threw: ${err}`)
                 }
+            } else if (kpiType === 'website' && result.executed && !result.verified && isNonRetryableKpiResult(result)) {
+                log(`T${threadId}: KPI "website" not retryable: ${result.detail}`)
+                onStatusUpdate(`❌ WEBSITE not retryable: ${result.detail}`)
             }
 
             // Ensure back on target map after each KPI
@@ -564,11 +592,14 @@ export class AutonomousMapAgent {
         result: KpiSkillResult
     ): void {
         for (const action of result.actions) {
+            const websiteVisit = kpiType === 'website'
             this.pushAction(actions, {
                 action,
-                success: result.executed,
+                success: websiteVisit
+                    ? websiteEvidenceSuccess(action, result.executed, result.verified)
+                    : result.executed,
                 source: 'kpi_skill',
-                detail: `${kpiType}: ${action}`,
+                detail: websiteVisit ? result.detail : `${kpiType}: ${action}`,
             })
         }
     }

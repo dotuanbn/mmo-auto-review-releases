@@ -13,6 +13,7 @@ import { Dialog, Locator, Page } from 'playwright'
 import { DOMUtils } from './DOMUtils'
 import { moveCursor, clickCursor } from './BrowserCursorOverlay'
 import { writeAgenticLog } from '../utils/agenticLog'
+import { visitMapsWebsite } from './MapsWebsiteVisit'
 
 export type MapKpiType = 'phone' | 'direction' | 'website'
 
@@ -22,6 +23,8 @@ export interface KpiSkillResult {
     actions: string[]
     detail: string
     durationMs: number
+    /** Explicitly false for website failures that should not be retried. */
+    retryable?: boolean
 }
 
 export interface KpiAvailability {
@@ -46,11 +49,13 @@ type DialogEmitter = {
 export interface ExecuteAvailableKpisOptions {
     preferredOrder?: MapKpiType[]
     directionStartPoint?: string
+    shouldStop?: () => boolean
 }
 
 export interface ExecuteKpiOptions {
     placeUrl?: string
     directionStartPoint?: string
+    shouldStop?: () => boolean
 }
 
 const PHONE_SELECTORS = [
@@ -546,18 +551,35 @@ export class KpiSkills {
     /**
      * Execute a website click on the Google Maps place page.
      *
-     * Google Maps registers a "website click" when the user clicks the website link.
-     * This link typically opens in a new tab. Google Analytics on the destination site
-     * requires > 10 seconds dwell time to count as an "engaged session".
+     * Delegates to the bounded `visitMapsWebsite` helper which enforces an
+     * 8-second load budget and 30-second total budget.  If the destination
+     * does not load, the helper skips promptly and the result is marked
+     * non-retryable so callers do not burn more visit time.
      */
-    async executeWebsiteClick(page: Page, threadId: number): Promise<KpiSkillResult> {
+    async executeWebsiteClick(
+        page: Page,
+        threadId: number,
+        options: ExecuteKpiOptions = {}
+    ): Promise<KpiSkillResult> {
         const start = Date.now()
         const actions: string[] = []
-        let executed = false
-        let verified = false
+        const shouldStop = options.shouldStop
 
         log(`T${threadId}: Executing WEBSITE KPI skill...`)
 
+        if (shouldStop?.()) {
+            actions.push('website_skipped_stopped')
+            return {
+                executed: false,
+                verified: false,
+                actions,
+                detail: 'website_skipped_stopped: Stop requested before website KPI',
+                durationMs: Date.now() - start,
+                retryable: false,
+            }
+        }
+
+        // --- Locate the website element ---
         const websiteSelectors = [
             'a[data-item-id="authority"]',
             'a[aria-label*="website" i]',
@@ -567,10 +589,11 @@ export class KpiSkills {
             'a:has-text("Trang web")',
         ]
 
-        let targetLocator = null
+        let targetLocator: Locator | null = null
         for (const selector of websiteSelectors) {
+            if (shouldStop?.()) break
             const locator = page.locator(selector).first()
-            const isVisible = await locator.isVisible({ timeout: 1500 }).catch(() => false)
+            const isVisible = await locator.isVisible({ timeout: 800 }).catch(() => false)
             if (isVisible) {
                 targetLocator = locator
                 actions.push(`website_found_${selector.substring(0, 30)}`)
@@ -578,9 +601,9 @@ export class KpiSkills {
             }
         }
 
-        if (!targetLocator) {
+        if (!targetLocator && !shouldStop?.()) {
             log(`T${threadId}: No website element found via selectors. Trying DOM search...`)
-            const dom = await DOMUtils.extractInteractiveDOM(page)
+            const dom = await DOMUtils.extractInteractiveDOM(page).catch(() => ({ domText: '', summaries: [] }))
             const websiteCandidate = dom.summaries.find(s => {
                 const text = [s.textContent, s.ariaLabel, s.title].filter(Boolean).join(' ')
                 const href = s.href || ''
@@ -598,162 +621,51 @@ export class KpiSkills {
             }
         }
 
+        if (shouldStop?.()) {
+            actions.push('website_skipped_stopped')
+            return {
+                executed: false,
+                verified: false,
+                actions,
+                detail: 'website_skipped_stopped: Stop requested before website click',
+                durationMs: Date.now() - start,
+                retryable: false,
+            }
+        }
+
         if (!targetLocator) {
+            actions.push('website_skipped_no_element')
             return {
                 executed: false,
                 verified: false,
                 actions,
-                detail: 'Could not find website element on page',
+                detail: 'website_skipped_no_element: Could not find website element on page',
                 durationMs: Date.now() - start,
+                retryable: false,
             }
         }
 
-        const originalMapUrl = page.url()
-        const targetHref = await targetLocator.getAttribute('href').catch(() => null)
+        // --- Delegate to bounded helper ---
+        log(`T${threadId}: Delegating to bounded visitMapsWebsite helper...`)
+        const visit = await visitMapsWebsite(page, targetLocator, {
+            shouldStop,
+            onStatus: (msg) => log(`T${threadId}: ${msg}`),
+        })
 
-        // Set up new tab listener BEFORE clicking
-        const newPagePromise = page.context().waitForEvent('page', { timeout: 12000 }).catch(() => null)
+        // Merge visit actions into ours.
+        actions.push(...visit.actions)
 
-        // Execute the click
-        const clicked = await humanClickLocator(page, targetLocator, 'website_link')
-        if (clicked) {
-            executed = true
-            actions.push('website_click')
-        } else {
-            return {
-                executed: false,
-                verified: false,
-                actions,
-                detail: 'Website click failed',
-                durationMs: Date.now() - start,
-            }
-        }
+        const executed = visit.clicked
+        const verified = visit.loaded && !visit.skipped
+        const retryable = visit.skipped ? false : undefined
 
-        // Wait for new tab
-        const newPage = await newPagePromise
-        if (newPage) {
-            log(`T${threadId}: Website tab opened: ${newPage.url()}`)
-            actions.push('website_tab_opened')
-            verified = true
+        const detail = verified
+            ? `Website click VERIFIED (website dwell, ${Math.round(visit.durationMs / 1000)}s)`
+            : executed
+                ? `Website click EXECUTED but destination did not load: ${visit.detail}`
+                : `Website click FAILED: ${visit.detail}`
 
-            try {
-                await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {})
-
-                // ORGANIC BROWSING on the external website (15-30s for engaged session)
-                log(`T${threadId}: Starting organic browse on website (~20s)...`)
-                actions.push('website_organic_start')
-
-                const browseDuration = randomInt(15000, 30000)
-                const browseStart = Date.now()
-                const scrollRounds = randomInt(6, 12)
-
-                for (let i = 0; i < scrollRounds && (Date.now() - browseStart) < browseDuration; i++) {
-                    // Scroll down with variable amounts
-                    const scrollAmount = randomInt(150, 450)
-                    await (newPage as Page).mouse.wheel(0, scrollAmount).catch(() => {})
-                    await humanDelay(1500, 3500)
-
-                    // Occasionally scroll up (reading pattern)
-                    if (Math.random() > 0.7) {
-                        await (newPage as Page).mouse.wheel(0, -randomInt(80, 200)).catch(() => {})
-                        await humanDelay(800, 2000)
-                    }
-
-                    // Occasionally move mouse (reading simulation)
-                    if (Math.random() > 0.5) {
-                        const vp = newPage.viewportSize()
-                        if (vp) {
-                            await (newPage as Page).mouse.move(
-                                randomInt(100, vp.width - 100),
-                                randomInt(100, vp.height - 100),
-                                { steps: randomInt(5, 10) }
-                            ).catch(() => {})
-                        }
-                    }
-                }
-
-                actions.push(`website_browsed_${Math.round((Date.now() - browseStart) / 1000)}s`)
-            } catch (err) {
-                log(`T${threadId}: Error during website browse: ${err}`)
-            } finally {
-                if (!newPage.isClosed()) {
-                    await newPage.close().catch(() => {})
-                }
-                await page.bringToFront().catch(() => {})
-                log(`T${threadId}: Closed website tab, back to Maps.`)
-                actions.push('website_tab_closed')
-            }
-        } else {
-            log(`T${threadId}: No new tab detected after website click. May be same-page or blocked.`)
-            actions.push('website_no_popup')
-
-            await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {})
-            const currentUrl = page.url().toLowerCase()
-            const sameTabWebsite = /^https?:\/\//i.test(currentUrl)
-                && !currentUrl.includes('google.')
-                && !currentUrl.includes('/maps')
-
-            if (sameTabWebsite) {
-                verified = true
-                actions.push('website_same_tab_opened')
-
-                const browseDuration = randomInt(15000, 25000)
-                const browseStart = Date.now()
-                const scrollRounds = randomInt(5, 9)
-                for (let i = 0; i < scrollRounds && (Date.now() - browseStart) < browseDuration; i++) {
-                    await page.mouse.wheel(0, randomInt(150, 450)).catch(() => {})
-                    await humanDelay(1500, 3000)
-                    if (Math.random() > 0.7) {
-                        await page.mouse.wheel(0, -randomInt(80, 200)).catch(() => {})
-                        await humanDelay(800, 1800)
-                    }
-                }
-                actions.push(`website_same_tab_browsed_${Math.round((Date.now() - browseStart) / 1000)}s`)
-            } else if (targetHref && /^https?:\/\//i.test(targetHref) && !targetHref.toLowerCase().includes('google.')) {
-                const fallbackPage = await page.context().newPage()
-                try {
-                    await fallbackPage.goto(targetHref, { waitUntil: 'domcontentloaded', timeout: 15000 })
-                    verified = true
-                    actions.push('website_fallback_href_opened')
-
-                    const browseDuration = randomInt(15000, 25000)
-                    const browseStart = Date.now()
-                    const scrollRounds = randomInt(5, 9)
-                    for (let i = 0; i < scrollRounds && (Date.now() - browseStart) < browseDuration; i++) {
-                        await fallbackPage.mouse.wheel(0, randomInt(150, 450)).catch(() => {})
-                        await humanDelay(1500, 3000)
-                        if (Math.random() > 0.7) {
-                            await fallbackPage.mouse.wheel(0, -randomInt(80, 200)).catch(() => {})
-                            await humanDelay(800, 1800)
-                        }
-                    }
-                    actions.push(`website_fallback_browsed_${Math.round((Date.now() - browseStart) / 1000)}s`)
-                } catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err)
-                    log(`T${threadId}: Website fallback href open failed: ${msg}`)
-                    actions.push('website_fallback_href_failed')
-                    if (/ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY_CONNECTION_FAILED|proxy|tunnel/i.test(msg)) {
-                        actions.push('website_proxy_tunnel_failed')
-                        verified = false
-                    }
-                } finally {
-                    await fallbackPage.close().catch(() => {})
-                    await page.bringToFront().catch(() => {})
-                }
-            } else {
-                await humanDelay(3000, 6000)
-            }
-
-            if (!page.url().toLowerCase().includes('google.') || !page.url().toLowerCase().includes('map')) {
-                await page.goto(originalMapUrl, { waitUntil: 'domcontentloaded', timeout: 12000 })
-                    .catch(() => page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {}))
-                await humanDelay(1500, 3000)
-                actions.push('website_returned_to_maps')
-            }
-        }
-
-        const detail = `Website click ${verified ? 'VERIFIED (website dwell)' : executed ? 'EXECUTED (no tab capture)' : 'FAILED'}`
-        log(`T${threadId}: Website KPI result: executed=${executed}, verified=${verified}`)
+        log(`T${threadId}: Website KPI result: executed=${executed}, verified=${verified}, skipped=${visit.skipped}`)
 
         return {
             executed,
@@ -761,6 +673,7 @@ export class KpiSkills {
             actions,
             detail,
             durationMs: Date.now() - start,
+            retryable,
         }
     }
 
@@ -1248,7 +1161,9 @@ export class KpiSkills {
 
         log(`T${threadId}: [ALL KPI] Starting available KPIs in order: ${kpiTypes.join(' -> ')}`)
 
+        let hasRetryableAttempt = false
         for (let idx = 0; idx < kpiTypes.length; idx++) {
+            if (options.shouldStop?.()) break
             const kpiType = kpiTypes[idx]
             if (idx > 0) {
                 const interKpiDelay = randomInt(3000, 7000)
@@ -1263,6 +1178,9 @@ export class KpiSkills {
             allActions.push(...result.actions)
             if (result.executed) totalExecuted++
             if (result.verified) totalVerified++
+            if (result.executed && !result.verified && result.retryable !== false) {
+                hasRetryableAttempt = true
+            }
             details.push(`${kpiType}: ${result.executed ? (result.verified ? 'verified' : 'unverified') : 'not_executed'} ${result.detail}`)
 
             // Individual KPI skills own their navigation recovery. Do not call
@@ -1280,6 +1198,7 @@ export class KpiSkills {
             actions: allActions,
             detail: summaryDetail,
             durationMs,
+            retryable: totalExecuted > 0 && totalVerified === 0 && !hasRetryableAttempt ? false : undefined,
         }
     }
 
@@ -1384,7 +1303,7 @@ export class KpiSkills {
             case 'phone':
                 return this.executePhoneClick(page, threadId)
             case 'website':
-                return this.executeWebsiteClick(page, threadId)
+                return this.executeWebsiteClick(page, threadId, options)
             case 'direction':
             case 'directions':
                 return this.executeDirectionClick(page, threadId, options)

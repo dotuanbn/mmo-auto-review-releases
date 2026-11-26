@@ -5,6 +5,7 @@ import { registerCampaignHandlers } from './campaigns'
 import { registerReviewHandlers } from './reviews'
 import { registerAutomationHandlers } from './automation'
 import { registerSettingsHandlers } from './settings'
+import { registerAgentBridgeHandlers } from './agentBridge'
 import { registerTrafficHandlers } from './traffic'
 import { registerProjectHandlers } from './projects'
 import { registerScriptHandlers } from './scripts'
@@ -44,6 +45,7 @@ export function registerAllHandlers() {
     registerReviewHandlers()
     registerAutomationHandlers()
     registerSettingsHandlers()
+    registerAgentBridgeHandlers()
     registerTrafficHandlers()
     registerProjectHandlers()
     registerScriptHandlers()

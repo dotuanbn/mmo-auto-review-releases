@@ -2,7 +2,8 @@
  * AgenticTrafficHandler - Autonomous web automation for Traffic Boost using local LLM
  */
 
-import { Page } from 'playwright'
+import { Locator, Page } from 'playwright'
+import { visitMapsWebsite } from './MapsWebsiteVisit'
 import { ollamaService } from '../services/OllamaService'
 import { writeAgenticLog } from '../utils/agenticLog'
 import { moveCursor, clickCursor } from './BrowserCursorOverlay'
@@ -40,6 +41,40 @@ interface AgentDecisionResult {
 
 type FollowUpIntent = 'photos' | 'reviews' | 'directions' | 'info' | 'map' | 'generic'
 type InterruptionRecoveryResult = { handled: boolean; via?: string; detail?: string }
+
+interface WebsiteFollowUpOutcome {
+    success: boolean
+    detail: string
+    subActions: string[]
+    skipConfiguredDelay: boolean
+    durationMs: number
+    clicked: boolean
+}
+
+/** Absent retryable keeps the legacy single retry. Skipped websites set it false. */
+function isNonRetryableKpiResult(result: KpiSkillResult): boolean {
+    return (result as KpiSkillResult & { retryable?: boolean }).retryable === false
+}
+
+// Match failure tokens, not substrings such as "fallback".
+function isWebsiteFailureAction(actionName: string): boolean {
+    return /(^|_)(skipped|failed|failure|error|unloaded|not_restored|blocked)(_|$)/i.test(actionName)
+        || /website_skipped_/i.test(actionName)
+}
+
+function isWebsiteClickAction(actionName: string): boolean {
+    return /click/i.test(actionName) && !isWebsiteFailureAction(actionName)
+}
+
+function websiteEvidenceSuccess(actionName: string, clicked: boolean, visitSucceeded: boolean): boolean {
+    if (isWebsiteFailureAction(actionName)) {
+        return false
+    }
+    if (isWebsiteClickAction(actionName)) {
+        return clicked
+    }
+    return visitSucceeded
+}
 
 export class AgenticTrafficHandler {
     private readonly MIN_STEPS = 8
@@ -1181,13 +1216,96 @@ Respond strictly as JSON. No markdown:
         return results
     }
 
-    private async runWebsiteFollowUp(page: Page, threadId: number): Promise<string[]> {
-        const results: string[] = []
-        
-        // Find the website link
+    private websiteNotVisited(detail: string, subActions: string[]): WebsiteFollowUpOutcome {
+        return {
+            success: false,
+            detail,
+            subActions,
+            skipConfiguredDelay: true,
+            durationMs: 0,
+            clicked: false,
+        }
+    }
+
+    private recordWebsiteStep(
+        actionsPerformed: AgenticPerformedAction[],
+        outcome: WebsiteFollowUpOutcome,
+        stepIndex: number
+    ): void {
+        this.pushAction(actionsPerformed, {
+            action: 'execute_browse_website',
+            success: outcome.success,
+            source: 'llm',
+            detail: outcome.detail,
+            step: stepIndex + 1,
+            durationMs: outcome.durationMs,
+        })
+
+        for (const subAction of outcome.subActions) {
+            this.pushAction(actionsPerformed, {
+                action: subAction,
+                success: websiteEvidenceSuccess(subAction, outcome.clicked, outcome.success),
+                source: 'llm',
+                detail: outcome.detail,
+                step: stepIndex + 1,
+            })
+        }
+    }
+
+    private recordWebsiteKpiActions(
+        actionsPerformed: AgenticPerformedAction[],
+        result: KpiSkillResult
+    ): void {
+        for (const actionName of result.actions) {
+            this.pushAction(actionsPerformed, {
+                action: actionName,
+                success: websiteEvidenceSuccess(actionName, result.executed, result.verified),
+                source: 'kpi_skill',
+                detail: result.detail,
+                durationMs: result.durationMs,
+            })
+        }
+    }
+
+    /**
+     * Locate the Maps website control and hand the visit to the shared helper.
+     * The helper owns click, load budget, popup cleanup, and Maps URL restoration.
+     */
+    private async runWebsiteFollowUp(
+        page: Page,
+        threadId: number,
+        shouldStopCheck: () => boolean,
+        onStatusUpdate: (msg: string) => void
+    ): Promise<WebsiteFollowUpOutcome> {
+        if (page.isClosed()) {
+            const outcome = this.websiteNotVisited(
+                'website_skipped_closed: Maps page is already closed',
+                ['website_skipped_closed']
+            )
+            onStatusUpdate(this.sanitizeForStatus(outcome.detail))
+            return outcome
+        }
+
+        if (shouldStopCheck()) {
+            const outcome = this.websiteNotVisited(
+                'website_skipped_stopped: Stop requested before website visit',
+                ['website_skipped_stopped']
+            )
+            onStatusUpdate(this.sanitizeForStatus(outcome.detail))
+            return outcome
+        }
+
         const selectors = ['a[data-item-id="authority"]', 'a[aria-label*="website" i]', 'a:has-text("Website")']
-        let targetElement = null
+        let targetElement: Locator | null = null
         for (const sel of selectors) {
+            if (shouldStopCheck()) {
+                const outcome = this.websiteNotVisited(
+                    'website_skipped_stopped: Stop requested before website visit',
+                    ['website_skipped_stopped']
+                )
+                onStatusUpdate(this.sanitizeForStatus(outcome.detail))
+                return outcome
+            }
             const locator = page.locator(sel).first()
             if (await locator.isVisible({ timeout: 1000 }).catch(() => false)) {
                 targetElement = locator
@@ -1196,71 +1314,55 @@ Respond strictly as JSON. No markdown:
         }
 
         if (!targetElement) {
-            this.log(`T${threadId}: No website button found. Doing normal info read instead.`)
-            return this.runInfoFollowUp(page, threadId)
+            const outcome = this.websiteNotVisited(
+                'website_skipped_no_element: No website button found',
+                ['website_skipped_no_element']
+            )
+            this.log(`T${threadId}: ${outcome.detail}`)
+            onStatusUpdate(this.sanitizeForStatus(outcome.detail))
+            return outcome
         }
 
-        this.log(`T${threadId}: Clicking website link...`)
-        
-        // Website clicks on Maps open in a new tab (popup). We MUST capture it.
-        const newPagePromise = page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null)
-        
+        this.log(`T${threadId}: Visiting website through bounded helper...`)
+        let visit: Awaited<ReturnType<typeof visitMapsWebsite>>
         try {
-            await targetElement.scrollIntoViewIfNeeded().catch(() => {})
-            await this.delay(300, 600)
-            await targetElement.click({ timeout: 3000 })
-            results.push('website_click')
-        } catch (e) {
-            this.log(`T${threadId}: Failed to click website: ${e}`)
-            return results
+            visit = await visitMapsWebsite(page, targetElement, {
+                shouldStop: shouldStopCheck,
+                onStatus: (message) => {
+                    this.log(`T${threadId}: ${message}`)
+                    onStatusUpdate(this.sanitizeForStatus(message))
+                },
+            })
+        } catch (error: unknown) {
+            const outcome = this.websiteNotVisited(
+                `website_skipped_error: ${this.formatError(error)}`,
+                ['website_skipped_error']
+            )
+            this.log(`T${threadId}: ${outcome.detail}`)
+            onStatusUpdate(this.sanitizeForStatus(outcome.detail))
+            return outcome
         }
 
-        // Wait for the popup
-        const newPage = await newPagePromise
-        
-        if (newPage) {
-            this.log(`T${threadId}: Successfully captured new website tab: ${newPage.url()}`)
-            results.push('website_popup_handled')
-            try {
-                // Wait for the page to load sufficiently
-                await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {})
-                
-                // Pretend to be a human reading the website organically for 15-30s
-                // This ensures google analytics captures it and Dwell Time > 10s (engaged session)
-                this.log(`T${threadId}: Starting organic browse on new website tab...`)
-                const scrollCount = this.randomInt(6, 12)
-                for (let i = 0; i < scrollCount; i++) {
-                    await DOMUtils.scrollObservedPage(newPage as Page, 'down').catch(() => {})
-                    await this.delay(2000, 4000)
-                    
-                    if (Math.random() > 0.7) {
-                        await DOMUtils.scrollObservedPage(newPage as Page, 'up').catch(() => {})
-                        await this.delay(1000, 2500)
-                    }
-                }
-                
-                results.push('website_organic_browse')
-            } catch (err) {
-                this.log(`T${threadId}: Error during external website browse: ${err}`)
-            } finally {
-                // Always ensure the new tab is closed so it doesn't leak memory
-                if (!newPage.isClosed()) {
-                    await newPage.close().catch(() => {})
-                }
-                // Bring Maps back to focus
-                await page.bringToFront().catch(() => {})
-                this.log(`T${threadId}: Closed website tab, returning to Maps.`)
-            }
-        } else {
-            // It didn't open a new tab, maybe navigation in same tab or failed?
-            this.log(`T${threadId}: No new tab detected. Likely failed or same-page nav.`)
-            await this.delay(4000, 7000)
-            if (!this.isStillOnTargetPlace(page.url(), page.url())) {
-                await page.goBack({ waitUntil: 'domcontentloaded', timeout: 9000 }).catch(() => {})
-            }
+        const loaded = visit.loaded && !visit.skipped
+        const success = loaded && visit.mapRestored
+        const provided = visit.detail.trim()
+        const detail = provided
+            || (success
+                ? 'Website visit loaded and Maps context restored'
+                : !loaded
+                    ? 'website_skipped_unloaded: Website visit did not load'
+                    : 'website_map_not_restored: Maps page was not restored after website visit')
+        const outcome: WebsiteFollowUpOutcome = {
+            success,
+            detail,
+            subActions: visit.actions,
+            skipConfiguredDelay: !success,
+            durationMs: visit.durationMs,
+            clicked: visit.clicked,
         }
-        
-        return results
+        this.log(`T${threadId}: Website visit success=${outcome.success} detail=${outcome.detail}`)
+        onStatusUpdate(this.sanitizeForStatus(outcome.detail))
+        return outcome
     }
 
     private async runPostClickFollowUp(
@@ -1423,7 +1525,7 @@ Respond strictly as JSON. No markdown:
             case 'read_info':
                 return this.runInfoFollowUp(page, threadId)
             case 'browse_website':
-                return this.runWebsiteFollowUp(page, threadId)
+                throw new Error('browse_website is handled by the shared website helper before planned-action dispatch')
             case 'check_directions':
                 return this.runInfoFollowUp(page, threadId)
             case 'pan_map':
@@ -1495,16 +1597,26 @@ Respond strictly as JSON. No markdown:
             return 'captcha'
         }
 
+        let skipConfiguredDelay = false
         try {
-            const executedSubActions = await this.executePlannedAction(page, action, threadId)
-            this.pushAction(actionsPerformed, {
-                action: `execute_${action}`,
-                success: true,
-                source: 'llm',
-                detail: `Sub-actions: ${executedSubActions.join(', ')}`,
-                step: stepIndex + 1,
-            })
+            if (action === 'browse_website') {
+                const outcome = await this.runWebsiteFollowUp(page, threadId, shouldStopCheck, onStatusUpdate)
+                skipConfiguredDelay = outcome.skipConfiguredDelay
+                this.recordWebsiteStep(actionsPerformed, outcome, stepIndex)
+            } else {
+                const executedSubActions = await this.executePlannedAction(page, action, threadId)
+                this.pushAction(actionsPerformed, {
+                    action: `execute_${action}`,
+                    success: true,
+                    source: 'llm',
+                    detail: `Sub-actions: ${executedSubActions.join(', ')}`,
+                    step: stepIndex + 1,
+                })
+            }
         } catch (err) {
+            if (action === 'browse_website') {
+                skipConfiguredDelay = true
+            }
             const errorMsg = this.formatError(err)
             this.log(`T${threadId}: Error executing ${action}: ${errorMsg}`)
             this.pushAction(actionsPerformed, {
@@ -1522,10 +1634,15 @@ Respond strictly as JSON. No markdown:
         }
 
         await this.cleanupExtraTabs(page, threadId, `step_${stepIndex}_${action}`)
-        // Natural delay with ±20% jitter
-        const jitterMin = Math.floor(actionDelaySec * 1000 * 0.8)
-        const jitterMax = Math.ceil(actionDelaySec * 1000 * 1.2)
-        await this.delay(jitterMin, jitterMax)
+        if (action === 'browse_website' && shouldStopCheck()) {
+            return 'stop'
+        }
+        // A skipped or failed website must not burn the plan's long reading delay.
+        if (!skipConfiguredDelay) {
+            const jitterMin = Math.floor(actionDelaySec * 1000 * 0.8)
+            const jitterMax = Math.ceil(actionDelaySec * 1000 * 1.2)
+            await this.delay(jitterMin, jitterMax)
+        }
         return 'ok'
     }
 
@@ -1697,19 +1814,23 @@ Rules:
                     await this.delay(1000, 2000, 'kpi')
 
                     const kpiResult: KpiSkillResult = await kpiSkills.executeKpi(page, threadId, targetKpi!)
+                    const websiteKpi = targetKpi!.toLowerCase() === 'website'
 
                     this.pushAction(actionsPerformed, {
                         action: `kpi_skill_${targetKpi}`,
-                        success: kpiResult.executed,
+                        success: websiteKpi ? kpiResult.verified : kpiResult.executed,
                         source: 'kpi_skill',
                         detail: kpiResult.detail,
                         durationMs: kpiResult.durationMs,
                     })
+                    if (websiteKpi) {
+                        this.recordWebsiteKpiActions(actionsPerformed, kpiResult)
+                    }
 
                     if (kpiResult.executed && kpiResult.verified) {
                         this.log(`T${threadId}: [KPI MODE] ✅ KPI VERIFIED: ${kpiResult.detail}`)
                         onStatusUpdate(`✅ KPI ${targetKpi!.toUpperCase()} verified!`)
-                    } else if (kpiResult.executed && !kpiResult.verified) {
+                    } else if (kpiResult.executed && !kpiResult.verified && !isNonRetryableKpiResult(kpiResult)) {
                         this.log(`T${threadId}: [KPI MODE] ⚠️ KPI executed but unverified. Retrying once...`)
                         onStatusUpdate(`⚠️ KPI ${targetKpi!.toUpperCase()} unverified, retrying...`)
 
@@ -1720,11 +1841,14 @@ Rules:
 
                         this.pushAction(actionsPerformed, {
                             action: `kpi_skill_retry_${targetKpi}`,
-                            success: retryResult.executed,
+                            success: websiteKpi ? retryResult.verified : retryResult.executed,
                             source: 'kpi_skill',
                             detail: `Retry: ${retryResult.detail}`,
                             durationMs: retryResult.durationMs,
                         })
+                        if (websiteKpi) {
+                            this.recordWebsiteKpiActions(actionsPerformed, retryResult)
+                        }
 
                         if (retryResult.verified) {
                             this.log(`T${threadId}: [KPI MODE] ✅ KPI VERIFIED on retry!`)
@@ -1733,6 +1857,9 @@ Rules:
                             this.log(`T${threadId}: [KPI MODE] ❌ KPI still unverified after retry.`)
                             onStatusUpdate(`❌ KPI ${targetKpi!.toUpperCase()} could not be verified`)
                         }
+                    } else if (kpiResult.executed && !kpiResult.verified) {
+                        this.log(`T${threadId}: [KPI MODE] KPI not retryable: ${kpiResult.detail}`)
+                        onStatusUpdate(`❌ KPI ${targetKpi!.toUpperCase()} not retryable: ${this.sanitizeForStatus(kpiResult.detail)}`)
                     } else {
                         this.log(`T${threadId}: [KPI MODE] ❌ KPI skill could not execute: ${kpiResult.detail}`)
                         onStatusUpdate(`❌ KPI ${targetKpi!.toUpperCase()} element not found`)

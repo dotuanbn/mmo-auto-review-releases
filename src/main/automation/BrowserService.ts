@@ -1087,6 +1087,40 @@ export class BrowserService {
             }
         }
     }
+
+    /**
+     * Drop the shared Chrome used by ephemeral visits so the next visit starts a fresh process.
+     * closeContext() takes the same non-reentrant browser lock, so this calls closeContextInternal.
+     */
+    async recycleSharedBrowser(force: boolean): Promise<{
+        recycled: boolean
+        reason: string
+        closedEphemeral: number
+    }> {
+        return this.withBrowserLock(async () => {
+            const ephemeralIds = Array.from(this.ephemeralContextIds)
+            if (!force && ephemeralIds.length > 0) {
+                return {
+                    recycled: false,
+                    reason: 'ephemeral_contexts_active',
+                    closedEphemeral: 0,
+                }
+            }
+            for (const id of ephemeralIds) {
+                try {
+                    await this.closeContextInternal(id)
+                } catch {
+                    // reset below still drops the shared browser
+                }
+            }
+            await this.resetBrowserState('agent_bridge_recycle')
+            return {
+                recycled: true,
+                reason: 'shared_browser_closed',
+                closedEphemeral: ephemeralIds.length,
+            }
+        })
+    }
 }
 
 function sanitizeHostForLog(rawHost: string): string {
